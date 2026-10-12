@@ -102,6 +102,8 @@ const {
   visibleWidth: tuiVisibleWidth,
 } = await import("@earendil-works/pi-tui");
 export { tuiVisibleWidth };
+const { clampThinkingLevel: nativeClampThinkingLevel } =
+  await import("@earendil-works/pi-ai");
 process.env.PI_CODING_AGENT_DIR = PI_AGENT_ROOT;
 export const PI_AGENTS_DIR = join(PI_AGENT_ROOT, "agents");
 realFs.mkdirSync(PI_AGENTS_DIR);
@@ -112,9 +114,11 @@ realFs.writeFileSync(
 const {
   buildContextEntries: nativeBuildContextEntries,
   buildSessionProjection: nativeBuildSessionProjection,
+  convertToLlm: nativeConvertToLlm,
   CURRENT_SESSION_VERSION: nativeCurrentSessionVersion,
   parseFrontmatter: nativeParseFrontmatter,
   parseSessionEntries: nativeParseSessionEntries,
+  sessionEntryToContextMessages: nativeSessionEntryToContextMessages,
   truncateTail: nativeTruncateTail,
 } = await import("@earendil-works/pi-coding-agent");
 after(() => {
@@ -285,10 +289,12 @@ mock.module("@earendil-works/pi-coding-agent", {
     CONFIG_DIR_NAME: ".pi",
     buildContextEntries: nativeBuildContextEntries,
     buildSessionProjection: nativeBuildSessionProjection,
+    convertToLlm: nativeConvertToLlm,
     CURRENT_SESSION_VERSION: nativeCurrentSessionVersion,
     getAgentDir: () => PI_AGENT_ROOT,
     parseFrontmatter: nativeParseFrontmatter,
     parseSessionEntries: nativeParseSessionEntries,
+    sessionEntryToContextMessages: nativeSessionEntryToContextMessages,
     loadProjectContextFiles: ({ cwd }: { cwd: string }) => {
       projectContextCwds.push(cwd);
       return [];
@@ -518,6 +524,7 @@ mock.module("@earendil-works/pi-tui", {
 });
 mock.module("@earendil-works/pi-ai", {
   namedExports: {
+    clampThinkingLevel: nativeClampThinkingLevel,
     contentText: (
       content: string | readonly { type: string; text: string }[],
       separator = "\n",

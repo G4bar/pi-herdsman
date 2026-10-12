@@ -801,7 +801,16 @@ test("registered lead and unmanaged roles expose the correct surface", async () 
   );
   assert.equal(lead.commands.includes("subagents"), false);
   assert.equal(lead.events.has("before_agent_start"), true);
-  assert.equal(lead.events.has("context"), false);
+  // Project memory owns the Lead's request context, and passes every request
+  // through unchanged while no memory project is configured.
+  assert.equal(lead.events.get("context")?.length, 1);
+  assert.equal(
+    await lead.events.get("context")![0](
+      { type: "context", messages: [] },
+      leadContext,
+    ),
+    undefined,
+  );
   assert.ok(lead.events.has("session_start"));
   assert.ok(lead.events.has("session_shutdown"));
   lead.events.get("session_shutdown")?.[0]();
@@ -3042,7 +3051,16 @@ test("definition roster matches live list and rejects stale sessions", async () 
   );
   assert.equal(restartedPrompt, undefined);
   assert.ok(restartedEvent.systemPromptOptions.sections.agent_definitions);
-  assert.equal(pi.events.has("context"), false);
+  // Project memory owns the Lead's request context, and passes every request
+  // through unchanged while no memory project is configured.
+  assert.equal(pi.events.get("context")?.length, 1);
+  assert.equal(
+    await pi.events.get("context")![0](
+      { type: "context", messages: [] },
+      context,
+    ),
+    undefined,
+  );
   pi.events.get("session_shutdown")?.[0]();
   delete process.env.HERDR_PANE_ID;
 });

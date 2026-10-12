@@ -248,6 +248,7 @@ import {
   type ErrorCategory,
 } from "./errors.ts";
 
+import { registerMemoryRuntime } from "./memory-runtime.ts";
 import {
   MAX_BYTE_LIMIT,
   MIN_BYTE_LIMIT,
@@ -2236,6 +2237,11 @@ export default function (pi: ExtensionAPI): void {
             renderCoordinationResult("peer", "message", r, o, t, c),
         });
       }
+      registerMemoryRuntime(pi, {
+        isOrdinaryLead: () =>
+          controllerScope.kind === "lead" &&
+          roleTransitions.leadPresentationAllowed(),
+      });
     }
   }
   if (processRole !== "managed-agent") return;
