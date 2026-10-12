@@ -5,6 +5,7 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -16,9 +17,11 @@ import {
   CHAT_BYTES,
   CHAT_TARGET_BYTES,
   COMPACTION_BYTES,
+  COMPACTION_TARGET_BYTES,
   ECHO_CHARS,
   LEAF_BYTES,
   MemoryStore,
+  PAGE_CHARS,
   UNBUILT_LINE,
   clipEcho,
   deriveMessages,
@@ -36,6 +39,7 @@ import {
   renderView,
   type IdentifierKind,
   type MemoryIdentifier,
+  type MemoryKind,
   type ViewLine,
 } from "./memory.ts";
 
@@ -89,6 +93,27 @@ function customMessageEntry(content: unknown, details?: unknown): SessionEntry {
     content,
     details,
     display: true,
+  } as unknown as SessionEntry;
+}
+
+function bashEntry(
+  command: string,
+  output: string,
+  extra: Record<string, unknown> = {},
+): SessionEntry {
+  return {
+    ...entryBase(),
+    type: "message",
+    message: {
+      role: "bashExecution",
+      command,
+      output,
+      exitCode: 0,
+      cancelled: false,
+      truncated: false,
+      timestamp: 0,
+      ...extra,
+    },
   } as unknown as SessionEntry;
 }
 
@@ -234,7 +259,7 @@ test("entries that are not chat are not memory messages", () => {
       } as unknown as SessionEntry,
     ],
     [
-      "bash execution",
+      "bash execution without context",
       {
         ...entryBase(),
         type: "message",
@@ -243,6 +268,7 @@ test("entries that are not chat are not memory messages", () => {
           command: "ls",
           output: "files",
           exitCode: 0,
+          excludeFromContext: true,
         },
       } as unknown as SessionEntry,
     ],
@@ -250,6 +276,38 @@ test("entries that are not chat are not memory messages", () => {
   ];
   for (const [name, entry] of entries)
     assert.deepEqual(deriveMessages(entry, SESSION), [], name);
+});
+
+test("a bash execution logs the command and then its output", () => {
+  const [command, output] = deriveMessages(bashEntry("ls", "files"), SESSION);
+  assert.deepEqual([command.kind, command.text], ["user", "Ran `ls`"]);
+  assert.equal(output.kind, "echo");
+  assert.equal(output.text.includes("files"), true);
+
+  const [failed, notes] = deriveMessages(
+    bashEntry("false", "", { exitCode: 1 }),
+    SESSION,
+  );
+  assert.equal(failed.text, "Ran `false`");
+  assert.equal(notes.text.includes("exited with code 1"), true);
+
+  // `!!cmd` is excluded from context, so it is not memory either.
+  assert.deepEqual(
+    deriveMessages(
+      bashEntry("ls", "files", { excludeFromContext: true }),
+      SESSION,
+    ),
+    [],
+  );
+
+  const [longCommand, longOutput] = deriveMessages(
+    bashEntry("cat big.log", "z".repeat(50_000)),
+    SESSION,
+  );
+  assert.equal(longCommand.text, "Ran `cat big.log`");
+  assert.equal(longOutput.kind, "echo");
+  assert.equal(longOutput.size <= ECHO_CHARS, true);
+  assert.equal(longOutput.text.includes("characters omitted"), true);
 });
 
 test("long texts are split into pages and tool output is clipped", () => {
@@ -277,6 +335,43 @@ test("long texts are split into pages and tool output is clipped", () => {
   assert.match(echo.text, /\[\.\.\. \d+ characters omitted \.\.\.\]/);
   assert.equal(clipEcho("short"), "short");
 });
+
+test("splitting and clipping never cut a surrogate pair", () => {
+  const emoji = "😀";
+  // The page boundary falls between the two halves of the pair.
+  const paged = deriveMessages(
+    userEntry(`${"x".repeat(PAGE_CHARS - 1)}${emoji}${"y".repeat(10)}`),
+    SESSION,
+  );
+  assert.equal(paged.length, 2);
+  assert.deepEqual(
+    paged.map((page) => hasLoneSurrogate(page.text)),
+    [false, false],
+  );
+  assert.equal(
+    paged.map((page) => page.text).join(""),
+    `${"x".repeat(PAGE_CHARS - 1)}${emoji}${"y".repeat(10)}`,
+  );
+
+  // The clip's head cut falls between the two halves of the pair.
+  const head = "a".repeat(14_935);
+  const clipped = clipEcho(`${head}${emoji}${"b".repeat(20_000)}`);
+  assert.equal(hasLoneSurrogate(clipped), false);
+  assert.equal(clipped.length <= ECHO_CHARS, true);
+  assert.equal(clipped.startsWith(head), true);
+});
+
+function hasLoneSurrogate(text: string): boolean {
+  for (let at = 0; at < text.length; at += 1) {
+    const code = text.charCodeAt(at);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = text.charCodeAt(at + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return true;
+      at += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) return true;
+  }
+  return false;
+}
 
 test("messages record the images they had", () => {
   const [withImage] = deriveMessages(
@@ -628,21 +723,72 @@ test("identifiers are typed, ordered and deduped", () => {
       `${kind}: ${text}`,
     );
 
-  assert.deepEqual(
-    extractIdentifiers("a/b.ts a/b.ts 12345 12345"),
-    [
-      { kind: "path", value: "a/b.ts" },
-      { kind: "path", value: "a/b.ts" },
-      { kind: "number", value: "12345" },
-      { kind: "number", value: "12345" },
-    ].filter((_, index) => index % 2 === 0),
-  );
+  assert.deepEqual(extractIdentifiers("a/b.ts a/b.ts 12345 12345"), [
+    { kind: "path", value: "a/b.ts" },
+    { kind: "number", value: "12345" },
+  ]);
   assert.deepEqual(extractIdentifiers("12345 then /tmp/a.ts"), [
     { kind: "number", value: "12345" },
     { kind: "path", value: "/tmp/a.ts" },
   ]);
   // A URL is a URL, never also a path.
   assert.deepEqual(identifierValues("https://example.com/a.ts", "path"), []);
+});
+
+test("identifiers survive JSON, markdown, shell and prose", () => {
+  const samples: [string, MemoryIdentifier[]][] = [
+    [
+      'fetch {"url":"https://a.com/x","timeout":5000}',
+      [
+        { kind: "url", value: "https://a.com/x" },
+        { kind: "number", value: "5000" },
+      ],
+    ],
+    [
+      "run `/tmp/x.json` now",
+      [
+        { kind: "code", value: "/tmp/x.json" },
+        { kind: "path", value: "/tmp/x.json" },
+      ],
+    ],
+    [
+      "see --file=/tmp/x.json and >/tmp/out.txt",
+      [
+        { kind: "path", value: "/tmp/x.json" },
+        { kind: "path", value: "/tmp/out.txt" },
+      ],
+    ],
+    [
+      "read [docs](https://x.com/a) first",
+      [{ kind: "url", value: "https://x.com/a" }],
+    ],
+    ['{"path":"src/app.ts"}', [{ kind: "path", value: "src/app.ts" }]],
+    // Prose and versions are not paths, and never half a number.
+    ["e.g. this, i.e. that, Node.js and 1.2.3", []],
+    // A capitalized name without a directory is treated as prose too.
+    ["AGENTS.md", []],
+  ];
+  for (const [text, expected] of samples)
+    assert.deepEqual(extractIdentifiers(text), expected, text);
+});
+
+test("a bare file name needs a lowercase extension with a letter", () => {
+  const samples: [string, string[]][] = [
+    ["memory.ts exists", ["memory.ts"]],
+    ["x.ts and a.json", ["x.ts", "a.json"]],
+    [".env is a file", [".env"]],
+    ["read a_doc-1.md, please", ["a_doc-1.md"]],
+    ["Node.js", []],
+    ["AGENTS.md", []],
+    ["e.g", []],
+    ["1.2", []],
+    ["v1.2.3", []],
+    ["file.TS", []],
+    // A directory always makes a path.
+    ["see docs/AGENTS.md", ["docs/AGENTS.md"]],
+  ];
+  for (const [text, expected] of samples)
+    assert.deepEqual(identifierValues(text, "path"), expected, text);
 });
 
 test("identifiers used by tool calls and tool results are all extracted", () => {
@@ -926,7 +1072,7 @@ test("the store queues the work its messages unblock", () => {
       store.appendEntry(userEntry("small"), SESSION);
       assert.equal(store.needsCall([0, 0]), false);
       assert.equal(store.nextJob(), undefined);
-      assert.equal(store.renderChat().includes("small"), true);
+      assert.equal(store.renderChat().includes("0+1|user: small"), true);
 
       store.appendEntry(userEntry("a".repeat(LEAF_BYTES + 1)), SESSION);
       assert.equal(store.needsCall([0, 1]), true);
@@ -935,6 +1081,7 @@ test("the store queues the work its messages unblock", () => {
       assert.deepEqual(store.nodeInputs([0, 1]), {
         kind: "message",
         id: 1,
+        messageKind: "user",
         text: "a".repeat(LEAF_BYTES + 1),
       });
       // A failed call is tried again.
@@ -959,6 +1106,383 @@ test("the store queues the work its messages unblock", () => {
         entry: last.id,
         part: 0,
       });
+    } finally {
+      store.close();
+    }
+  });
+});
+
+/** Answers every ready compaction like the compactor, so the tree fills. */
+function drain(store: MemoryStore): number {
+  let built = 0;
+  for (;;) {
+    const job = store.nextJob();
+    if (!job) return built;
+    const line: ViewLine = job.kind === "message" ? [0, job.id] : job.line;
+    store.appendNode(line, `summary ${built} ${"z".repeat(600)}`);
+    built += 1;
+  }
+}
+
+/** The rendered byte size of a view, as the model receives it. */
+function viewBytes(store: MemoryStore, lines: readonly ViewLine[]): number {
+  return lines.reduce(
+    (total, line) =>
+      total + Buffer.byteLength(renderLine(line, store.nodeText(line)), "utf8"),
+    0,
+  );
+}
+
+function chatBytes(store: MemoryStore): number {
+  return viewBytes(store, store.view.chat);
+}
+
+function compactionBytes(store: MemoryStore): number {
+  return viewBytes(store, store.view.compaction);
+}
+
+test("a leaf line carries the kind and the message word for word", () => {
+  withProject((project) => {
+    const store = new MemoryStore(project);
+    try {
+      const entries: [SessionEntry, MemoryKind][] = [
+        [userEntry("hello"), "user"],
+        [assistantEntry([{ type: "text", text: "an answer" }]), "lead"],
+        [
+          assistantEntry([
+            {
+              type: "toolCall",
+              id: "call-1",
+              name: "read",
+              arguments: { path: "x" },
+            },
+          ]),
+          "tool",
+        ],
+        [toolResultEntry("a result"), "echo"],
+        [customMessageEntry("done", { agentLabel: "scout" }), "work"],
+        [
+          userEntry([
+            { type: "image", data: "x", mimeType: "image/png" },
+          ] as unknown as string),
+          "user",
+        ],
+      ];
+      for (const [entry, kind] of entries) {
+        for (const message of store.appendEntry(entry, SESSION)) {
+          assert.equal(store.messageKind(message.i), kind);
+          const body = message.text || "(image)";
+          assert.equal(
+            store.renderChat().includes(`${message.i}+1|${kind}: ${body}`),
+            true,
+            `${kind} at ${message.i}`,
+          );
+        }
+      }
+
+      // The 512-byte rule measures the tagged line, not the bare text.
+      const tagged = store.appendEntry(
+        userEntry("t".repeat(LEAF_BYTES - 4)),
+        SESSION,
+      );
+      assert.equal(store.needsCall([0, tagged[0].i]), true);
+      const bare = store.appendEntry(
+        userEntry("t".repeat(LEAF_BYTES - 8)),
+        SESSION,
+      );
+      assert.equal(store.needsCall([0, bare[0].i]), false);
+    } finally {
+      store.close();
+    }
+  });
+});
+
+test("an empty project writes nothing but its project.json", () => {
+  withProject((project) => {
+    const store = new MemoryStore(project);
+    try {
+      assert.equal(store.messageCount, 0);
+      assert.equal(store.renderChat(), "<chat>\n</chat>");
+      assert.equal(store.viewRebuilt, false);
+    } finally {
+      store.close();
+    }
+    const root = projectMemoryRoot(project);
+    assert.equal(statSync(join(root, "project.json")).isFile(), true);
+    assert.equal(
+      statSync(join(root, "view.json"), { throwIfNoEntry: false }),
+      undefined,
+    );
+
+    const reopened = new MemoryStore(project);
+    try {
+      assert.equal(reopened.messageCount, 0);
+    } finally {
+      reopened.close();
+    }
+    assert.equal(
+      statSync(join(root, "view.json"), { throwIfNoEntry: false }),
+      undefined,
+    );
+  });
+});
+
+test("a backfilled older date still appends in id order", () => {
+  withProject((project) => {
+    const store = new MemoryStore(project);
+    try {
+      store.appendEntry(
+        userEntry("later one", "2026-01-03T03:04:05.000Z"),
+        SESSION,
+      );
+      store.appendEntry(
+        userEntry("backfilled", "2025-12-01T03:04:05.000Z"),
+        SESSION,
+      );
+      store.appendEntry(
+        userEntry("later two", "2026-01-03T04:00:00.000Z"),
+        SESSION,
+      );
+    } finally {
+      store.close();
+    }
+    // Main files never go backwards, so the log stays in id order.
+    assert.deepEqual(readdirSync(join(projectMemoryRoot(project), "main")), [
+      "2026-01-03.jsonl",
+    ]);
+
+    const reopened = new MemoryStore(project);
+    try {
+      assert.deepEqual(reopened.loadWarnings, []);
+      assert.equal(reopened.viewRebuilt, false);
+      assert.equal(reopened.messageCount, 3);
+      assert.deepEqual(
+        [0, 1, 2].map((i) => reopened.messageText(i)),
+        ["later one", "backfilled", "later two"],
+      );
+      assert.deepEqual(reopened.view.chat, [
+        [0, 0],
+        [0, 1],
+        [0, 2],
+      ]);
+    } finally {
+      reopened.close();
+    }
+  });
+});
+
+test("damaged log lines are reported instead of dropped silently", () => {
+  withProject((project) => {
+    const store = new MemoryStore(project);
+    try {
+      store.appendEntry(userEntry("first"), SESSION);
+      store.appendEntry(userEntry("second"), SESSION);
+    } finally {
+      store.close();
+    }
+    const file = join(projectMemoryRoot(project), "main", "2026-01-02.jsonl");
+    const first = JSON.parse(readFileSync(file, "utf8").split("\n")[0]);
+    appendFileSync(file, "nonsense\n");
+    appendFileSync(file, `${JSON.stringify({ ...first, i: 5 })}\n`);
+
+    const reopened = new MemoryStore(project);
+    try {
+      assert.equal(reopened.messageCount, 2);
+      const warnings = reopened.loadWarnings.join("\n");
+      assert.match(warnings, /unreadable line/);
+      assert.match(warnings, /out of sequence/);
+      assert.equal(reopened.viewRebuilt, false);
+    } finally {
+      reopened.close();
+    }
+  });
+});
+
+test("a torn last line that is complete JSON is kept", () => {
+  withProject((project) => {
+    const store = new MemoryStore(project);
+    try {
+      store.appendEntry(userEntry("first"), SESSION);
+      store.appendEntry(userEntry("second"), SESSION);
+    } finally {
+      store.close();
+    }
+    const file = join(projectMemoryRoot(project), "main", "2026-01-02.jsonl");
+    const content = readFileSync(file, "utf8");
+    writeFileSync(file, content.slice(0, -1));
+
+    const reopened = new MemoryStore(project);
+    try {
+      assert.equal(reopened.messageCount, 2);
+      assert.deepEqual(reopened.loadWarnings, []);
+      reopened.appendEntry(userEntry("third"), SESSION);
+      assert.equal(reopened.messageCount, 3);
+      assert.equal(reopened.messageText(2), "third");
+    } finally {
+      reopened.close();
+    }
+
+    const reloaded = new MemoryStore(project);
+    try {
+      assert.deepEqual(
+        [0, 1, 2].map((i) => reloaded.messageText(i)),
+        ["first", "second", "third"],
+      );
+    } finally {
+      reloaded.close();
+    }
+  });
+});
+
+test("messages the saved view does not cover are appended at load", () => {
+  withProject((project) => {
+    const store = new MemoryStore(project);
+    try {
+      for (const text of ["one", "two", "three"])
+        store.appendEntry(userEntry(text), SESSION);
+    } finally {
+      store.close();
+    }
+    // A crash between the log append and the view write leaves T behind.
+    writeFileSync(
+      join(projectMemoryRoot(project), "view.json"),
+      JSON.stringify({ version: 1, T: 1, chat: [[0, 0]], compaction: [] }),
+    );
+
+    const reopened = new MemoryStore(project);
+    try {
+      assert.equal(reopened.viewRebuilt, false);
+      assert.deepEqual(reopened.loadWarnings, []);
+      assert.equal(reopened.messageCount, 3);
+      assert.deepEqual(reopened.view.chat, [
+        [0, 0],
+        [0, 1],
+        [0, 2],
+      ]);
+      assert.equal(
+        JSON.parse(readFileSync(join(reopened.root, "view.json"), "utf8")).T,
+        3,
+      );
+    } finally {
+      reopened.close();
+    }
+  });
+});
+
+test("the compaction view can be cut at a node", () => {
+  withProject((project) => {
+    const store = new MemoryStore(project);
+    try {
+      for (const text of ["first", "second", "third"])
+        store.appendEntry(userEntry(text), SESSION);
+      assert.equal(
+        store.renderCompaction(),
+        "<chat>\n0+1|user: first\n1+1|user: second\n2+1|user: third\n</chat>",
+      );
+      // Before a message: the lines that end at or before it.
+      assert.deepEqual(store.compactionLinesBefore([0, 2]), [
+        [0, 0],
+        [0, 1],
+      ]);
+      assert.equal(store.renderCompaction([0, 2]).includes("third"), false);
+      assert.deepEqual(store.compactionLinesBefore([0, 0]), []);
+      // Before a merge: the lines up to the merge's last message.
+      assert.deepEqual(store.compactionLinesBefore([1, 0]), [
+        [0, 0],
+        [0, 1],
+      ]);
+    } finally {
+      store.close();
+    }
+  });
+});
+
+test("the store keeps both views inside their batch bounds", () => {
+  withProject((project) => {
+    const store = new MemoryStore(project);
+    const body = "m".repeat(3000);
+    try {
+      let chatGrew = false;
+      let chatFell = false;
+      let compactionGrew = false;
+      let compactionFell = false;
+      for (let i = 0; i < 90; i += 1) {
+        store.appendEntry(userEntry(body), SESSION);
+        // Drain like the compactor, watching the compaction view for each
+        // node it builds, where its own merges land.
+        for (;;) {
+          const job = store.nextJob();
+          if (!job) break;
+          store.appendNode(
+            job.kind === "message" ? [0, job.id] : job.line,
+            `summary ${"z".repeat(3000)}`,
+          );
+          const compaction = compactionBytes(store);
+          assert.equal(
+            compaction <= COMPACTION_BYTES + 3100,
+            true,
+            `compaction at ${i}`,
+          );
+          if (compaction > COMPACTION_TARGET_BYTES) compactionGrew = true;
+          else if (compactionGrew) compactionFell = true;
+        }
+
+        const chat = chatBytes(store);
+        assert.equal(chat <= CHAT_BYTES, true, `chat size at ${i}`);
+        if (chat > CHAT_TARGET_BYTES) chatGrew = true;
+        else if (chatGrew) chatFell = true;
+      }
+      // Each view grew past its target and later fell back to it.
+      assert.equal(chatGrew && chatFell, true);
+      assert.equal(compactionGrew && compactionFell, true);
+    } finally {
+      store.close();
+    }
+  });
+});
+
+test("a batch that cannot finish keeps going as parents appear", () => {
+  withProject((project) => {
+    const store = new MemoryStore(project);
+    try {
+      // 400-byte messages are call-free leaves; their pairs are not.
+      const body = "s".repeat(400);
+      for (let i = 0; i < 340; i += 1)
+        store.appendEntry(userEntry(body), SESSION);
+      const stuck = chatBytes(store);
+      assert.equal(stuck > CHAT_BYTES, true);
+
+      // The open batch merges as soon as one parent exists, without waiting
+      // for the size to pass the trigger again.
+      store.appendNode([1, 0], "first pair");
+      const once = chatBytes(store);
+      assert.equal(once < stuck, true);
+      store.appendNode([1, 1], "second pair");
+      assert.equal(chatBytes(store) < once, true);
+    } finally {
+      store.close();
+    }
+  });
+});
+
+test("the compaction view merges down to its own target", () => {
+  withProject((project) => {
+    const store = new MemoryStore(project);
+    try {
+      const body = "c".repeat(400);
+      let merges = 0;
+      let last = 0;
+      let max = 0;
+      for (let i = 0; i < 300; i += 1) {
+        store.appendEntry(userEntry(body), SESSION);
+        drain(store);
+        const size = compactionBytes(store);
+        max = Math.max(max, size);
+        if (size < last) merges += 1;
+        last = size;
+      }
+      assert.equal(merges > 0, true);
+      assert.equal(max <= COMPACTION_BYTES + 700, true);
     } finally {
       store.close();
     }

@@ -1,4 +1,5 @@
 import { tmpdir } from "node:os";
+import { randomUUID } from "node:crypto";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
   chmodSync,
@@ -7,9 +8,11 @@ import {
   mkdirSync,
   openSync,
   readdirSync,
+  renameSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 const RESULT_PREFIX = "result:";
 const RESULT_ID =
@@ -63,6 +66,31 @@ export function herdsmanConfigPath(): string {
 
 export function herdsmanTempRoot(): string {
   return join(tmpdir(), `pi-herdsman-${process.getuid?.() ?? "user"}`);
+}
+
+/** Replaces a file's contents atomically: temp file, fsync, rename. */
+export function writeAtomically(path: string, content: string): void {
+  const temporaryPath = join(
+    dirname(path),
+    `.${basename(path)}.${randomUUID()}.tmp`,
+  );
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(temporaryPath, "wx", 0o600);
+    writeFileSync(descriptor, content, "utf8");
+    fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = undefined;
+    chmodSync(temporaryPath, 0o600);
+    renameSync(temporaryPath, path);
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+    try {
+      unlinkSync(temporaryPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
 }
 
 function validateResultId(requestId: string): void {

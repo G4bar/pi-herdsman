@@ -5,26 +5,25 @@
  * No model calls and no Pi event wiring live here; the compactor, the session
  * wiring and the tools build on these primitives.
  */
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import {
   closeSync,
-  chmodSync,
-  fsyncSync,
   mkdirSync,
   openSync,
   readFileSync,
   readSync,
   readdirSync,
   realpathSync,
-  renameSync,
   statSync,
-  unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { basename, dirname, join } from "node:path";
-import type { SessionEntry } from "@earendil-works/pi-coding-agent";
+import { basename, join } from "node:path";
+import {
+  convertToLlm,
+  type SessionEntry,
+} from "@earendil-works/pi-coding-agent";
 import { claimProcessLock } from "./lock.ts";
-import { herdsmanDataRoot } from "./storage.ts";
+import { herdsmanDataRoot, writeAtomically } from "./storage.ts";
 
 export type MemoryKind = "user" | "lead" | "tool" | "echo" | "work" | "note";
 
@@ -72,7 +71,13 @@ export type MemoryView = {
 
 /** The inputs of one compaction call, or of a message read whole. */
 export type NodeInputs =
-  | { kind: "message"; id: number; text: string }
+  | {
+      kind: "message";
+      id: number;
+      /** `kind` names the variant, so the memory kind has its own field. */
+      messageKind: MemoryKind;
+      text: string;
+    }
   | { kind: "merge"; line: ViewLine; first: string; second: string };
 
 export type MemoryJob =
@@ -91,6 +96,10 @@ export const COMPACTION_TARGET_BYTES = 16_000;
 /** The view is sent as blocks of this many lines, for the cache marks. */
 export const VIEW_BLOCK_LINES = 4;
 export const UNBUILT_LINE = "(not summarized yet: zoom it)";
+const UNBUILT_BYTES = Buffer.byteLength(UNBUILT_LINE, "utf8");
+/** The body of a message that only carried images. Images are not stored. */
+const IMAGE_BODY = "(image)";
+const IMAGE_BODY_BYTES = Buffer.byteLength(IMAGE_BODY, "utf8");
 
 function sha256(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
@@ -184,7 +193,19 @@ function entryParts(entry: SessionEntry): MessagePart[] {
     const clipped = clipEcho(text);
     return text || images ? pages("echo", clipped, images) : [];
   }
-  // Other roles (bash executions) are not memory messages.
+  if (message.role === "bashExecution") {
+    // Pi's own text: `Ran <cmd>` plus the fenced output and its notes. The
+    // user's command is their words; the output is an echo.
+    const [converted] = convertToLlm([entry.message]);
+    if (!converted) return [];
+    const [command = "", ...rest] = contentText(converted.content).text.split(
+      "\n",
+    );
+    return [
+      ...pages("user", command, false),
+      ...pages("echo", clipEcho(rest.join("\n").trim()), false),
+    ];
+  }
   return [];
 }
 
@@ -234,8 +255,15 @@ function customLabel(details: unknown): string | undefined {
 function pages(kind: MemoryKind, text: string, images: boolean): MessagePart[] {
   if (!text) return images ? [{ kind, text, images: true }] : [];
   const parts: MessagePart[] = [];
-  for (let at = 0; at < text.length; at += PAGE_CHARS)
-    parts.push({ kind, text: text.slice(at, at + PAGE_CHARS), images: false });
+  let at = 0;
+  while (at < text.length) {
+    const end =
+      at + PAGE_CHARS >= text.length
+        ? text.length
+        : safeCut(text, at + PAGE_CHARS);
+    parts.push({ kind, text: text.slice(at, end), images: false });
+    at = end;
+  }
   if (images) parts[0] = { ...parts[0], images: true };
   return parts;
 }
@@ -244,9 +272,19 @@ function pages(kind: MemoryKind, text: string, images: boolean): MessagePart[] {
 export function clipEcho(text: string): string {
   if (text.length <= ECHO_CHARS) return text;
   const side = Math.floor(ECHO_CHARS / 2) - 64;
-  const omitted = text.length - side * 2;
+  const head = safeCut(text, side);
+  const tail = safeCut(text, text.length - side);
+  const omitted = tail - head;
   const marker = `\n[... ${omitted} characters omitted ...]\n`;
-  return `${text.slice(0, side)}${marker}${text.slice(text.length - side)}`;
+  return `${text.slice(0, head)}${marker}${text.slice(tail)}`;
+}
+
+/** Moves a cut back when it would split a surrogate pair. */
+function safeCut(text: string, at: number): number {
+  const code = text.charCodeAt(at);
+  return at > 0 && at < text.length && code >= 0xdc00 && code <= 0xdfff
+    ? at - 1
+    : at;
 }
 
 // --- tree coordinates -------------------------------------------------------
@@ -390,24 +428,44 @@ const IDENTIFIER_PATTERNS: readonly {
   },
   // `result:` followed by an agent label, with an optional `#N` index.
   { kind: "ref", pattern: /result:[A-Za-z0-9_-]+(?:#[0-9]+)?/g },
-  // A scheme followed by `://`; matched here so it is not also a path.
-  { kind: "url", pattern: /[A-Za-z][A-Za-z0-9+.-]*:\/\/\S+/g },
+  // A scheme followed by `://`, up to the quote or bracket that ends it.
+  { kind: "url", pattern: /[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"`\\<>]+/g },
   // Text in backticks, usually a command.
   { kind: "code", pattern: /`([^`\n]+)`/g },
-  // Four or more digits, or digits with a decimal point.
-  { kind: "number", pattern: /\b[0-9]{4,}\b|\b[0-9]+\.[0-9]+\b/g },
+  // Four or more digits, or a decimal, but never half of a longer version.
+  {
+    kind: "number",
+    pattern: /(?<![\w.])\d{4,}(?!\.?\d)|(?<![\w.])\d+\.\d+(?!\.?\d)/g,
+  },
 ];
 
 const SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*:\/\//;
-const EXTENSION = /\.[A-Za-z0-9]{1,8}$/;
-const TRAILING_PUNCTUATION = /[.,;:)\]}>'"]+$/;
-const LEADING_PUNCTUATION = /^["'([{]+/;
+// A bare file name: a 2-8 character lowercase extension holding a letter.
+const FILE_EXTENSION = /\.[a-z0-9]{2,8}$/;
+const HAS_LETTER = /[a-z]/;
+const UPPERCASE = /[A-Z]/;
+// Tokens stop at the punctuation JSON, markdown and shells wrap values in.
+const TOKEN = /[^\s"`=<>()[\]{},;]+/g;
+const TRAILING_PUNCTUATION = /[.,;:)\]}>'"`]+$/;
+const LEADING_PUNCTUATION = /^["'([{`]+/;
+
+/**
+ * A bare file name (no directory) counts as a path only with a 2-8 character
+ * lowercase extension that holds a letter, so prose such as `e.g`, `i.e`,
+ * `Node.js` and `1.2.3` is not one; a token containing `/` always is.
+ */
+function isBareFileName(token: string): boolean {
+  const extension = FILE_EXTENSION.exec(token);
+  if (!extension || UPPERCASE.test(token)) return false;
+  return HAS_LETTER.test(extension[0]);
+}
 
 /**
  * Typed identifiers in text, in first-appearance order, deduped.
  *
  * The zoom gate compares the identifiers an action uses against the ones the
- * view already holds, so this errs toward extracting more, never less.
+ * view already holds, so this errs toward extracting more, never less. UUIDs
+ * are stored lowercase and must be compared case-insensitively.
  */
 export function extractIdentifiers(text: string): MemoryIdentifier[] {
   const found: { kind: IdentifierKind; value: string; index: number }[] = [];
@@ -420,11 +478,10 @@ export function extractIdentifiers(text: string): MemoryIdentifier[] {
       });
     }
   }
-  // Double quotes separate tokens, because JSON arguments quote their values.
-  for (const match of text.matchAll(/[^\s"]+/g)) {
+  for (const match of text.matchAll(TOKEN)) {
     const value = trimToken(match[0]);
     if (!value || SCHEME.test(value)) continue;
-    if (!value.includes("/") && !EXTENSION.test(value)) continue;
+    if (!value.includes("/") && !isBareFileName(value)) continue;
     found.push({ kind: "path", value, index: match.index ?? 0 });
   }
   found.sort(
@@ -462,8 +519,27 @@ function trimToken(token: string): string {
 
 // --- store ------------------------------------------------------------------
 
-type MessageRecord = MemoryMessage & { file: string; offset: number };
+type MessageRecord = Omit<MemoryMessage, "text"> & {
+  file: string;
+  offset: number;
+};
 type NodeRecord = { file: string; offset: number; size: number };
+
+/** The size of a message body, without reading it. */
+function bodySize(record: MessageRecord): number {
+  if (record.size > 0) return record.size;
+  return record.src.images ? IMAGE_BODY_BYTES : 0;
+}
+
+/** A leaf node is the message word for word, tagged with its kind. */
+function leafText(kind: MemoryKind, body: string): string {
+  return `${kind}: ${body}`;
+}
+
+/** The size of a leaf node's text: the ASCII kind tag plus the body. */
+function leafSize(record: MessageRecord): number {
+  return record.kind.length + 2 + bodySize(record);
+}
 
 /**
  * One project's memory: the append-only logs, the built nodes, the view and
@@ -486,6 +562,12 @@ export class MemoryStore {
   private queue: MemoryJob[] = [];
   private queued = new Set<string>();
   private closed = false;
+  /** The newest main day file; main files never go backwards. */
+  private mainDay = "";
+  /** True while a chat batch still owes merges it could not make yet. */
+  private batching = false;
+  /** Lines the load pass could not use, so log damage is never silent. */
+  readonly loadWarnings: string[] = [];
 
   constructor(projectPath: string) {
     this.projectPath = realpathSync(projectPath);
@@ -548,9 +630,22 @@ export class MemoryStore {
       src: message.src,
       hash: message.hash,
     };
-    const file = this.dayFile("main", message.date);
+    const file = join(
+      this.root,
+      "main",
+      `${this.nextMainDay(message.date)}.jsonl`,
+    );
     const offset = this.appendLine(file, JSON.stringify(record));
-    this.records.push({ ...record, file, offset });
+    this.records.push({
+      i,
+      kind: record.kind,
+      size: record.size,
+      date: record.date,
+      src: record.src,
+      hash: record.hash,
+      file,
+      offset,
+    });
     this.pushLeaf(i);
     this.seedLeaf(i);
     this.syncCompaction();
@@ -574,7 +669,7 @@ export class MemoryStore {
       text,
       size: Buffer.byteLength(text, "utf8"),
     };
-    const file = this.dayFile("tree", this.nodeDate(line));
+    const file = this.treeFile(this.nodeDate(line));
     const offset = this.appendLine(file, JSON.stringify(record));
     this.nodes.set(nodeKey(line), {
       file,
@@ -582,7 +677,8 @@ export class MemoryStore {
       size: record.size,
     });
     this.chatSize = this.bytes(this.chat);
-    if (this.chatSize > CHAT_BYTES) this.mergeChatBatch();
+    if (this.chatSize > CHAT_BYTES) this.batching = true;
+    if (this.batching) this.mergeChatBatch();
     this.refreshJobs(line);
     this.syncCompaction();
     this.saveView();
@@ -596,8 +692,8 @@ export class MemoryStore {
     if (!this.withinLog(line)) return undefined;
     if (l === 0) {
       const record = this.records[i];
-      if (!record || record.size > LEAF_BYTES) return undefined;
-      return readLogText(record.file, record.offset);
+      if (!record || leafSize(record) > LEAF_BYTES) return undefined;
+      return leafText(record.kind, this.messageBody(i));
     }
     const first = this.nodeText([l - 1, i * 2]);
     const second = this.nodeText([l - 1, i * 2 + 1]);
@@ -611,9 +707,9 @@ export class MemoryStore {
     return this.nodeSize(line) === undefined;
   }
 
-  /** True when the node's two children are already available. */
+  /** True when the node's text is available without a compaction call. */
   canBuildWithoutCall(line: ViewLine): boolean {
-    return this.nodeText(line) !== undefined;
+    return this.nodeSize(line) !== undefined;
   }
 
   nodeInputs(line: ViewLine): NodeInputs | undefined {
@@ -625,7 +721,8 @@ export class MemoryStore {
       return {
         kind: "message",
         id: i,
-        text: readLogText(record.file, record.offset) ?? "",
+        messageKind: record.kind,
+        text: this.messageBody(i),
       };
     }
     const first = this.nodeText([l - 1, i * 2]);
@@ -635,8 +732,20 @@ export class MemoryStore {
   }
 
   messageText(i: number): string | undefined {
+    return this.records[i] ? this.messageBody(i) : undefined;
+  }
+
+  /** A message's body: its words, or the image placeholder it only had. */
+  private messageBody(i: number): string {
     const record = this.records[i];
-    return record ? readLogText(record.file, record.offset) : undefined;
+    if (!record) return "";
+    const text = readLogText(record.file, record.offset);
+    if (text) return text;
+    return record.src.images ? IMAGE_BODY : "";
+  }
+
+  messageKind(i: number): MemoryKind | undefined {
+    return this.records[i]?.kind;
   }
 
   messageSource(i: number): MemorySource | undefined {
@@ -666,8 +775,21 @@ export class MemoryStore {
     return renderView(this.chat, (line) => this.nodeText(line));
   }
 
-  renderCompaction(): string {
-    return renderView(this.compaction, (line) => this.nodeText(line));
+  renderCompaction(line?: ViewLine): string {
+    const lines = line ? this.compactionLinesBefore(line) : this.compaction;
+    return renderView(lines, (entry) => this.nodeText(entry));
+  }
+
+  /**
+   * The compaction view cut at a node: the lines before a message, or the
+   * lines up to a merge's last message. Only built lines are in it.
+   */
+  compactionLinesBefore(line: ViewLine): ViewLine[] {
+    const limit =
+      line[0] === 0 ? nodeStart(line) : nodeStart(line) + nodeLength(line);
+    return this.compaction.filter(
+      (entry) => nodeStart(entry) + nodeLength(entry) <= limit,
+    );
   }
 
   renderChatBlocks(): string[] {
@@ -706,6 +828,8 @@ export class MemoryStore {
     this.records = [];
     this.nodes.clear();
     this.torn.clear();
+    this.loadWarnings.length = 0;
+    this.mainDay = "";
     this.readLog("main", (value, file, offset) =>
       this.loadMessage(value, file, offset),
     );
@@ -720,8 +844,9 @@ export class MemoryStore {
       this.chatSize = this.bytes(this.chat);
     } else {
       // A missing, unparsable or stale view is rebuilt deterministically; the
-      // rebuild costs a prompt-cache miss, which phase 7 records.
-      this.viewRebuilt = true;
+      // rebuild costs a prompt-cache miss, which phase 7 records. An empty
+      // project has no view to lose.
+      if (this.records.length > 0) this.viewRebuilt = true;
       this.chat = [];
       this.compaction = [];
       this.chatSize = 0;
@@ -730,6 +855,10 @@ export class MemoryStore {
     // messages; they append as leaves, exactly as they would have live.
     for (let i = this.chatEnd(); i < this.records.length; i += 1)
       this.pushLeaf(i);
+
+    // A saved view above the batch target may be an unfinished batch, but a
+    // rebuild at open would rewrite it; the next append carries it on.
+    this.batching = this.chatSize > CHAT_BYTES;
 
     this.syncCompaction();
     for (let i = 0; i < this.records.length; i += 1) this.seedLeaf(i);
@@ -743,14 +872,29 @@ export class MemoryStore {
   private loadMessage(value: unknown, file: string, offset: number): void {
     const record = value as MemoryMessage;
     if (!record || typeof record !== "object") return;
-    // Ids are linear, so a line that breaks the sequence is not this log.
-    if (record.i !== this.records.length) return;
     if (!isKind(record.kind) || typeof record.text !== "string") return;
     if (!Number.isInteger(record.size) || record.size < 0) return;
     if (typeof record.date !== "string" || typeof record.hash !== "string")
       return;
     if (!isSource(record.src)) return;
-    this.records.push({ ...record, file, offset });
+    // Ids are linear, so a line that breaks the sequence is not this log.
+    if (record.i !== this.records.length) {
+      this.warn(
+        `${basename(file)}: message i=${record.i} is out of sequence at ${this.records.length}`,
+      );
+      return;
+    }
+    // Texts are read on demand, so only the index stays in memory.
+    this.records.push({
+      i: record.i,
+      kind: record.kind,
+      size: record.size,
+      date: record.date,
+      src: record.src,
+      hash: record.hash,
+      file,
+      offset,
+    });
   }
 
   private loadNode(value: unknown, file: string, offset: number): void {
@@ -779,21 +923,25 @@ export class MemoryStore {
     }
     for (const name of names) {
       const file = join(path, name);
+      if (directory === "main") {
+        const day = name.slice(0, 10);
+        if (day > this.mainDay) this.mainDay = day;
+      }
       const content = readFileSync(file, "utf8");
       const lines = content.split("\n");
       let offset = 0;
       for (let index = 0; index < lines.length; index += 1) {
         const line = lines[index];
-        // A torn last line is ignored; the next append starts on a new line.
+        // A torn last line is ignored, unless it already holds complete JSON;
+        // either way the next append starts on a new line.
         const torn = index === lines.length - 1 && line !== "";
         if (line !== "") {
           if (torn) this.torn.add(file);
-          else {
-            try {
-              accept(JSON.parse(line), file, offset);
-            } catch {
-              // An unreadable line is not part of the log.
-            }
+          try {
+            accept(JSON.parse(line), file, offset);
+          } catch {
+            if (!torn)
+              this.warn(`${basename(file)}: unreadable line at ${offset}`);
           }
         }
         offset += Buffer.byteLength(line, "utf8") + 1;
@@ -833,7 +981,7 @@ export class MemoryStore {
       }
       return true;
     };
-    const built = (line: ViewLine) => this.nodeText(line) !== undefined;
+    const built = (line: ViewLine) => this.canBuildWithoutCall(line);
     // Only a pending leaf may be unbuilt in the chat view; an unbuilt merge
     // line, or any unbuilt line in the compaction view, is a lost summary.
     return (
@@ -856,8 +1004,22 @@ export class MemoryStore {
     return size + Buffer.byteLength(prefix, "utf8");
   }
 
-  private dayFile(directory: "main" | "tree", date: string): string {
-    return join(this.root, directory, `${dayKey(date)}.jsonl`);
+  private treeFile(date: string): string {
+    return join(this.root, "tree", `${dayKey(date)}.jsonl`);
+  }
+
+  /**
+   * Main files never go backwards, so a backfilled older date still appends
+   * after the newest file and message ids stay in file order.
+   */
+  private nextMainDay(date: string): string {
+    const day = dayKey(date);
+    if (day > this.mainDay) this.mainDay = day;
+    return this.mainDay;
+  }
+
+  private warn(message: string): void {
+    this.loadWarnings.push(message);
   }
 
   private nodeDate(line: ViewLine): string {
@@ -866,6 +1028,8 @@ export class MemoryStore {
   }
 
   private saveView(): void {
+    // An empty project writes nothing but its project.json.
+    if (this.records.length === 0) return;
     writeAtomically(
       join(this.root, "view.json"),
       `${JSON.stringify(this.view)}\n`,
@@ -888,7 +1052,9 @@ export class MemoryStore {
     if (!this.withinLog(line)) return undefined;
     if (l === 0) {
       const record = this.records[i];
-      return record && record.size <= LEAF_BYTES ? record.size : undefined;
+      if (!record) return undefined;
+      const size = leafSize(record);
+      return size <= LEAF_BYTES ? size : undefined;
     }
     const first = this.nodeSize([l - 1, i * 2]);
     if (first === undefined) return undefined;
@@ -898,8 +1064,14 @@ export class MemoryStore {
     return joined <= LEAF_BYTES ? joined : undefined;
   }
 
+  /**
+   * The rendered size of a line, without reading its text. A `\r\n` renders as
+   * one space, so a line holding carriage returns measures a byte or two long.
+   */
   private lineBytes(line: ViewLine): number {
-    return Buffer.byteLength(renderLine(line, this.nodeText(line)), "utf8");
+    const size = this.nodeSize(line);
+    const body = size === undefined ? UNBUILT_BYTES : size;
+    return Buffer.byteLength(lineLabel(line), "utf8") + 1 + body;
   }
 
   private bytes(lines: readonly ViewLine[]): number {
@@ -920,20 +1092,24 @@ export class MemoryStore {
     const line: ViewLine = [0, id];
     this.chat.push(line);
     this.chatSize += this.lineBytes(line);
-    if (this.chatSize > CHAT_BYTES) this.mergeChatBatch();
+    if (this.chatSize > CHAT_BYTES) this.batching = true;
+    if (this.batching) this.mergeChatBatch();
   }
 
-  /** One batch merges the most due pairs until the view fits its target. */
+  /**
+   * One batch merges the most due pairs until the view fits its target. A
+   * batch that runs out of built parents stays open: each later message, and
+   * each node the compactor builds, carries it on.
+   */
   private mergeChatBatch(): void {
     while (this.chatSize > CHAT_TARGET_BYTES) {
-      const index = mostDuePair(
-        this.chat,
-        this.records.length,
-        (parent) => this.nodeText(parent) !== undefined,
+      const index = mostDuePair(this.chat, this.records.length, (parent) =>
+        this.canBuildWithoutCall(parent),
       );
       if (index === undefined) return;
       this.chatSize += this.applyMerge(this.chat, index);
     }
+    this.batching = false;
   }
 
   private applyMerge(lines: ViewLine[], index: number): number {
@@ -954,7 +1130,7 @@ export class MemoryStore {
   private syncCompaction(): void {
     const source: ViewLine[] = [];
     for (const line of this.chat) {
-      if (this.nodeText(line) === undefined) break;
+      if (!this.canBuildWithoutCall(line)) break;
       source.push(line);
     }
     const sourceEnd =
@@ -980,14 +1156,18 @@ export class MemoryStore {
     if (from >= 0) this.compaction.push(...source.slice(from));
 
     this.compactionSize = this.bytes(this.compaction);
-    while (this.compactionSize > COMPACTION_BYTES) {
-      const index = mostDuePair(
-        this.compaction,
-        this.records.length,
-        (parent) => this.nodeText(parent) !== undefined,
-      );
-      if (index === undefined) break;
-      this.compactionSize += this.applyMerge(this.compaction, index);
+    // Merged down to the target only once it passes the bound, so compactions
+    // keep reading each other's view from the prompt cache.
+    if (this.compactionSize > COMPACTION_BYTES) {
+      while (this.compactionSize > COMPACTION_TARGET_BYTES) {
+        const index = mostDuePair(
+          this.compaction,
+          this.records.length,
+          (parent) => this.canBuildWithoutCall(parent),
+        );
+        if (index === undefined) break;
+        this.compactionSize += this.applyMerge(this.compaction, index);
+      }
     }
   }
 
@@ -1017,14 +1197,24 @@ export class MemoryStore {
     let current: ViewLine = [line[0] + 1, Math.floor(line[1] / 2)];
     for (;;) {
       if (!this.withinLog(current)) return;
-      if (this.nodeText(current) !== undefined)
+      if (this.canBuildWithoutCall(current)) {
         current = [current[0] + 1, Math.floor(current[1] / 2)];
-      else {
-        if (this.nodeInputs(current) !== undefined)
-          this.enqueue({ kind: "merge", line: current });
-        return;
+        continue;
       }
+      if (this.inputsReady(current))
+        this.enqueue({ kind: "merge", line: current });
+      return;
     }
+  }
+
+  /** True when a node's inputs exist, without reading them. */
+  private inputsReady(line: ViewLine): boolean {
+    const [l, i] = line;
+    if (l === 0) return this.withinLog(line);
+    return (
+      this.canBuildWithoutCall([l - 1, i * 2]) &&
+      this.canBuildWithoutCall([l - 1, i * 2 + 1])
+    );
   }
 
   private assertOpen(): void {
@@ -1117,30 +1307,5 @@ function readLine(file: string, offset: number): string | undefined {
     }
   } finally {
     closeSync(descriptor);
-  }
-}
-
-function writeAtomically(path: string, content: string): void {
-  const directory = dirname(path);
-  const temporaryPath = join(
-    directory,
-    `.${basename(path)}.${randomUUID()}.tmp`,
-  );
-  let descriptor: number | undefined;
-  try {
-    descriptor = openSync(temporaryPath, "wx", 0o600);
-    writeFileSync(descriptor, content, "utf8");
-    fsyncSync(descriptor);
-    closeSync(descriptor);
-    descriptor = undefined;
-    chmodSync(temporaryPath, 0o600);
-    renameSync(temporaryPath, path);
-  } finally {
-    if (descriptor !== undefined) closeSync(descriptor);
-    try {
-      unlinkSync(temporaryPath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
   }
 }

@@ -1,17 +1,6 @@
-import {
-  closeSync,
-  chmodSync,
-  fsyncSync,
-  openSync,
-  readFileSync,
-  renameSync,
-  unlinkSync,
-  writeFileSync,
-} from "node:fs";
-import { randomUUID } from "node:crypto";
-import { basename, dirname, join } from "node:path";
+import { readFileSync, unlinkSync } from "node:fs";
 import { claimProcessLock } from "./lock.ts";
-import { herdsmanConfigPath } from "./storage.ts";
+import { herdsmanConfigPath, writeAtomically } from "./storage.ts";
 import {
   isLeadExecutionMode,
   isSpawnPlacement,
@@ -122,31 +111,6 @@ export function readConfig(): HerdsmanConfig {
   return { ...DEFAULT_CONFIG, ...readRawConfig() };
 }
 
-function writeConfigAtomically(path: string, content: string): void {
-  const directory = dirname(path);
-  const temporaryPath = join(
-    directory,
-    `.${basename(path)}.${randomUUID()}.tmp`,
-  );
-  let descriptor: number | undefined;
-  try {
-    descriptor = openSync(temporaryPath, "wx", 0o600);
-    writeFileSync(descriptor, content, "utf8");
-    fsyncSync(descriptor);
-    closeSync(descriptor);
-    descriptor = undefined;
-    chmodSync(temporaryPath, 0o600);
-    renameSync(temporaryPath, path);
-  } finally {
-    if (descriptor !== undefined) closeSync(descriptor);
-    try {
-      unlinkSync(temporaryPath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
-  }
-}
-
 export function updateConfig<K extends ConfigKey>(
   key: K,
   value: HerdsmanConfig[K] | undefined,
@@ -179,7 +143,7 @@ export function updateConfig<K extends ConfigKey>(
       current[key] = value;
     } else delete current[key];
     if (Object.keys(current).length)
-      writeConfigAtomically(path, `${JSON.stringify(current, null, 2)}\n`);
+      writeAtomically(path, `${JSON.stringify(current, null, 2)}\n`);
     else {
       try {
         unlinkSync(path);

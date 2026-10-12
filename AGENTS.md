@@ -75,6 +75,7 @@ in `AGENTS.md`.
 - `extension/lock.ts`: Process-lock ownership.
 - `extension/presentation.ts`: Model, TUI, and status presentation.
 - `extension/config.ts`: Flat Pi Herdsman configuration.
+- `extension/memory.ts`: Project memory log, summary tree, view math, and identifier extraction.
 - `extension/supervision.ts`: Chief lease, supervision projection, lead transport, and staff tool contracts.
 - `extension/support.ts`: Shared extension integration-test mocks and fixtures.
 - `extension/extension-contract.test.ts`: Extension and model contract behavior.
