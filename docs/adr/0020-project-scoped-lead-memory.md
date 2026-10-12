@@ -67,11 +67,12 @@ branch that produced it is no longer active.
 
 ### The view in the request
 
-The view replaces history in each request through Pi's `context` event. Needs
-that concern late content follow
-[ADR 0009](0009-preserve-prompt-cache-continuity.md): this is an explicit
-semantic replacement, in the same class as compaction, not an accidental
-rewrite of a reusable prefix.
+The view replaces history in each request through Pi's `context` event. This
+departs on purpose from the preference in
+[ADR 0009](0009-preserve-prompt-cache-continuity.md) for durable append-only
+context over request-local transformations. It is an explicit semantic
+replacement, in the same class as compaction. The byte-stable rule below limits
+its cache cost, and correctness never depends on a cache hit.
 
 The view is byte-stable within a turn. It grows only at the end of a turn,
 between batch merges, and it is never rebuilt from the log. The Lead sees a
@@ -90,10 +91,12 @@ governs managed Agent retirement and is unchanged by this decision.
 ### Roles
 
 Memory belongs to ordinary Leads only. Manager, Chief, and `managed-lead`
-sessions never own it, read it, or write to it, so the role separation in
+sessions never own it, read it, or write to it. The threshold-compaction
+cancellation in
 [ADR 0010](0010-retire-managed-agent-sessions-before-threshold-compaction.md)
-and the launch-policy boundary in
-[ADR 0015](0015-use-reserved-definition-for-managed-project-leads.md) are
+applies to managed Agents, and the memory owner is an ordinary Lead, so the two
+never apply to the same session. The launch-policy boundary in
+[ADR 0015](0015-use-reserved-definition-for-managed-project-leads.md) is
 untouched. Ordinary Lead execution profiles from
 [ADR 0018](0018-use-standalone-lead-execution-profiles.md) do not partition the
 memory: both profiles in one project share the same log and view.
