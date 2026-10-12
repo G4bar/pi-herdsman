@@ -12,23 +12,28 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { buildSessionProjection } from "@earendil-works/pi-coding-agent";
 import type {
   ExtensionAPI,
   ExtensionContext,
+  SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { updateConfig } from "./config.ts";
 import { ProcessLockOccupiedError } from "./lock.ts";
 import {
   MemoryStore,
   projectMemoryRoot,
-  type MemoryCompactor,
-  type MemoryCompactorOptions,
   type MemoryMessage,
 } from "./memory.ts";
+import type {
+  MemoryCompactor,
+  MemoryCompactorOptions,
+  MemoryCompactorFactory,
+} from "./memory-compactor.ts";
 import {
   TURN_SETTLE_GRACE_MS,
+  ordinaryLeadSession,
   registerMemoryRuntime,
-  type MemoryCompactorFactory,
 } from "./memory-runtime.ts";
 import { fakeContext, fakePi } from "./support.ts";
 
@@ -67,7 +72,7 @@ function userEntry(text: string, parentId: string | null = null) {
     ...entryBase(parentId),
     type: "message",
     message: { role: "user", content: text, timestamp: 0 },
-  } as unknown as import("@earendil-works/pi-coding-agent").SessionEntry;
+  } as unknown as SessionEntry;
 }
 
 function assistantEntry(text: string, parentId: string | null = null) {
@@ -75,7 +80,7 @@ function assistantEntry(text: string, parentId: string | null = null) {
     ...entryBase(parentId),
     type: "message",
     message: { role: "assistant", content: [{ type: "text", text }] },
-  } as unknown as import("@earendil-works/pi-coding-agent").SessionEntry;
+  } as unknown as SessionEntry;
 }
 
 function compactionEntry(parentId: string | null = null) {
@@ -85,7 +90,17 @@ function compactionEntry(parentId: string | null = null) {
     summary: "summary",
     firstKeptEntryId: "none",
     tokensBefore: 1,
-  } as unknown as import("@earendil-works/pi-coding-agent").SessionEntry;
+  } as unknown as SessionEntry;
+}
+
+/** Pi omits a failed attempt's messages this way on retry and overflow recovery. */
+function omitEntry(targetId: string, parentId: string | null) {
+  return {
+    ...entryBase(parentId),
+    type: "context_edit",
+    targetId,
+    replacement: null,
+  } as unknown as SessionEntry;
 }
 
 /** A fake compactor: it builds nothing, and records what the runtime asked. */
@@ -131,14 +146,14 @@ class TestSession {
   readonly cwd: string;
   readonly file: string | undefined;
   readonly notices: { message: string; type: string | undefined }[] = [];
-  entries: import("@earendil-works/pi-coding-agent").SessionEntry[];
-  branch: import("@earendil-works/pi-coding-agent").SessionEntry[];
+  entries: SessionEntry[];
+  branch: SessionEntry[];
   signal: AbortSignal | undefined;
 
   constructor(options: {
     cwd: string;
     file?: string;
-    entries?: import("@earendil-works/pi-coding-agent").SessionEntry[];
+    entries?: SessionEntry[];
   }) {
     this.cwd = options.cwd;
     this.file = options.file;
@@ -150,8 +165,14 @@ class TestSession {
   context(): ExtensionContext {
     const context = fakeContext(this.entries, this.branch);
     context.cwd = this.cwd;
-    context.ui.notify = (message: string, type?: string) => {
-      this.notices.push({ message, type });
+    context.ui = {
+      ...context.ui,
+      notify: (...args: unknown[]) => {
+        this.notices.push({
+          message: String(args[0]),
+          type: args[1] as string | undefined,
+        });
+      },
     };
     context.sessionManager = {
       getSessionId: () => "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -159,6 +180,12 @@ class TestSession {
       getSessionFile: () => this.file,
       getEntries: () => this.entries,
       getBranch: () => this.branch,
+      // Pi's own projection, so context edits and compactions are real here.
+      buildSessionProjection: () =>
+        buildSessionProjection(
+          this.entries,
+          this.branch[this.branch.length - 1]?.id ?? null,
+        ),
     } as unknown as typeof context.sessionManager;
     const extended = context as unknown as ExtensionContext;
     (extended as { signal?: AbortSignal }).signal = this.signal;
@@ -229,6 +256,14 @@ class Harness {
     return this.emit(
       "message_end",
       { type: "message_end", message: { role: "assistant" } },
+      session.context(),
+    );
+  }
+
+  turnEnd(session: TestSession): Promise<unknown[]> {
+    return this.emit(
+      "turn_end",
+      { type: "turn_end", turnIndex: 0, message: {}, toolResults: [] },
       session.context(),
     );
   }
@@ -314,6 +349,39 @@ function occupyLock(project: string): void {
 
 test("the settle grace is 30 seconds", () => {
   assert.equal(TURN_SETTLE_GRACE_MS, 30_000);
+});
+
+test("memory applies to an ordinary Lead only", () => {
+  const cases: [string, Parameters<typeof ordinaryLeadSession>[0], boolean][] =
+    [
+      [
+        "ordinary Lead",
+        { isLeadProcess: true, leadRoleActive: true, managedExecution: false },
+        true,
+      ],
+      [
+        "assigned managed Lead using managed-lead",
+        { isLeadProcess: true, leadRoleActive: true, managedExecution: true },
+        false,
+      ],
+      [
+        "Manager or Chief",
+        { isLeadProcess: true, leadRoleActive: false, managedExecution: false },
+        false,
+      ],
+      [
+        "Manager with a managed assignment",
+        { isLeadProcess: true, leadRoleActive: false, managedExecution: true },
+        false,
+      ],
+      [
+        "managed Agent or unmanaged process",
+        { isLeadProcess: false, leadRoleActive: true, managedExecution: false },
+        false,
+      ],
+    ];
+  for (const [name, session, expected] of cases)
+    assert.equal(ordinaryLeadSession(session), expected, name);
 });
 
 type ActivationCase = {
@@ -457,7 +525,7 @@ test("the compactor is started with the Lead's thinking level", async () => {
   await harness.shutdown(session, "quit");
 });
 
-test("ownership is kept across session replacements and released on quit", async () => {
+test("ownership follows the project and is released on shutdown", async () => {
   const project = projectDir();
   const other = projectDir();
   withProjects([project]);
@@ -465,18 +533,7 @@ test("ownership is kept across session replacements and released on quit", async
   const first = new TestSession({ cwd: project, file: "/sessions/a.jsonl" });
   await harness.sessionStart(first);
   assert.equal(harness.compactors.length, 1);
-
-  // /new in the same process keeps the store, the compactor and the lock.
-  const second = new TestSession({
-    cwd: project,
-    file: "/sessions/b.jsonl",
-    entries: [userEntry("hello")],
-  });
-  second.branch = second.entries;
-  await harness.sessionStart(second, "new");
-  assert.equal(harness.compactors.length, 1);
   assert.throws(() => new MemoryStore(project), ProcessLockOccupiedError);
-  assert.equal(mainLog(project).length, 1);
 
   // A session outside the project ends ownership.
   const outside = new TestSession({ cwd: other, file: "/sessions/c.jsonl" });
@@ -485,20 +542,48 @@ test("ownership is kept across session replacements and released on quit", async
   const freed = new MemoryStore(project);
   freed.close();
 
-  // Quit stops the compactor and releases the lock.
+  // A listed session claims the lock again.
+  const second = new TestSession({
+    cwd: project,
+    file: "/sessions/b.jsonl",
+    entries: [userEntry("hello")],
+  });
+  second.branch = second.entries;
   await harness.sessionStart(second, "resume");
   assert.equal(harness.compactors.length, 2);
-  await harness.shutdown(second, "quit");
+  assert.equal(mainLog(project).length, 1);
+
+  // Every shutdown releases, so the next owner is never blocked by this one.
+  await harness.shutdown(second, "new");
   assert.equal(harness.compactors[1].stopped, true);
   const reopened = new MemoryStore(project);
   reopened.close();
+});
 
-  // A reload shutdown releases too; a session replacement does not.
-  await harness.sessionStart(second, "reload");
-  await harness.shutdown(second, "new");
-  assert.equal(harness.compactors[2].stopped, false);
-  await harness.shutdown(second, "reload");
-  assert.equal(harness.compactors[2].stopped, true);
+test("a replacement runtime re-acquires the released lock", async () => {
+  const project = projectDir();
+  withProjects([project]);
+  const session = new TestSession({
+    cwd: project,
+    file: "/sessions/a.jsonl",
+    entries: [userEntry("hello")],
+  });
+  session.branch = session.entries;
+  const first = new Harness();
+  await first.sessionStart(session);
+  assert.equal(first.compactors.length, 1);
+
+  // Pi tears the runtime down and re-runs the extension factory on /new, so the
+  // replacement is a second registration with its own state.
+  const next = new TestSession({ cwd: project, file: "/sessions/b.jsonl" });
+  await first.shutdown(session, "new");
+  assert.equal(first.compactors[0].stopped, true);
+
+  const second = new Harness();
+  await second.sessionStart(next, "new");
+  assert.equal(second.compactors.length, 1);
+  assert.deepEqual(next.notices, []);
+  await second.shutdown(next, "quit");
 });
 
 test("backfill imports the branch once, as notes, and dedupes a fork by hash", async () => {
@@ -690,6 +775,149 @@ test("the view replaces history and the tail follows the anchor", async () => {
   assert.equal(await harness.context(session, extended), undefined);
   assert.equal(await harness.context(session, extended), undefined);
   await harness.shutdown(session, "quit");
+});
+
+test("a context edit narrows the tail to the projected messages", async () => {
+  const project = projectDir();
+  withProjects([project]);
+  const opening = userEntry("opening");
+  const anchored = assistantEntry("anchored reply", opening.id);
+  const session = new TestSession({
+    cwd: project,
+    file: "/sessions/edited.jsonl",
+    entries: [opening, anchored],
+  });
+  session.branch = [opening, anchored];
+  const harness = new Harness();
+  await harness.sessionStart(session);
+  await harness.beforeAgentStart(session);
+
+  // The turn retries: Pi omits the failed attempt's messages, then answers.
+  const prompt = userEntry("second message", anchored.id);
+  const failed = assistantEntry("failed attempt", prompt.id);
+  const toolResult = {
+    ...entryBase(failed.id),
+    type: "message",
+    message: {
+      role: "toolResult",
+      content: [{ type: "text", text: "tool output" }],
+    },
+  } as unknown as SessionEntry;
+  const omittedFailed = omitEntry(failed.id, toolResult.id);
+  const omittedTool = omitEntry(toolResult.id, omittedFailed.id);
+  const retry = assistantEntry("retry reply", omittedTool.id);
+  session.entries = [
+    opening,
+    anchored,
+    prompt,
+    failed,
+    toolResult,
+    omittedFailed,
+    omittedTool,
+    retry,
+  ];
+  session.branch = session.entries;
+
+  // Pi's request holds the retried turn and drops the omitted attempt.
+  const openingMessage = { role: "user", content: "opening" };
+  const anchoredMessage = {
+    role: "assistant",
+    content: [{ type: "text", text: "anchored reply" }],
+  };
+  const promptMessage = { role: "user", content: "second message" };
+  const retryMessage = {
+    role: "assistant",
+    content: [{ type: "text", text: "retry reply" }],
+  };
+  const injected = await harness.context(session, [
+    openingMessage,
+    anchoredMessage,
+    promptMessage,
+    retryMessage,
+  ]);
+  assert.ok(injected);
+  assert.deepEqual(injected.messages.slice(1), [promptMessage, retryMessage]);
+  await harness.shutdown(session, "quit");
+});
+
+test("a message that lands during the grace is in the tail, not the view", async () => {
+  const project = projectDir();
+  withProjects([project]);
+  const opening = userEntry("opening");
+  const session = new TestSession({
+    cwd: project,
+    file: "/sessions/grace.jsonl",
+    entries: [opening],
+  });
+  session.branch = [opening];
+  const harness = new Harness({ hang: true, settleGraceMs: 30 });
+  await harness.sessionStart(session);
+
+  // A message lands while the turn waits for the previous turn's summaries.
+  const late = assistantEntry("late reply", opening.id);
+  const waiting = harness.beforeAgentStart(session);
+  session.entries = [opening, late];
+  session.branch = [opening, late];
+  await harness.messageEnd(session);
+  await waiting;
+
+  const openingMessage = { role: "user", content: "opening" };
+  const lateMessage = {
+    role: "assistant",
+    content: [{ type: "text", text: "late reply" }],
+  };
+  const injected = await harness.context(session, [
+    openingMessage,
+    lateMessage,
+  ]);
+  assert.ok(injected);
+  assert.ok(
+    injected.messages[0].content
+      .slice(1, -1)
+      .every((block: any) => !block.text.includes("late reply")),
+  );
+  assert.deepEqual(injected.messages.slice(1), [lateMessage]);
+  await harness.shutdown(session, "quit");
+});
+
+test("the last message of a turn is logged at turn_end and at shutdown", async () => {
+  const project = projectDir();
+  withProjects([project]);
+  const prompt = userEntry("hello");
+  const session = new TestSession({
+    cwd: project,
+    file: "/sessions/turn.jsonl",
+    entries: [prompt],
+  });
+  session.branch = [prompt];
+  const harness = new Harness();
+  await harness.sessionStart(session);
+  assert.deepEqual(
+    mainLog(project).map((message) => message.text),
+    ["user: hello"],
+  );
+
+  // Pi persists a message after its `message_end` handlers have run.
+  const reply = assistantEntry("first reply", prompt.id);
+  await harness.messageEnd(session);
+  assert.equal(mainLog(project).length, 1);
+  session.entries = [prompt, reply];
+  session.branch = [prompt, reply];
+  await harness.turnEnd(session);
+  assert.deepEqual(
+    mainLog(project).map((message) => message.text),
+    ["user: hello", "first reply"],
+  );
+
+  // A shutdown flushes what no turn boundary saw.
+  const last = assistantEntry("last reply", reply.id);
+  session.entries = [prompt, reply, last];
+  session.branch = [prompt, reply, last];
+  await harness.shutdown(session, "quit");
+  assert.deepEqual(
+    mainLog(project).map((message) => message.text),
+    ["user: hello", "first reply", "last reply"],
+  );
 });
 
 test("an empty memory and an inactive session pass everything through", async () => {

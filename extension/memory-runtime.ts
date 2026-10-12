@@ -9,13 +9,11 @@
 import { readFileSync, readdirSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import {
-  sessionEntryToContextMessages,
   type ContextEvent,
   type ExtensionAPI,
   type ExtensionContext,
+  type ProjectedSessionEntry,
   type SessionBeforeCompactEvent,
-  type SessionEntry,
-  type SessionShutdownEvent,
 } from "@earendil-works/pi-coding-agent";
 import type { TextContent } from "@earendil-works/pi-ai";
 import { readConfig } from "./config.ts";
@@ -90,6 +88,21 @@ type ActiveMemory = {
   /** True once a compaction failure was reported, so an outage notifies once. */
   reported: boolean;
 };
+
+/**
+ * Memory belongs to an ordinary Lead session only: a Lead process that is
+ * neither Manager nor Chief and does not run the `managed-lead` profile of an
+ * assigned managed Lead (ADR 0020).
+ */
+export function ordinaryLeadSession(session: {
+  isLeadProcess: boolean;
+  leadRoleActive: boolean;
+  managedExecution: boolean;
+}): boolean {
+  return (
+    session.isLeadProcess && session.leadRoleActive && !session.managedExecution
+  );
+}
 
 export function registerMemoryRuntime(
   pi: ExtensionAPI,
@@ -279,6 +292,15 @@ export function registerMemoryRuntime(
     if (appended) memory.compactor.onMessage();
   }
 
+  /** Logs every entry that is not in the log yet, without failing the turn. */
+  function flush(memory: ActiveMemory): void {
+    try {
+      logNewEntries(memory);
+    } catch {
+      // A log failure must not fail the turn; the next resume backfills it.
+    }
+  }
+
   /** Waits for the previous turn's nodes, then freezes this turn's view. */
   async function freezeTurn(ctx: ExtensionContext): Promise<void> {
     const memory = owning();
@@ -293,6 +315,10 @@ export function registerMemoryRuntime(
       // nodes unblock, so the 128 KB bound and `view.json` are already current;
       // the freeze below is the turn boundary the request depends on.
       logNewEntries(memory);
+      // The blocks are rendered before the wait for the same reason: a message
+      // that lands while waiting must not enter the view as well as the tail.
+      const blocks = memory.store.renderChatBlocks();
+      const lines = memory.store.view.chat;
       // A ref'd timer: the process must not leave this turn while the previous
       // one is still being summarized.
       const grace = new AbortController();
@@ -306,8 +332,8 @@ export function registerMemoryRuntime(
         clearTimeout(timer);
       }
       memory.frozen = {
-        blocks: memory.store.renderChatBlocks(),
-        lines: memory.store.view.chat,
+        blocks,
+        lines,
         anchor,
         timestamp: Date.now(),
         fallback: false,
@@ -330,11 +356,15 @@ export function registerMemoryRuntime(
     const memory = owning();
     if (!memory) return;
     memory.ctx = ctx;
-    try {
-      logNewEntries(memory);
-    } catch {
-      // A log failure must not fail the turn: the next resume backfills it.
-    }
+    flush(memory);
+  });
+  // Pi persists a message after its `message_end` handlers, so the last message
+  // of a turn is only an entry once the turn ends.
+  pi.on("turn_end", (_event, ctx: ExtensionContext) => {
+    const memory = owning();
+    if (!memory) return;
+    memory.ctx = ctx;
+    flush(memory);
   });
   pi.on("before_agent_start", async (_event, ctx: ExtensionContext) => {
     await freezeTurn(ctx);
@@ -360,11 +390,18 @@ export function registerMemoryRuntime(
     if (event.reason === "threshold") return { cancel: true };
     return;
   });
-  pi.on("session_shutdown", (event: SessionShutdownEvent) => {
-    // Quit and reload tear the extension runtime down. Every other reason is a
-    // session replacement, which keeps the project lock for this process. An
-    // unclassified shutdown cannot hold ownership, so it releases.
-    if (event && event.reason !== "quit" && event.reason !== "reload") return;
+  pi.on("session_shutdown", (_event, ctx: ExtensionContext) => {
+    // A session replacement tears this runtime down and re-runs the extension
+    // factory, and quit or reload starts over from nothing: in every case the
+    // next `session_start` is a new registration that claims the project lock
+    // for itself. Holding it here would leave that session native, with a
+    // spurious "already open" notice, and the compactor running on a disposed
+    // session's ctx. Flush first, because the outgoing session is still on disk.
+    const memory = active;
+    if (memory && ctx) {
+      memory.ctx = ctx;
+      flush(memory);
+    }
     deactivate();
   });
 }
@@ -442,18 +479,21 @@ function loggedHashes(root: string): Set<string> {
   return hashes;
 }
 
-/** What one entry contributes to the request, as Pi projects it. */
-function visibleMessages(entry: SessionEntry): ContextMessage[] {
-  return sessionEntryToContextMessages(entry).filter(
-    (message) => message.role !== "system",
-  );
+/**
+ * What the request holds for one entry, as Pi projects it: a `context_edit`
+ * that omits an entry contributes nothing, so the tail never counts it.
+ */
+function projectedMessages(
+  entry: ProjectedSessionEntry,
+): ContextEvent["messages"] {
+  return entry.messages.filter((message) => message.role !== "system");
 }
 
 /** The last context-producing entry on the branch, or none when it is fresh. */
 function anchorOf(ctx: ExtensionContext): string | null {
   let anchor: string | null = null;
-  for (const entry of ctx.sessionManager.getBranch())
-    if (visibleMessages(entry).length > 0) anchor = entry.id;
+  for (const entry of ctx.sessionManager.buildSessionProjection().entries)
+    if (projectedMessages(entry).length > 0) anchor = entry.sourceEntry.id;
   return anchor;
 }
 
@@ -467,16 +507,16 @@ function tailCount(
 ): number | undefined {
   let after = anchor === null;
   let count = 0;
-  for (const entry of ctx.sessionManager.getBranch()) {
+  for (const entry of ctx.sessionManager.buildSessionProjection().entries) {
     if (!after) {
-      if (entry.id === anchor) after = true;
+      if (entry.sourceEntry.id === anchor) after = true;
       continue;
     }
     // A compaction entry summarizes the history before it, so the tail is no
     // longer the last messages of the request; `buildContextEntries` drops the
     // summarized entries and the fallback handles that turn instead.
-    if (entry.type === "compaction") return undefined;
-    count += visibleMessages(entry).length;
+    if (entry.sourceEntry.type === "compaction") return undefined;
+    count += projectedMessages(entry).length;
   }
   return after ? count : undefined;
 }
