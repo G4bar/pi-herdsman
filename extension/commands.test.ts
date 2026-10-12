@@ -98,9 +98,11 @@ import support, {
   writeAgentState,
 } from "./support.ts";
 import {
+  createLeadAgentEventRuntime,
   createLeadToolState,
   sessionLeadExecutionState,
 } from "./lead-runtime.ts";
+import { MEMORY_LEAD_PROMPT, MEMORY_PROMPT_SECTION } from "./memory-prompts.ts";
 
 const leadTools = [
   "list_agents",
@@ -201,6 +203,122 @@ test("Lead execution state is strict and profile tools preserve only Lead capabi
     }),
     [...baseline, "delegate_agent", "message_supervisor"],
   );
+});
+
+test("project memory tools are projected for both Lead profiles only while active", () => {
+  let active = false;
+  const state = createLeadToolState(
+    () => ["read", "bash", "zoom", "date"].map((name) => ({ name })),
+    [],
+    [],
+    () => (active ? ["zoom", "date"] : []),
+  );
+  const baseline = ["read", "bash"];
+  const flexible = {
+    name: "flexible-lead",
+    path: "flexible-lead.md",
+    frontmatter: { name: "flexible-lead" },
+    body: "",
+  };
+  const orchestrator = {
+    name: "orchestrator-lead",
+    path: "orchestrator-lead.md",
+    frontmatter: { name: "orchestrator-lead", tools: ["read"] },
+    body: "",
+  };
+  const expected = {
+    flexible: [...baseline],
+    orchestrator: ["read"],
+  };
+  assert.deepEqual(
+    state.projectLeadTools(baseline, flexible),
+    expected.flexible,
+  );
+  assert.deepEqual(
+    state.projectLeadTools(baseline, orchestrator),
+    expected.orchestrator,
+  );
+
+  active = true;
+  const withMemory = {
+    flexible: [...expected.flexible, "zoom", "date"],
+    orchestrator: [...expected.orchestrator, "zoom", "date"],
+  };
+  // The order is stable: the same inputs project the same list every time.
+  assert.deepEqual(
+    state.projectLeadTools(baseline, flexible),
+    withMemory.flexible,
+  );
+  assert.deepEqual(
+    state.projectLeadTools(baseline, flexible),
+    withMemory.flexible,
+  );
+  assert.deepEqual(
+    state.projectLeadTools(baseline, orchestrator),
+    withMemory.orchestrator,
+  );
+});
+
+test("the project memory prompt section appears only while memory is active", async () => {
+  let active = false;
+  const runtime = createLeadAgentEventRuntime({
+    isCurrentChief: () => false,
+    setActiveTools: () => {},
+    chiefTools: [],
+    leadInboxRuntime: { holdStartPreflight: () => {} },
+    prepareSupervisionMessage: async () => undefined,
+    sendMessage: () => {},
+    chiefSystemPrompt: () => "",
+    isActiveManager: () => false,
+    roleCharter: () => "charter",
+    isActiveLead: () => true,
+    memoryActive: () => active,
+    executionPrompt: () => "execution body",
+    prepareLeadSupervisorStateMessage: async () => undefined,
+    definitionRoster: () => undefined,
+    consumeChiefStartPreflight: () => {},
+    herdRun: { agentStarted: () => {}, agentSettled: () => {} },
+    controller: {
+      settleAsks: () => {},
+      sessionSignal: () => new AbortController().signal,
+      settleResults: async () => {},
+    },
+    isStaffTool: () => false,
+  } as any);
+  const ctx = { sessionManager: { getSessionId: () => "s" } } as any;
+
+  const off = {
+    systemPromptOptions: { sections: {}, contextFiles: [] },
+  } as any;
+  await runtime.beforeAgentStart(off, ctx);
+  assert.equal(
+    off.systemPromptOptions.sections[MEMORY_PROMPT_SECTION],
+    undefined,
+  );
+  assert.equal(
+    off.systemPromptOptions.sections.pi_herdsman_lead_execution,
+    "execution body",
+  );
+
+  active = true;
+  const first = {
+    systemPromptOptions: { sections: {}, contextFiles: [] },
+  } as any;
+  await runtime.beforeAgentStart(first, ctx);
+  const second = {
+    systemPromptOptions: { sections: {}, contextFiles: [] },
+  } as any;
+  await runtime.beforeAgentStart(second, ctx);
+  assert.equal(
+    first.systemPromptOptions.sections[MEMORY_PROMPT_SECTION],
+    MEMORY_LEAD_PROMPT,
+  );
+  // The section is byte-identical across turns: no dates, counts or state.
+  assert.equal(
+    second.systemPromptOptions.sections[MEMORY_PROMPT_SECTION],
+    first.systemPromptOptions.sections[MEMORY_PROMPT_SECTION],
+  );
+  assert.doesNotMatch(MEMORY_LEAD_PROMPT, /\d{4}-\d{2}-\d{2}/);
 });
 
 test("ordinary Lead profile switches retain the saved tool baseline", async () => {

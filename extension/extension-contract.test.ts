@@ -47,6 +47,7 @@ import type {
   ManagedAgentState,
 } from "./mailbox.ts";
 import { OperationError } from "./errors.ts";
+import { MEMORY_TOOL_NAMES } from "./memory-prompts.ts";
 import support, {
   CHILD_SESSION_ID,
   DEFAULT_PI_SESSION_ID,
@@ -373,6 +374,8 @@ test("semantic coordination tools expose exact strict object contracts", () => {
       "delegate_project",
       "resume_project",
       "stop_lead",
+      "zoom",
+      "date",
     ].sort(),
   );
   for (const name of [
@@ -694,6 +697,8 @@ test("registered lead and unmanaged roles expose the correct surface", async () 
       "delegate_project",
       "resume_project",
       "stop_lead",
+      "zoom",
+      "date",
     ].sort(),
   );
   assert.equal(
@@ -702,6 +707,8 @@ test("registered lead and unmanaged roles expose the correct surface", async () 
   );
   for (const tool of lead.tools) {
     assertPortableToolSchema(tool);
+    // The memory tools are plain reads and use Pi's default renderer.
+    if (MEMORY_TOOL_NAMES.includes(tool.name as never)) continue;
     assert.equal(tool.executionMode, "sequential");
     assert.equal(typeof tool.renderCall, "function");
     assert.equal(typeof tool.renderResult, "function");

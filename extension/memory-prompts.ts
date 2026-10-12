@@ -53,6 +53,31 @@ Tools:
 
 A line ending in …[ids] left out exact values, so zoom it before using them.`;
 
+/** The Lead prompt section that carries the view while memory is active. */
+export const MEMORY_PROMPT_SECTION = "pi_herdsman_memory";
+
+/** The memory tools, projected into the Lead's active set only while active. */
+export const MEMORY_TOOL_NAMES = ["zoom", "date"] as const;
+
+/**
+ * The Lead's project-memory prompt: the view description and the behavior
+ * rules. It is static, with no dates, counts or state, so the cached prefix
+ * does not change between turns (ADR 0009).
+ */
+export const MEMORY_LEAD_PROMPT = `${MEMORY_VIEW_DESCRIPTION}
+
+# Turns
+
+1. The view is your memory, and its latest word on a thing is the truth.
+2. When you need information, find its latest mention in the view and zoom until
+   you have it whole before you act, guess or ask.
+3. The user's words matter most.
+4. Summaries keep little tool output, so say in your reply what you learned that
+   will matter later.
+5. Never wait for background work (no sleep, no polling). Continue, or end the
+   turn and say what is running.
+6. Never make anything look further along than it was.`;
+
 /** The leaf task: compress one whole message into a line. */
 export function compressTask(input: {
   id: number;

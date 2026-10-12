@@ -252,6 +252,7 @@ import {
   ordinaryLeadSession,
   registerMemoryRuntime,
 } from "./memory-runtime.ts";
+import { MEMORY_TOOL_NAMES } from "./memory-prompts.ts";
 import {
   MAX_BYTE_LIMIT,
   MIN_BYTE_LIMIT,
@@ -1063,6 +1064,9 @@ export default function (pi: ExtensionAPI): void {
     { sessionId: string; definitions: Record<string, unknown>[] } | undefined;
   let leadRuntime!: LeadRuntimeState;
   let leadToolState!: ReturnType<typeof createLeadToolState>;
+  // Replaced by the memory runtime's handle, so tool projection and the Lead
+  // prompt section can see ownership without importing memory-runtime.
+  let projectMemoryActive = (): boolean => false;
   const activeRole = (): SessionRole => activeLeadRole(leadRuntime);
   const supervisionHost = {
     herdrSessionSnapshot,
@@ -1128,6 +1132,7 @@ export default function (pi: ExtensionAPI): void {
     "chief",
     "peer",
     "staff",
+    ...MEMORY_TOOL_NAMES,
     ...AGENT_COORDINATION_TOOLS,
     ...LEAD_SUPERVISOR_TOOLS,
     ...PEER_TOOLS,
@@ -1401,6 +1406,7 @@ export default function (pi: ExtensionAPI): void {
       isActiveManager: () =>
         activeRole() === "manager" && !leadRuntime.roleSuspended,
       isActiveLead: () => activeRole() === "lead",
+      memoryActive: () => projectMemoryActive(),
       prepareLeadSupervisorStateMessage: (ctx: ExtensionContext) =>
         leadRuntimes.coordinationRuntime!.prepareLeadSupervisorStateMessage(
           ctx,
@@ -2240,14 +2246,16 @@ export default function (pi: ExtensionAPI): void {
             renderCoordinationResult("peer", "message", r, o, t, c),
         });
       }
-      registerMemoryRuntime(pi, {
+      const memoryRuntime = registerMemoryRuntime(pi, {
         isOrdinaryLead: () =>
           ordinaryLeadSession({
             isLeadProcess: controllerScope.kind === "lead",
             leadRoleActive: roleTransitions.leadPresentationAllowed(),
             managedExecution: leadRuntimes.leadExecutionPresentation().managed,
           }),
+        onActiveChange: () => roleTransitions.reconcileRoleTools(),
       });
+      projectMemoryActive = memoryRuntime.isActive;
     }
   }
   if (processRole !== "managed-agent") return;

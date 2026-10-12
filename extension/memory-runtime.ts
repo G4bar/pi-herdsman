@@ -12,17 +12,25 @@ import {
   type ContextEvent,
   type ExtensionAPI,
   type ExtensionContext,
+  type FileEntry,
   type ProjectedSessionEntry,
   type SessionBeforeCompactEvent,
+  type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
-import type { TextContent } from "@earendil-works/pi-ai";
+import { parseSessionEntries } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import { readConfig } from "./config.ts";
 import { ProcessLockOccupiedError, readProcessLockStatus } from "./lock.ts";
 import {
   MemoryStore,
   deriveMessages,
+  nodeAt,
+  nodeStart,
   projectMemoryRoot,
+  renderLine,
   type DerivedMessage,
+  type MemorySource,
   type ViewLine,
 } from "./memory.ts";
 import {
@@ -53,6 +61,8 @@ export type MemoryRuntimeOptions = {
   settleGraceMs?: number;
   /** The compactor factory. Tests inject a fake. */
   startCompactor?: MemoryCompactorFactory;
+  /** Called whenever ownership starts or ends, so tools and prompts follow. */
+  onActiveChange?: () => void;
 };
 
 type ContextMessage = ContextEvent["messages"][number];
@@ -109,7 +119,7 @@ export function ordinaryLeadSession(session: {
 export function registerMemoryRuntime(
   pi: ExtensionAPI,
   options: MemoryRuntimeOptions,
-): void {
+): { isActive(): boolean } {
   const settleGraceMs = options.settleGraceMs ?? TURN_SETTLE_GRACE_MS;
   const startCompactor = options.startCompactor ?? startMemoryCompactor;
   let active: ActiveMemory | undefined;
@@ -141,6 +151,7 @@ export function registerMemoryRuntime(
     } catch {
       // A lock that changed owner is not this session's to release.
     }
+    options.onActiveChange?.();
   }
 
   /** Names the live owner, so a second concurrent session is not a mystery. */
@@ -235,6 +246,7 @@ export function registerMemoryRuntime(
         frozen: undefined,
         reported: false,
       };
+      options.onActiveChange?.();
     }
     bind(ctx);
   }
@@ -352,6 +364,57 @@ export function registerMemoryRuntime(
     }
   }
 
+  // The tools are always registered for the Lead role and activated only while
+  // memory is active, so an inactive project's tool list stays unchanged.
+  function toolStore(): MemoryStore {
+    const memory = owning();
+    if (!memory)
+      throw new Error("Project memory is not active in this session.");
+    return memory.store;
+  }
+
+  pi.registerTool({
+    name: "zoom",
+    label: "zoom",
+    description:
+      "Open the line id+n of the view into the two lines of n/2 under it; n = 1 gives the message whole.",
+    promptSnippet: undefined,
+    exposure: "model-only",
+    executionMode: "sequential",
+    defaultActive: false,
+    parameters: Type.Object(
+      { id: Type.Integer({ minimum: 0 }), n: Type.Integer({ minimum: 1 }) },
+      { additionalProperties: false },
+    ),
+    execute: async (
+      _toolCallId: string,
+      params: { id: number; n: number },
+      _signal: AbortSignal | undefined,
+      _update: unknown,
+      ctx: ExtensionContext,
+    ) => zoomResult(toolStore(), ctx, params.id, params.n),
+  });
+  pi.registerTool({
+    name: "date",
+    label: "date",
+    description: "The date and time of message id.",
+    promptSnippet: undefined,
+    exposure: "model-only",
+    executionMode: "sequential",
+    defaultActive: false,
+    parameters: Type.Object(
+      { id: Type.Integer({ minimum: 0 }) },
+      { additionalProperties: false },
+    ),
+    execute: async (
+      _toolCallId: string,
+      params: { id: number },
+      _signal: AbortSignal | undefined,
+      _update: unknown,
+      _ctx: ExtensionContext,
+    ) => dateResult(toolStore(), params.id),
+  });
+
   pi.on("session_start", (_event, ctx: ExtensionContext) => {
     try {
       activate(ctx);
@@ -412,6 +475,8 @@ export function registerMemoryRuntime(
     }
     deactivate();
   });
+
+  return { isActive: () => active !== undefined };
 }
 
 /** The listed project path the cwd resolves to, or undefined when it is not listed. */
@@ -550,4 +615,166 @@ function closeQuietly(store: MemoryStore): void {
 function reason(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   return message.replace(/^Error: /, "");
+}
+
+// --- zoom and date ----------------------------------------------------------
+
+/**
+ * Opens a view line: the two child lines for n > 1, the message itself for
+ * n = 1. The text is the stored original, never a re-summary.
+ */
+function zoomResult(
+  store: MemoryStore,
+  ctx: ExtensionContext,
+  id: number,
+  n: number,
+): {
+  content: (TextContent | ImageContent)[];
+  details: Record<string, unknown>;
+} {
+  const T = store.messageCount;
+  throwIfZoomInvalid(id, n, T);
+  if (n === 1) {
+    const kind = store.messageKind(id) ?? "user";
+    const source = store.messageSource(id);
+    const content: (TextContent | ImageContent)[] = [
+      { type: "text", text: `${kind}: ${store.messageText(id) ?? ""}` },
+    ];
+    if (source?.images) {
+      const images = sourceImages(source, ctx);
+      if (images === undefined)
+        content.push({
+          type: "text",
+          text: "[image unavailable: session file missing]",
+        });
+      else content.push(...images);
+    }
+    return {
+      content,
+      details: {
+        id,
+        n,
+        ranges: [[0, id]],
+        ...(source ? { session: source.session, entry: source.entry } : {}),
+      },
+    };
+  }
+  const ranges: ViewLine[] = [];
+  const lines: string[] = [];
+  for (const child of [nodeAt(id, n / 2), nodeAt(id + n / 2, n / 2)]) {
+    if (!child || nodeStart(child) >= T) continue;
+    lines.push(renderLine(child, store.nodeText(child)));
+    ranges.push(child);
+  }
+  return {
+    content: [{ type: "text", text: lines.join("\n") }],
+    details: { id, n, ranges },
+  };
+}
+
+/** One sentence naming the broken rule and a form that would work. */
+function throwIfZoomInvalid(id: number, n: number, T: number): void {
+  if (!Number.isInteger(n) || n < 1 || !Number.isInteger(Math.log2(n)))
+    throw new Error(
+      "n must be a power of two: use zoom(id, 1), zoom(id, 2), zoom(id, 4), …",
+    );
+  throwIfIdOutOfRange(id, T, "zoom");
+  if (id % n !== 0)
+    throw new Error(
+      `id must be a multiple of n: use zoom(${Math.floor(id / n) * n}, ${n})`,
+    );
+}
+
+function dateResult(
+  store: MemoryStore,
+  id: number,
+): { content: TextContent[]; details: { id: number; date: string } } {
+  const T = store.messageCount;
+  throwIfIdOutOfRange(id, T, "date");
+  const date = formatLocalDate(store.messageDate(id) ?? "");
+  return { content: [{ type: "text", text: date }], details: { id, date } };
+}
+
+function throwIfIdOutOfRange(id: number, T: number, label: string): void {
+  if (!Number.isInteger(id) || id < 0)
+    throw new Error(`id must be a non-negative integer: use ${label}(0)`);
+  if (id >= T)
+    throw new Error(
+      T === 0
+        ? "id must be below the project log count: the log is empty"
+        : `id must be below the project log count ${T}: use ${label}(${T - 1})`,
+    );
+}
+
+/** `YYYY-MM-DD HH:MM:SS` in local time, followed by the UTC offset. */
+function formatLocalDate(value: string): string {
+  const at = new Date(value);
+  if (!Number.isFinite(at.getTime())) return value;
+  const pad = (part: number) => String(part).padStart(2, "0");
+  const local = `${at.getFullYear()}-${pad(at.getMonth() + 1)}-${pad(at.getDate())} ${pad(at.getHours())}:${pad(at.getMinutes())}:${pad(at.getSeconds())}`;
+  const offset = -at.getTimezoneOffset();
+  const sign = offset < 0 ? "-" : "+";
+  const size = Math.abs(offset);
+  return `${local} ${sign}${pad(Math.floor(size / 60))}:${pad(size % 60)}`;
+}
+
+/** Parsed image blocks per old session file, so each is parsed at most once. */
+const sessionImageCache = new Map<string, Map<string, ImageContent[]>>();
+
+/**
+ * The images a record pointed at, or undefined when its session file is gone.
+ * The current session is read in memory; an old one is parsed once and cached.
+ */
+function sourceImages(
+  source: MemorySource,
+  ctx: ExtensionContext,
+): ImageContent[] | undefined {
+  if (source.session === ctx.sessionManager.getSessionFile()) {
+    const entry = ctx.sessionManager
+      .getEntries()
+      .find((candidate) => candidate.id === source.entry);
+    return entry ? imageBlocks(entry) : [];
+  }
+  const cached = sessionImageCache.get(source.session);
+  if (cached) return cached.get(source.entry) ?? [];
+  let content: string;
+  try {
+    content = readFileSync(source.session, "utf8");
+  } catch {
+    return undefined;
+  }
+  const images = new Map<string, ImageContent[]>();
+  for (const entry of parseSessionEntries(content)) {
+    const blocks = imageBlocks(entry);
+    if (blocks.length > 0) images.set(entry.id, blocks);
+  }
+  sessionImageCache.set(source.session, images);
+  return images.get(source.entry) ?? [];
+}
+
+function imageBlocks(entry: SessionEntry | FileEntry): ImageContent[] {
+  if (entry.type === "message") return imageContent(entry.message.content);
+  if (entry.type === "custom_message") return imageContent(entry.content);
+  return [];
+}
+
+function imageContent(content: unknown): ImageContent[] {
+  if (!Array.isArray(content)) return [];
+  return content.filter(isImageContent);
+}
+
+function isImageContent(block: unknown): block is ImageContent {
+  if (!block || typeof block !== "object") return false;
+  // SAFETY: every content block carries a `type`; the fields checked here are
+  // the ones the image block contract requires.
+  const candidate = block as {
+    type?: unknown;
+    data?: unknown;
+    mimeType?: unknown;
+  };
+  return (
+    candidate.type === "image" &&
+    typeof candidate.data === "string" &&
+    typeof candidate.mimeType === "string"
+  );
 }

@@ -1043,3 +1043,334 @@ test("a compaction failure notifies once and a shutdown stops the compactor", as
   await harness.shutdown(session, "quit");
   assert.equal(compactor.stopped, true);
 });
+
+// --- zoom and date ----------------------------------------------------------
+
+const IMAGE_BLOCK = { type: "image", data: "aGVsbG8=", mimeType: "image/png" };
+
+/** A user entry whose content carries one image, so its record flags `src`. */
+function imageUserEntry(text: string, parentId: string | null = null) {
+  return {
+    ...entryBase(parentId),
+    type: "message",
+    message: {
+      role: "user",
+      content: [{ type: "text", text }, { ...IMAGE_BLOCK }],
+      timestamp: 0,
+    },
+  } as unknown as SessionEntry;
+}
+
+function writeSessionFile(
+  dir: string,
+  id: string,
+  entry: SessionEntry,
+): string {
+  const file = join(dir, `${id}.jsonl`);
+  const header = {
+    type: "session",
+    version: 3,
+    id,
+    timestamp: new Date().toISOString(),
+    cwd: dir,
+  };
+  writeFileSync(file, `${JSON.stringify(header)}\n${JSON.stringify(entry)}\n`);
+  return file;
+}
+
+function memoryTool(harness: Harness, name: string): any {
+  const found = harness.pi.tools.find((candidate) => candidate.name === name);
+  assert.ok(found, `the ${name} tool is registered`);
+  return found;
+}
+
+function callMemoryTool(
+  harness: Harness,
+  session: TestSession,
+  name: string,
+  params: Record<string, unknown>,
+): Promise<any> {
+  return memoryTool(harness, name).execute(
+    "call",
+    params,
+    undefined,
+    undefined,
+    session.context(),
+  );
+}
+
+function resultText(result: any): string {
+  return result.content.map((block: any) => block.text).join("\n");
+}
+
+/** A session with four small entries, so T = 4 and every leaf is call-free. */
+function fourEntrySession(project: string, file: string): TestSession {
+  const entries = [
+    userEntry("first"),
+    assistantEntry("second"),
+    userEntry("third"),
+    assistantEntry("fourth"),
+  ];
+  entries[1].parentId = entries[0].id;
+  entries[2].parentId = entries[1].id;
+  entries[3].parentId = entries[2].id;
+  const session = new TestSession({ cwd: project, file, entries });
+  session.branch = entries;
+  return session;
+}
+
+test("zoom n > 1 returns the two child lines", async () => {
+  const project = projectDir();
+  withProjects([project]);
+  const session = fourEntrySession(project, "/sessions/zoom.jsonl");
+  const harness = new Harness();
+  await harness.sessionStart(session);
+
+  const result = await callMemoryTool(harness, session, "zoom", {
+    id: 0,
+    n: 2,
+  });
+  assert.equal(
+    resultText(result),
+    "0+1|note: user: first\n1+1|note: lead: second",
+  );
+  assert.deepEqual(result.details, {
+    id: 0,
+    n: 2,
+    ranges: [
+      [0, 0],
+      [0, 1],
+    ],
+  });
+  await harness.shutdown(session, "quit");
+});
+
+test("zoom shows a placeholder for an unbuilt child and omits one past T", async () => {
+  const project = projectDir();
+  withProjects([project]);
+  const long = userEntry("x".repeat(600));
+  const short = assistantEntry("short", long.id);
+  const session = new TestSession({
+    cwd: project,
+    file: "/sessions/placeholder.jsonl",
+    entries: [long, short],
+  });
+  session.branch = [long, short];
+  const harness = new Harness();
+  await harness.sessionStart(session);
+
+  const opened = await callMemoryTool(harness, session, "zoom", {
+    id: 0,
+    n: 2,
+  });
+  assert.equal(
+    resultText(opened),
+    "0+1|(not summarized yet: zoom it)\n1+1|note: lead: short",
+  );
+
+  // A child whose start is at T is omitted: T is 2, so 2+1 is not a line.
+  const past = await callMemoryTool(harness, session, "zoom", { id: 0, n: 4 });
+  assert.equal(resultText(past), "0+2|(not summarized yet: zoom it)");
+  assert.deepEqual(past.details.ranges, [[1, 0]]);
+  await harness.shutdown(session, "quit");
+});
+
+test("zoom rejects a bad n, a misaligned id and an out-of-range id", async () => {
+  const project = projectDir();
+  withProjects([project]);
+  const session = fourEntrySession(project, "/sessions/zoom-errors.jsonl");
+  const harness = new Harness();
+  await harness.sessionStart(session);
+
+  await assert.rejects(
+    callMemoryTool(harness, session, "zoom", { id: 0, n: 3 }),
+    /n must be a power of two/,
+  );
+  await assert.rejects(
+    callMemoryTool(harness, session, "zoom", { id: 1, n: 2 }),
+    /id must be a multiple of n/,
+  );
+  await assert.rejects(
+    callMemoryTool(harness, session, "zoom", { id: 4, n: 1 }),
+    /below the project log count 4/,
+  );
+  await assert.rejects(
+    callMemoryTool(harness, session, "zoom", { id: -1, n: 1 }),
+    /non-negative integer/,
+  );
+  await harness.shutdown(session, "quit");
+});
+
+test("zoom n = 1 returns the message whole with its images", async () => {
+  const project = projectDir();
+  withProjects([project]);
+  const session = new TestSession({
+    cwd: project,
+    file: "/sessions/current-images.jsonl",
+  });
+  const harness = new Harness();
+  await harness.sessionStart(session);
+  const store = harness.compactors[0].store;
+
+  // The current session: the image lives in its in-memory entries.
+  const current = imageUserEntry("look here");
+  session.entries = [current];
+  store.appendMessage({
+    kind: "user",
+    text: "look here",
+    size: 9,
+    date: current.timestamp,
+    src: { session: session.file!, entry: current.id, part: 0, images: true },
+    hash: "image-current",
+  });
+  const fromCurrent = await callMemoryTool(harness, session, "zoom", {
+    id: 0,
+    n: 1,
+  });
+  assert.equal(fromCurrent.content[0].text, "user: look here");
+  assert.deepEqual(fromCurrent.content[1], IMAGE_BLOCK);
+  assert.equal(fromCurrent.details.session, session.file);
+
+  // An older session file: parsed once, and its images come back.
+  const dir = projectDir();
+  const older = imageUserEntry("from before");
+  const olderFile = writeSessionFile(dir, "older-session", older);
+  store.appendMessage({
+    kind: "user",
+    text: "from before",
+    size: 11,
+    date: older.timestamp,
+    src: { session: olderFile, entry: older.id, part: 0, images: true },
+    hash: "image-older",
+  });
+  const fromFile = await callMemoryTool(harness, session, "zoom", {
+    id: 1,
+    n: 1,
+  });
+  assert.equal(fromFile.content[0].text, "user: from before");
+  assert.deepEqual(fromFile.content[1], IMAGE_BLOCK);
+
+  // A session file that is gone is reported, not hidden.
+  store.appendMessage({
+    kind: "user",
+    text: "gone image",
+    size: 10,
+    date: older.timestamp,
+    src: {
+      session: `/nonexistent/${randomUUID()}.jsonl`,
+      entry: "gone",
+      part: 0,
+      images: true,
+    },
+    hash: "image-gone",
+  });
+  const fromGone = await callMemoryTool(harness, session, "zoom", {
+    id: 2,
+    n: 1,
+  });
+  assert.equal(fromGone.content[0].text, "user: gone image");
+  assert.equal(
+    fromGone.content[1].text,
+    "[image unavailable: session file missing]",
+  );
+  await harness.shutdown(session, "quit");
+});
+
+test("an id from an earlier session resolves from a new session", async () => {
+  const project = projectDir();
+  withProjects([project]);
+  const first = new TestSession({
+    cwd: project,
+    file: "/sessions/earlier.jsonl",
+    entries: [userEntry("kept across sessions")],
+  });
+  first.branch = first.entries;
+  const harness = new Harness();
+  await harness.sessionStart(first);
+  await harness.shutdown(first, "quit");
+
+  const second = new TestSession({
+    cwd: project,
+    file: "/sessions/later.jsonl",
+  });
+  await harness.sessionStart(second, "new");
+  const result = await callMemoryTool(harness, second, "zoom", {
+    id: 0,
+    n: 1,
+  });
+  assert.equal(result.content[0].text, "note: user: kept across sessions");
+  await harness.shutdown(second, "quit");
+});
+
+test("date formats the record in local time with its UTC offset and rejects a range", async () => {
+  const project = projectDir();
+  withProjects([project]);
+  const entry = userEntry("dated");
+  entry.timestamp = "2026-01-02T03:04:05.000Z";
+  const session = new TestSession({
+    cwd: project,
+    file: "/sessions/date.jsonl",
+    entries: [entry],
+  });
+  session.branch = [entry];
+  const harness = new Harness();
+  await harness.sessionStart(session);
+
+  const result = await callMemoryTool(harness, session, "date", { id: 0 });
+  const text = result.content[0].text as string;
+  assert.match(text, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{2}:\d{2}$/);
+  const [day, clock, offset] = text.split(" ");
+  assert.equal(
+    Date.parse(`${day}T${clock}${offset}`),
+    Date.parse(entry.timestamp),
+  );
+  assert.equal(result.details.date, text);
+
+  await assert.rejects(
+    callMemoryTool(harness, session, "date", { id: 1 }),
+    /below the project log count 1/,
+  );
+  await harness.shutdown(session, "quit");
+});
+
+test("the memory tools are registered but inactive without memory", async () => {
+  const harness = new Harness();
+  assert.equal(memoryTool(harness, "zoom").defaultActive, false);
+  assert.equal(memoryTool(harness, "date").defaultActive, false);
+  assert.ok(!harness.pi.pi.getActiveTools().includes("zoom"));
+  assert.ok(!harness.pi.pi.getActiveTools().includes("date"));
+
+  const session = new TestSession({
+    cwd: projectDir(),
+    file: "/sessions/inactive.jsonl",
+  });
+  await assert.rejects(
+    callMemoryTool(harness, session, "zoom", { id: 0, n: 1 }),
+    /Project memory is not active/,
+  );
+  await assert.rejects(
+    callMemoryTool(harness, session, "date", { id: 0 }),
+    /Project memory is not active/,
+  );
+});
+
+test("an empty project reports the empty log to zoom and date", async () => {
+  const project = projectDir();
+  withProjects([project]);
+  const session = new TestSession({
+    cwd: project,
+    file: "/sessions/empty-log.jsonl",
+  });
+  const harness = new Harness();
+  await harness.sessionStart(session);
+
+  await assert.rejects(
+    callMemoryTool(harness, session, "zoom", { id: 0, n: 1 }),
+    /the log is empty/,
+  );
+  await assert.rejects(
+    callMemoryTool(harness, session, "date", { id: 0 }),
+    /the log is empty/,
+  );
+  await harness.shutdown(session, "quit");
+});

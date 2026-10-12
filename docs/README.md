@@ -21,6 +21,13 @@ independent branch-based work through Manager and multiple Leads.
 Read [Coordination](concepts/coordination.md) when you need the underlying role,
 authority, project-scope, and ownership model.
 
+## Manage project memory
+
+In opted-in projects, ordinary Lead sessions share one never-ending project
+memory. Read [Project memory](concepts/memory.md) for the view, scope, and cost,
+and the [memory tools reference](reference/memory-tools.md) for `zoom` and
+`date`.
+
 ## Understand Agents
 
 - [Agents and identity](concepts/agents.md)

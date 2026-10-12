@@ -753,6 +753,10 @@ export class MemoryStore {
     return this.records[i]?.kind;
   }
 
+  messageDate(i: number): string | undefined {
+    return this.records[i]?.date;
+  }
+
   messageSource(i: number): MemorySource | undefined {
     const record = this.records[i];
     return record

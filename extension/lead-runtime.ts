@@ -92,6 +92,11 @@ import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { randomUUID } from "node:crypto";
 import { realpathSync, statSync, unlinkSync } from "node:fs";
 import { persistedTranscriptReady as controllerPersistedTranscriptReady } from "./agent-controller.ts";
+import {
+  MEMORY_LEAD_PROMPT,
+  MEMORY_PROMPT_SECTION,
+  MEMORY_TOOL_NAMES,
+} from "./memory-prompts.ts";
 
 type LeadIdentityHost = {
   expectedSession(id: string, path?: string): ExpectedSession;
@@ -692,6 +697,7 @@ export function createLeadToolState(
   getAllTools: () => readonly { name: string }[],
   ownedNames: readonly string[],
   leadCoordinationNames: readonly string[],
+  memoryToolNames: () => readonly string[] = () => [],
 ) {
   const ownedTools = new Set(ownedNames);
   let leadTools: string[] | undefined;
@@ -732,7 +738,7 @@ export function createLeadToolState(
       policy.excluded.some((pattern) => matchesToolPattern(pattern, name));
     return appendRegisteredTools(
       normalizeBaseTools(selected.filter((name) => !excluded(name))),
-      leadCoordinationNames,
+      [...leadCoordinationNames, ...memoryToolNames()],
     );
   };
   return {
@@ -1208,6 +1214,7 @@ export function createLeadAgentEventRuntime(host: {
   isActiveManager(): boolean;
   roleCharter(): string;
   isActiveLead(): boolean;
+  memoryActive(): boolean;
   executionPrompt(): string | undefined;
   prepareLeadSupervisorStateMessage(
     ctx: ExtensionContext,
@@ -1256,6 +1263,9 @@ export function createLeadAgentEventRuntime(host: {
       const prompt = host.isActiveLead() ? host.executionPrompt() : undefined;
       if (prompt) sections.pi_herdsman_lead_execution = prompt;
       else delete sections.pi_herdsman_lead_execution;
+      if (host.memoryActive())
+        sections[MEMORY_PROMPT_SECTION] = MEMORY_LEAD_PROMPT;
+      else delete sections[MEMORY_PROMPT_SECTION];
       if (roster && roster.sessionId === ctx.sessionManager.getSessionId())
         sections.agent_definitions =
           `${JSON.stringify(roster.definitions, null, 2)}\n\n` +
@@ -2160,6 +2170,8 @@ export function registerLeadRuntime(
       () => pi.getAllTools(),
       options.ownedToolNames,
       options.leadCoordinationToolNames,
+      () =>
+        options.agentEventOptions.memoryActive() ? [...MEMORY_TOOL_NAMES] : [],
     );
   options.leadRuntime = leadRuntime;
   options.leadToolState = leadToolState;
