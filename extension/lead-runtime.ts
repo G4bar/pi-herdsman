@@ -78,6 +78,7 @@ import {
   type LeadDefinitionName,
 } from "./agent-definitions.ts";
 import type { MessageFileInput } from "./core.ts";
+import { modelToken, resolveConfiguredModel } from "./model-selection.ts";
 import type { ManagedAgentState, ResultBinding } from "./mailbox.ts";
 import {
   compactModelToken,
@@ -1286,8 +1287,6 @@ export function createLeadAgentEventRuntime(host: {
 }
 
 export function createLeadCommandRuntime(host: LeadCommandHost) {
-  const modelToken = (model: { provider: string; id: string }): string =>
-    `${model.provider}/${model.id}`;
   return {
     async openPlacementMenu(ctx: ExtensionCommandContext): Promise<void> {
       const current = await host.placementSettings(ctx);
@@ -1411,21 +1410,6 @@ export function createLeadCommandRuntime(host: LeadCommandHost) {
               ? definition.frontmatter.thinking
               : `inherit · ${host.getThinkingLevel()}`,
       };
-    },
-    resolveConfiguredModel(
-      ctx: ExtensionContext,
-      configured: string,
-    ): Model | undefined {
-      const models = ctx.modelRegistry.getAll();
-      const canonical = models.find(
-        (candidate: Model) => modelToken(candidate) === configured,
-      );
-      if (canonical) return canonical;
-      const compactMatches = models.filter(
-        (candidate: Model) =>
-          compactModelToken(modelToken(candidate)) === configured,
-      );
-      return compactMatches.length === 1 ? compactMatches[0] : undefined;
     },
     async openDefinitionsMenu(ctx: ExtensionCommandContext): Promise<void> {
       let selectedDefinition: string | undefined;
@@ -1624,7 +1608,7 @@ export function createLeadCommandRuntime(host: LeadCommandHost) {
                 ? definition.frontmatter.model
                 : undefined;
             if (configured && !tokens.includes(configured)) {
-              const resolved = this.resolveConfiguredModel(ctx, configured);
+              const resolved = resolveConfiguredModel(ctx, configured);
               const resolvedToken = resolved
                 ? modelToken(resolved)
                 : configured;
@@ -1636,7 +1620,7 @@ export function createLeadCommandRuntime(host: LeadCommandHost) {
               idCounts.set(id, (idCounts.get(id) ?? 0) + 1);
             }
             const resolvedConfigured = configured
-              ? this.resolveConfiguredModel(ctx, configured)
+              ? resolveConfiguredModel(ctx, configured)
               : undefined;
             const modelsByToken = new Map(
               models.map((item: Model) => [modelToken(item), item]),
@@ -1680,7 +1664,7 @@ export function createLeadCommandRuntime(host: LeadCommandHost) {
                 ? definition.frontmatter.model
                 : undefined;
             const model = configured
-              ? this.resolveConfiguredModel(ctx, configured)
+              ? resolveConfiguredModel(ctx, configured)
               : ctx.model;
             const levels = model
               ? getSupportedThinkingLevels(model)
