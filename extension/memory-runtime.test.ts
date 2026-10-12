@@ -113,6 +113,8 @@ class FakeCompactor implements MemoryCompactor {
   stopped = false;
   /** When true, `whenSettled` only ends with the signal. */
   hang = false;
+  /** Runs at the start of `whenSettled`, so a test can build during the wait. */
+  duringSettle: (() => void) | undefined;
 
   constructor(store: MemoryStore, options: MemoryCompactorOptions) {
     this.store = store;
@@ -126,6 +128,7 @@ class FakeCompactor implements MemoryCompactor {
   async whenSettled(upToIndex: number, signal?: AbortSignal): Promise<void> {
     this.settled.push(upToIndex);
     this.signals.push(signal);
+    this.duringSettle?.();
     if (!this.hang) return;
     await new Promise<void>((resolve) => {
       if (signal?.aborted) {
@@ -877,6 +880,35 @@ test("a message that lands during the grace is in the tail, not the view", async
       .every((block: any) => !block.text.includes("late reply")),
   );
   assert.deepEqual(injected.messages.slice(1), [lateMessage]);
+  await harness.shutdown(session, "quit");
+});
+
+test("a node built during the grace is in the frozen view", async () => {
+  const project = projectDir();
+  withProjects([project]);
+  // Over 512 bytes, so the line needs a call and starts as a placeholder.
+  const long = userEntry("x".repeat(600));
+  const session = new TestSession({
+    cwd: project,
+    file: "/sessions/built.jsonl",
+    entries: [long],
+  });
+  session.branch = session.entries;
+  const harness = new Harness({ hang: true, settleGraceMs: 20 });
+  await harness.sessionStart(session);
+  const compactor = harness.compactors[0];
+  compactor.duringSettle = () =>
+    compactor.store.appendNode([0, 0], "built summary");
+
+  await harness.beforeAgentStart(session);
+
+  const injected = await harness.context(session, []);
+  assert.ok(injected);
+  const view = injected.messages[0].content
+    .map((block: any) => block.text)
+    .join("\n");
+  assert.match(view, /built summary/);
+  assert.doesNotMatch(view, /not summarized yet/);
   await harness.shutdown(session, "quit");
 });
 

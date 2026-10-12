@@ -84,6 +84,8 @@ type ActiveMemory = {
   scanned: number;
   /** Entry ids already in the log, so a rescan never logs one twice. */
   logged: Set<string>;
+  /** True while a turn freeze waits for summaries; new entries wait with it. */
+  freezing: boolean;
   frozen: FrozenTurn | undefined;
   /** True once a compaction failure was reported, so an outage notifies once. */
   reported: boolean;
@@ -229,6 +231,7 @@ export function registerMemoryRuntime(
         session,
         scanned: 0,
         logged: new Set(),
+        freezing: false,
         frozen: undefined,
         reported: false,
       };
@@ -272,6 +275,9 @@ export function registerMemoryRuntime(
    * on: memory never rewinds, and abandoned branches stay in it (ADR 0020).
    */
   function logNewEntries(memory: ActiveMemory): void {
+    // While a freeze is waiting, a new entry belongs to the turn's tail: it is
+    // logged by the next flush, and `scanned` stays put so nothing is skipped.
+    if (memory.freezing) return;
     const session = memory.ctx.sessionManager.getSessionFile();
     if (session === undefined) return;
     const entries = memory.ctx.sessionManager.getEntries();
@@ -315,10 +321,9 @@ export function registerMemoryRuntime(
       // nodes unblock, so the 128 KB bound and `view.json` are already current;
       // the freeze below is the turn boundary the request depends on.
       logNewEntries(memory);
-      // The blocks are rendered before the wait for the same reason: a message
-      // that lands while waiting must not enter the view as well as the tail.
-      const blocks = memory.store.renderChatBlocks();
-      const lines = memory.store.view.chat;
+      // While the wait runs, a message that lands is left unscanned: it belongs
+      // to the turn's tail, and the view must not also carry it.
+      memory.freezing = true;
       // A ref'd timer: the process must not leave this turn while the previous
       // one is still being summarized.
       const grace = new AbortController();
@@ -330,10 +335,13 @@ export function registerMemoryRuntime(
         await memory.compactor.whenSettled(memory.store.view.T - 1, signal);
       } finally {
         clearTimeout(timer);
+        memory.freezing = false;
       }
+      // Every line the wait built is in the view; a line the grace gave up on
+      // renders as a placeholder.
       memory.frozen = {
-        blocks,
-        lines,
+        blocks: memory.store.renderChatBlocks(),
+        lines: memory.store.view.chat,
         anchor,
         timestamp: Date.now(),
         fallback: false,
