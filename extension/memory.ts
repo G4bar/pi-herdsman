@@ -172,6 +172,7 @@ function entryParts(entry: SessionEntry): MessagePart[] {
   const message = entry.message as {
     role?: string;
     content?: unknown;
+    command?: unknown;
   };
   if (message.role === "user") {
     const { text, images } = contentText(message.content);
@@ -195,15 +196,17 @@ function entryParts(entry: SessionEntry): MessagePart[] {
   }
   if (message.role === "bashExecution") {
     // Pi's own text: `Ran <cmd>` plus the fenced output and its notes. The
-    // user's command is their words; the output is an echo.
+    // user's command is their words; the output is an echo. A command can
+    // hold newlines, so its own length decides where it ends.
     const [converted] = convertToLlm([entry.message]);
     if (!converted) return [];
-    const [command = "", ...rest] = contentText(converted.content).text.split(
-      "\n",
-    );
+    const text = contentText(converted.content).text;
+    const { command } = message as { command?: unknown };
+    const head = typeof command === "string" ? `Ran \`${command}\`` : "";
+    const user = head && text.startsWith(head) ? head : text.split("\n")[0];
     return [
-      ...pages("user", command, false),
-      ...pages("echo", clipEcho(rest.join("\n").trim()), false),
+      ...pages("user", user, false),
+      ...pages("echo", clipEcho(text.slice(user.length).trim()), false),
     ];
   }
   return [];
@@ -478,7 +481,9 @@ export function extractIdentifiers(text: string): MemoryIdentifier[] {
       });
     }
   }
-  for (const match of text.matchAll(TOKEN)) {
+  // JSON arguments escape newlines, tabs and quotes; a space keeps the
+  // tokens on either side apart. Indices come from the unescaped text.
+  for (const match of text.replace(/\\[nrt"\\]/g, " ").matchAll(TOKEN)) {
     const value = trimToken(match[0]);
     if (!value || SCHEME.test(value)) continue;
     if (!value.includes("/") && !isBareFileName(value)) continue;

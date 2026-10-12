@@ -308,6 +308,18 @@ test("a bash execution logs the command and then its output", () => {
   assert.equal(longOutput.kind, "echo");
   assert.equal(longOutput.size <= ECHO_CHARS, true);
   assert.equal(longOutput.text.includes("characters omitted"), true);
+
+  // A command can hold newlines: its own length decides where it ends, so
+  // its tail never lands in the output message.
+  const [heredoc, heredocOutput] = deriveMessages(
+    bashEntry("cat <<EOF\nhello\nEOF", "line1\nline2"),
+    SESSION,
+  );
+  assert.equal(heredoc.text, "Ran `cat <<EOF\nhello\nEOF`");
+  assert.equal(heredocOutput.kind, "echo");
+  assert.equal(heredocOutput.text.startsWith("```"), true);
+  assert.equal(heredocOutput.text.includes("line1"), true);
+  assert.equal(heredocOutput.text.includes("EOF`"), false);
 });
 
 test("long texts are split into pages and tool output is clipped", () => {
@@ -763,6 +775,16 @@ test("identifiers survive JSON, markdown, shell and prose", () => {
       [{ kind: "url", value: "https://x.com/a" }],
     ],
     ['{"path":"src/app.ts"}', [{ kind: "path", value: "src/app.ts" }]],
+    // JSON escapes hold a newline as two characters; a token must not be
+    // built across one.
+    [
+      '{"command":"cd /x && ls\\ncat /tmp/b.txt\\nrm /y/z.md"}',
+      [
+        { kind: "path", value: "/x" },
+        { kind: "path", value: "/tmp/b.txt" },
+        { kind: "path", value: "/y/z.md" },
+      ],
+    ],
     // Prose and versions are not paths, and never half a number.
     ["e.g. this, i.e. that, Node.js and 1.2.3", []],
     // A capitalized name without a directory is treated as prose too.
@@ -1478,7 +1500,16 @@ test("the compaction view merges down to its own target", () => {
         drain(store);
         const size = compactionBytes(store);
         max = Math.max(max, size);
-        if (size < last) merges += 1;
+        if (size < last) {
+          merges += 1;
+          // A merge that runs to completion lands at or under the target; the
+          // slack covers text the same step builds after it.
+          assert.equal(
+            size <= COMPACTION_TARGET_BYTES + 700,
+            true,
+            `merge at ${i}`,
+          );
+        }
         last = size;
       }
       assert.equal(merges > 0, true);
