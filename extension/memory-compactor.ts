@@ -24,6 +24,7 @@ import {
   extractIdentifiers,
   nodeLength,
   nodeStart,
+  type MemoryIdentifier,
   type MemoryJob,
   type NodeInputs,
   type ViewLine,
@@ -43,6 +44,8 @@ export const MAX_CONCURRENT_COMPACTIONS = 8;
 export const MAX_LENGTH_RETRIES = 5;
 /** Consecutive failures of one node before the failure callback fires once. */
 export const FAILURES_BEFORE_REPORT = 3;
+/** A node past the report threshold is retried only every 8th `onMessage`. */
+export const FAILED_RETRY_INTERVAL = 8;
 
 export type MemoryCompactorUsage = {
   line: ViewLine;
@@ -65,6 +68,15 @@ export type MemoryCompactorCallbacks = {
   onFailure?: (failure: MemoryCompactorFailure) => void;
 };
 
+export type MemoryCompactorOptions = MemoryCompactorCallbacks & {
+  /**
+   * The Lead's live thinking level. Phase 4 fills it from
+   * `pi.getThinkingLevel()`, which is authoritative when `ctx.thinkingLevel`
+   * is absent.
+   */
+  thinkingLevel?: ModelThinkingLevel;
+};
+
 export type MemoryCompactor = {
   /** A new message or node may have made work ready; try to start it. */
   onMessage(): void;
@@ -82,8 +94,9 @@ class CompactionFailure extends Error {}
 export function start(
   store: MemoryStore,
   ctx: ExtensionContext,
-  callbacks: MemoryCompactorCallbacks = {},
+  options: MemoryCompactorOptions = {},
 ): MemoryCompactor {
+  const { thinkingLevel, ...callbacks } = options;
   const definition = resolveCompactorDefinition(ctx);
   const model = definition.model
     ? resolveConfiguredModel(ctx, definition.model)
@@ -100,7 +113,7 @@ export function start(
       `project memory compactor model ${modelToken(model)} has no configured credentials`,
     );
   }
-  const requested = definition.thinking ?? ctx.thinkingLevel;
+  const requested = definition.thinking ?? thinkingLevel ?? ctx.thinkingLevel;
   const reasoning = requested
     ? clampThinkingLevel(model, requested as ModelThinkingLevel)
     : undefined;
@@ -127,6 +140,8 @@ class CompactorRunner implements MemoryCompactor {
   private slots = 0;
   private stopped = false;
   private pumping = false;
+  private repump = false;
+  private onMessages = 0;
   private warmKey: string | undefined;
   private warmGate: Promise<void> | undefined;
   private warmRelease: (() => void) | undefined;
@@ -149,9 +164,17 @@ class CompactorRunner implements MemoryCompactor {
 
   onMessage(): void {
     if (this.stopped) return;
-    const retry = this.retry;
-    this.retry = [];
-    for (const job of retry) this.store.requeueJob(job);
+    this.onMessages += 1;
+    // A node that keeps failing is retried only every FAILED_RETRY_INTERVAL
+    // messages, so an outage cannot spend every message on one broken node.
+    const due = this.onMessages % FAILED_RETRY_INTERVAL === 0;
+    const held: MemoryJob[] = [];
+    for (const job of this.retry) {
+      const failures = this.failures.get(jobKey(job)) ?? 0;
+      if (failures < FAILURES_BEFORE_REPORT || due) this.store.requeueJob(job);
+      else held.push(job);
+    }
+    this.retry = held;
     this.pump();
   }
 
@@ -187,11 +210,19 @@ class CompactorRunner implements MemoryCompactor {
 
   // --- scheduling -----------------------------------------------------------
 
-  private pump(): void {
-    if (this.stopped || this.pumping) return;
+  pump(): void {
+    if (this.stopped) return;
+    if (this.pumping) {
+      this.repump = true;
+      return;
+    }
     this.pumping = true;
     void this.drain().finally(() => {
       this.pumping = false;
+      if (this.repump) {
+        this.repump = false;
+        this.pump();
+      }
     });
   }
 
@@ -199,6 +230,10 @@ class CompactorRunner implements MemoryCompactor {
     while (!this.stopped && this.slots < MAX_CONCURRENT_COMPACTIONS) {
       const job = this.store.nextJob();
       if (!job) return;
+      if (job.kind === "message" && !this.leafAllowed(job.id)) {
+        this.store.requeueJob(job);
+        return;
+      }
       await this.gate();
       if (this.stopped) {
         this.store.requeueJob(job);
@@ -206,6 +241,15 @@ class CompactorRunner implements MemoryCompactor {
       }
       this.launch(job);
     }
+  }
+
+  /**
+   * A leaf starts once fewer than 8 earlier lines are unbuilt, counting
+   * in-flight and retry-waiting nodes, so an outage cannot run the frontier
+   * past what the compaction view can still explain.
+   */
+  private leafAllowed(id: number): boolean {
+    return id - this.builtThrough() < MAX_CONCURRENT_COMPACTIONS;
   }
 
   /**
@@ -246,49 +290,61 @@ class CompactorRunner implements MemoryCompactor {
 
   private launch(job: MemoryJob): void {
     this.slots += 1;
-    void this.run(job).finally(() => {
-      this.slots -= 1;
-      this.releaseWarm();
-      this.notify();
-      this.pump();
-    });
+    void this.run(job)
+      .catch(() => {
+        // A store or hook failure never fails a model call; the run requeues
+        // the node when the call itself failed.
+      })
+      .finally(() => {
+        this.slots -= 1;
+        this.releaseWarm();
+        this.notify();
+        this.pump();
+      });
   }
 
   private async run(job: MemoryJob): Promise<void> {
     const line = jobLine(job);
     const inputs = this.store.nodeInputs(line);
-    if (!inputs) return;
+    if (!inputs) {
+      this.fail(job, "node inputs are not available");
+      return;
+    }
     const request: Message[] = [
       userMessage(this.store.renderCompaction(line)),
       userMessage(this.task(inputs)),
     ];
     const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+    let built: { text: string; retries: number } | undefined;
     try {
-      const built = await this.build(request, usage, inputs);
-      if (this.stopped || !built) return;
-      const text = this.markLossy(inputs, built.text);
-      this.store.appendNode(line, text);
-      this.callbacks.onNodeBuilt?.(line, text);
-      this.callbacks.onUsage?.({
-        line,
-        ...usage,
-        retries: built.retries,
-      });
-      this.failures.delete(jobKey(job));
+      built = await this.build(request, usage);
     } catch (error) {
       if (this.stopped) return;
       this.fail(
         job,
         error instanceof Error ? error.message : "compaction call failed",
       );
+      return;
     }
+    if (this.stopped || !built) return;
+    const text = this.markLossy(inputs, built.text);
+    this.store.appendNode(line, text);
+    this.failures.delete(jobKey(job));
     this.notify();
+    // Hooks observe a finished build; a throwing hook must not look like a
+    // failed model call or requeue the node.
+    try {
+      this.callbacks.onNodeBuilt?.(line, text);
+      this.callbacks.onUsage?.({ line, ...usage, retries: built.retries });
+    } catch {
+      // Swallowed on purpose: the build already happened.
+    }
   }
 
   /**
    * One node build: at most `MAX_LENGTH_RETRIES` over-length retries in the
-   * same conversation, keeping the shortest line seen. Throws on a failed,
-   * aborted or empty call.
+   * same conversation, keeping the shortest line seen. A retry that fails
+   * after a usable line exists keeps that line instead of throwing it away.
    */
   private async build(
     request: Message[],
@@ -298,25 +354,37 @@ class CompactorRunner implements MemoryCompactor {
       cacheRead: number;
       cacheWrite: number;
     },
-    inputs: NodeInputs,
   ): Promise<{ text: string; retries: number } | undefined> {
     let shortest: string | undefined;
-    let retries = 0;
+    const held = (retries: number) =>
+      shortest === undefined ? undefined : { text: shortest, retries };
     for (let attempt = 0; attempt <= MAX_LENGTH_RETRIES; attempt += 1) {
-      const message = await this.call(request);
-      retries = attempt;
-      if (message.stopReason === "error" || message.stopReason === "aborted")
+      let message: AssistantMessage;
+      try {
+        message = await this.call(request);
+      } catch (error) {
+        const kept = held(attempt);
+        if (kept) return kept;
+        throw error;
+      }
+      if (message.stopReason === "error" || message.stopReason === "aborted") {
+        const kept = held(attempt);
+        if (kept) return kept;
         throw new CompactionFailure(
           message.errorMessage ?? `compaction ${message.stopReason}`,
         );
+      }
       addUsage(usage, message.usage);
       const text = normalizeOutput(messageText(message));
-      if (text === "")
+      if (text === "") {
+        const kept = held(attempt);
+        if (kept) return kept;
         throw new CompactionFailure("compaction returned an empty line");
+      }
       const size = Buffer.byteLength(text, "utf8");
       if (shortest === undefined || size < Buffer.byteLength(shortest, "utf8"))
         shortest = text;
-      if (size <= LEAF_BYTES) return { text, retries };
+      if (size <= LEAF_BYTES) return { text, retries: attempt };
       if (attempt === MAX_LENGTH_RETRIES) break;
       request.push(
         message,
@@ -326,7 +394,7 @@ class CompactorRunner implements MemoryCompactor {
       );
     }
     if (shortest === undefined) return undefined;
-    return { text: shortest, retries };
+    return { text: shortest, retries: MAX_LENGTH_RETRIES };
   }
 
   /** One direct model call, with its own abort controller. */
@@ -381,22 +449,17 @@ class CompactorRunner implements MemoryCompactor {
    */
   private markLossy(inputs: NodeInputs, text: string): string {
     if (text.endsWith(LOSSY_MARKER)) return text;
-    let lossy: boolean;
-    if (inputs.kind === "message") {
-      lossy = extractIdentifiers(inputs.text).some(
-        (identifier) => !text.includes(identifier.value),
+    const drops = (source: string) =>
+      extractIdentifiers(source).some(
+        (identifier) => !keepsIdentifier(text, identifier),
       );
-    } else {
-      lossy =
-        inputs.first.endsWith(LOSSY_MARKER) ||
-        inputs.second.endsWith(LOSSY_MARKER) ||
-        extractIdentifiers(inputs.first).some(
-          (identifier) => !text.includes(identifier.value),
-        ) ||
-        extractIdentifiers(inputs.second).some(
-          (identifier) => !text.includes(identifier.value),
-        );
-    }
+    const lossy =
+      inputs.kind === "message"
+        ? drops(inputs.text)
+        : inputs.first.endsWith(LOSSY_MARKER) ||
+          inputs.second.endsWith(LOSSY_MARKER) ||
+          drops(inputs.first) ||
+          drops(inputs.second);
     return lossy ? `${text} ${LOSSY_MARKER}` : text;
   }
 
@@ -483,6 +546,13 @@ function messageText(message: AssistantMessage): string {
   return message.content
     .map((block) => (block.type === "text" ? block.text : ""))
     .join("");
+}
+
+/** A UUID is stored lowercase, so its comparison ignores case. */
+function keepsIdentifier(text: string, identifier: MemoryIdentifier): boolean {
+  return identifier.kind === "uuid"
+    ? text.toLowerCase().includes(identifier.value)
+    : text.includes(identifier.value);
 }
 
 function addUsage(

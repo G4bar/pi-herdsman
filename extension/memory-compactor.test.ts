@@ -55,25 +55,26 @@ function assistant(
   } as AssistantMessage;
 }
 
-/** A stream the test drives: `start` arrives at once, the end later. */
+/** A stream the test drives: `start` may arrive at once, the end later. */
 class FakeCall {
   readonly context: Context;
-  readonly signal: AbortSignal | undefined;
+  readonly reasoning: string | undefined;
   aborted = false;
   readonly stream: AsyncIterable<AssistantMessageEvent>;
   private readonly queue: AssistantMessageEvent[] = [];
   private wake: (() => void) | undefined;
   private ended = false;
 
-  constructor(context: Context, signal: AbortSignal | undefined) {
+  constructor(
+    context: Context,
+    options: { signal?: AbortSignal; reasoning?: string } | undefined,
+    emitStart: boolean,
+  ) {
     this.context = context;
-    this.signal = signal;
-    this.queue.push({
-      type: "start",
-      partial: assistant(""),
-    } as AssistantMessageEvent);
+    this.reasoning = options?.reasoning;
+    if (emitStart) this.begin();
     this.stream = { [Symbol.asyncIterator]: () => this.iterate() };
-    signal?.addEventListener(
+    options?.signal?.addEventListener(
       "abort",
       () => {
         this.aborted = true;
@@ -105,6 +106,22 @@ class FakeCall {
     wake?.();
   }
 
+  /** Emits the first stream event, which releases the warm-up gate. */
+  begin(): void {
+    this.push({
+      type: "start",
+      partial: assistant(""),
+    } as AssistantMessageEvent);
+  }
+
+  /** Ends the stream with no event at all. */
+  settle(): void {
+    this.ended = true;
+    const wake = this.wake;
+    this.wake = undefined;
+    wake?.();
+  }
+
   respond(text: string): void {
     this.push({
       type: "done",
@@ -127,6 +144,8 @@ class FakeRegistry {
   readonly requested: Model<Api>[] = [];
   responder: (call: FakeCall, index: number) => void = (call) =>
     call.respond("summary line");
+  emitStart = true;
+  throwSync: string | undefined;
   private readonly models: Model<Api>[];
 
   constructor(models: Model<Api>[]) {
@@ -144,10 +163,11 @@ class FakeRegistry {
   streamSimple(
     model: Model<Api>,
     context: Context,
-    options?: { signal?: AbortSignal },
+    options?: { signal?: AbortSignal; reasoning?: string },
   ): unknown {
+    if (this.throwSync) throw new Error(this.throwSync);
     this.requested.push(model);
-    const call = new FakeCall(context, options?.signal);
+    const call = new FakeCall(context, options, this.emitStart);
     const index = this.calls.length;
     this.calls.push(call);
     this.responder(call, index);
@@ -169,12 +189,13 @@ function fakeContext(
   registry: FakeRegistry,
   model: Model<Api> | undefined,
   project: string,
+  thinkingLevel: string | undefined = "high",
 ): ExtensionContext {
   return {
     cwd: project,
     isProjectTrusted: () => true,
     model: model ?? registry.getAll()[0],
-    thinkingLevel: "high",
+    thinkingLevel,
     modelRegistry: registry,
   } as unknown as ExtensionContext;
 }
@@ -365,6 +386,22 @@ test("a multi-byte retry cut never splits a code point", () =>
     assert.ok(Buffer.byteLength("a".repeat(511), "utf8") <= 512);
   }));
 
+test("a failed retry keeps the shortest line already held", () =>
+  withProject(async (project, store) => {
+    addMessage(store, longText());
+    let index = 0;
+    const registry = new FakeRegistry([makeModel("test", "lead")]);
+    registry.responder = (call) => {
+      if (index++ === 0) call.respond("a".repeat(700));
+      else call.fail("down");
+    };
+    const compactor = start(store, fakeContext(registry, undefined, project));
+    await compactor.whenSettled(0);
+    compactor.stop();
+    assert.equal(registry.calls.length, 2);
+    assert.equal(store.nodeText([0, 0]), "a".repeat(700));
+  }));
+
 // --- lossy marker -----------------------------------------------------------
 
 test("a dropped leaf identifier is marked", () =>
@@ -425,7 +462,24 @@ test("a child marker propagates to its merge", () =>
 
     assert.equal(registry.calls.length, 1);
     assert.match(taskText(registry.calls[0]!), /^Compaction: merge lines /);
+    assert.ok(
+      taskText(registry.calls[0]!).includes(
+        `${"a".repeat(300)} ${LOSSY_MARKER}`,
+      ),
+    );
     assert.equal(store.nodeText([1, 0]), `merged ${LOSSY_MARKER}`);
+  }));
+
+test("an uppercase UUID kept verbatim is not marked", () =>
+  withProject(async (project, store) => {
+    const uuid = "123E4567-E89B-12D3-A456-426614174000";
+    addMessage(store, longText(`${uuid} `));
+    const registry = new FakeRegistry([makeModel("test", "lead")]);
+    registry.responder = (call) => call.respond(`kept ${uuid}`);
+    const compactor = start(store, fakeContext(registry, undefined, project));
+    await compactor.whenSettled(0);
+    compactor.stop();
+    assert.equal(store.nodeText([0, 0]), `kept ${uuid}`);
   }));
 
 // --- concurrency ------------------------------------------------------------
@@ -452,6 +506,64 @@ test("at most eight calls run at once and leaves start in order", () =>
     await compactor.whenSettled(19);
     compactor.stop();
     assert.equal(registry.calls.length, 20);
+  }));
+
+test("a leaf starts only when fewer than eight earlier lines are unbuilt", () =>
+  withProject(async (project, store) => {
+    for (let index = 0; index < 20; index += 1) addMessage(store, longText());
+    const registry = new FakeRegistry([makeModel("test", "lead")]);
+    registry.responder = () => {};
+    const compactor = start(store, fakeContext(registry, undefined, project));
+    await waitFor(() => registry.calls.length === MAX_CONCURRENT_COMPACTIONS);
+
+    // Fail the earliest leaf; no later leaf may start into the unbuilt gap.
+    registry.calls[0]!.fail("down");
+    await tick();
+    await tick();
+    assert.equal(registry.calls.length, MAX_CONCURRENT_COMPACTIONS);
+    assert.deepEqual(
+      registry.calls.map(
+        (call) => /compress message (\d+)/.exec(taskText(call))?.[1],
+      ),
+      ["0", "1", "2", "3", "4", "5", "6", "7"],
+    );
+    compactor.stop();
+  }));
+
+test("the warm-up gate holds the rest until the first stream event", () =>
+  withProject(async (project, store) => {
+    addMessage(store, longText());
+    addMessage(store, longText());
+    const registry = new FakeRegistry([makeModel("test", "lead")]);
+    registry.emitStart = false;
+    registry.responder = () => {};
+    const compactor = start(store, fakeContext(registry, undefined, project));
+    await waitFor(() => registry.calls.length === 1);
+    await tick();
+    assert.equal(registry.calls.length, 1);
+
+    registry.calls[0]!.begin();
+    await waitFor(() => registry.calls.length === 2);
+    registry.calls[0]!.respond("ok");
+    registry.calls[1]!.respond("ok");
+    await compactor.whenSettled(1);
+    compactor.stop();
+  }));
+
+test("a first call that settles without events releases the rest", () =>
+  withProject(async (project, store) => {
+    addMessage(store, longText());
+    addMessage(store, longText());
+    const registry = new FakeRegistry([makeModel("test", "lead")]);
+    registry.emitStart = false;
+    registry.responder = (call, index) => {
+      if (index === 0) call.settle();
+    };
+    const compactor = start(store, fakeContext(registry, undefined, project));
+    await waitFor(() => registry.calls.length === 2);
+    registry.calls[1]!.respond("ok");
+    await waitFor(() => store.nodeText([0, 1]) !== undefined);
+    compactor.stop();
   }));
 
 test("a merge starts only once both halves are built", () =>
@@ -520,6 +632,62 @@ test("a failed node is requeued and retried on the next message", () =>
     assert.deepEqual(failures, ["provider down"]);
   }));
 
+test("a node past three failures is retried only every eighth message", () =>
+  withProject(async (project, store) => {
+    addMessage(store, longText());
+    const registry = new FakeRegistry([makeModel("test", "lead")]);
+    registry.responder = (call) => call.fail("down");
+    const compactor = start(store, fakeContext(registry, undefined, project));
+    await waitFor(() => registry.calls.length === 1);
+    await tick();
+    for (let index = 0; index < 10; index += 1) {
+      compactor.onMessage();
+      await tick();
+      await tick();
+    }
+    assert.equal(registry.calls.length, 4);
+    compactor.stop();
+  }));
+
+test("a throwing build callback does not requeue the node", () =>
+  withProject(async (project, store) => {
+    addMessage(store, longText());
+    const registry = new FakeRegistry([makeModel("test", "lead")]);
+    registry.responder = (call) => call.respond("ok");
+    const failures: string[] = [];
+    const compactor = start(store, fakeContext(registry, undefined, project), {
+      onNodeBuilt: () => {
+        throw new Error("hook");
+      },
+      onFailure: (failure) => failures.push(failure.error),
+    });
+    await compactor.whenSettled(0);
+    await tick();
+    compactor.stop();
+    assert.equal(store.nodeText([0, 0]), "ok");
+    assert.deepEqual(failures, []);
+    assert.equal(registry.calls.length, 1);
+  }));
+
+test("a synchronous streamSimple failure is requeued and reported", () =>
+  withProject(async (project, store) => {
+    addMessage(store, longText());
+    const failures: string[] = [];
+    const registry = new FakeRegistry([makeModel("test", "lead")]);
+    registry.throwSync = "no transport";
+    const compactor = start(store, fakeContext(registry, undefined, project), {
+      onFailure: (failure) => failures.push(failure.error),
+    });
+    for (let index = 0; index < 12 && failures.length === 0; index += 1) {
+      compactor.onMessage();
+      await tick();
+      await tick();
+    }
+    assert.equal(store.nodeText([0, 0]), undefined);
+    assert.deepEqual(failures, ["no transport"]);
+    compactor.stop();
+  }));
+
 // --- model resolution -------------------------------------------------------
 
 test("the definition model overrides the inherited model", () =>
@@ -553,6 +721,46 @@ test("the compactor inherits the Lead model when the definition sets none", () =
     await compactor.whenSettled(0);
     compactor.stop();
     assert.equal(registry.requested[0], inherited);
+  }));
+
+test("the thinkingLevel option supplies the Lead level when the context omits it", () =>
+  withProject(async (project, store) => {
+    addMessage(store, longText());
+    const model = makeModel("test", "lead");
+    const registry = new FakeRegistry([model]);
+    const compactor = start(
+      store,
+      fakeContext(registry, model, project, undefined),
+      { thinkingLevel: "low" },
+    );
+    await compactor.whenSettled(0);
+    compactor.stop();
+    assert.equal(registry.calls[0]!.reasoning, "low");
+  }));
+
+test("the definition thinking outranks the thinkingLevel option", () =>
+  withAgentDir(async (project, agentDir) => {
+    mkdirSync(join(agentDir, "agents"), { recursive: true });
+    writeFileSync(
+      join(agentDir, "agents", "compactor.md"),
+      "---\nname: compactor\nthinking: high\n---\n",
+    );
+    const store = new MemoryStore(project);
+    try {
+      addMessage(store, longText());
+      const model = makeModel("test", "lead");
+      const registry = new FakeRegistry([model]);
+      const compactor = start(
+        store,
+        fakeContext(registry, model, project, undefined),
+        { thinkingLevel: "low" },
+      );
+      await compactor.whenSettled(0);
+      compactor.stop();
+      assert.equal(registry.calls[0]!.reasoning, "high");
+    } finally {
+      store.close();
+    }
   }));
 
 test("an unresolvable definition model makes start throw", () =>
@@ -599,6 +807,19 @@ test("stop aborts calls and appends nothing", () =>
     compactor.stop();
     await tick();
     assert.equal(registry.calls[0]!.aborted, true);
+    assert.equal(store.nodeText([0, 0]), undefined);
+  }));
+
+test("a result arriving after stop is not appended", () =>
+  withProject(async (project, store) => {
+    addMessage(store, longText());
+    const registry = new FakeRegistry([makeModel("test", "lead")]);
+    registry.responder = () => {};
+    const compactor = start(store, fakeContext(registry, undefined, project));
+    await waitFor(() => registry.calls.length === 1);
+    compactor.stop();
+    registry.calls[0]!.respond("late");
+    await tick();
     assert.equal(store.nodeText([0, 0]), undefined);
   }));
 
