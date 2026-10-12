@@ -1,4 +1,5 @@
 import { readFileSync, unlinkSync } from "node:fs";
+import { isAbsolute, resolve } from "node:path";
 import { claimProcessLock } from "./lock.ts";
 import { herdsmanConfigPath, writeAtomically } from "./storage.ts";
 import {
@@ -19,6 +20,8 @@ export type HerdsmanConfig = {
   autoActivateManager: boolean;
   inlineAttachmentLimitBytes: number;
   mailboxPayloadLimitBytes: number;
+  /** Absolute project directories whose ordinary Lead sessions share memory. */
+  memoryProjects: string[];
 };
 
 export const DEFAULT_CONFIG: HerdsmanConfig = {
@@ -28,6 +31,7 @@ export const DEFAULT_CONFIG: HerdsmanConfig = {
   autoActivateManager: false,
   inlineAttachmentLimitBytes: DEFAULT_BYTE_LIMIT,
   mailboxPayloadLimitBytes: DEFAULT_BYTE_LIMIT,
+  memoryProjects: [],
 };
 
 export function validByteLimit(value: unknown): value is number {
@@ -47,7 +51,27 @@ const CONFIG_KEYS = new Set<ConfigKey>([
   "autoActivateManager",
   "inlineAttachmentLimitBytes",
   "mailboxPayloadLimitBytes",
+  "memoryProjects",
 ]);
+
+function parseMemoryProjects(value: unknown): string[] {
+  if (!Array.isArray(value))
+    throw new Error("Invalid Pi Herdsman config field memoryProjects");
+  const projects: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== "string" || !isAbsolute(entry))
+      throw new Error(
+        "Invalid Pi Herdsman config field memoryProjects: entries must be absolute paths",
+      );
+    const project = resolve(entry);
+    if (projects.includes(project))
+      throw new Error(
+        `Invalid Pi Herdsman config field memoryProjects: duplicate path ${project}`,
+      );
+    projects.push(project);
+  }
+  return projects;
+}
 
 function parseRawConfig(content: string): Partial<HerdsmanConfig> {
   let parsed: unknown;
@@ -94,6 +118,8 @@ function parseRawConfig(content: string): Partial<HerdsmanConfig> {
         throw new Error(`Invalid Pi Herdsman config field ${key}`);
       result[key] = record[key];
     }
+  if ("memoryProjects" in record)
+    result.memoryProjects = parseMemoryProjects(record.memoryProjects);
   return result;
 }
 
@@ -108,7 +134,7 @@ function readRawConfig(): Partial<HerdsmanConfig> {
 }
 
 export function readConfig(): HerdsmanConfig {
-  return { ...DEFAULT_CONFIG, ...readRawConfig() };
+  return { ...DEFAULT_CONFIG, memoryProjects: [], ...readRawConfig() };
 }
 
 export function updateConfig<K extends ConfigKey>(
@@ -122,25 +148,31 @@ export function updateConfig<K extends ConfigKey>(
   try {
     const current = readRawConfig();
     if (value !== undefined) {
-      if (key === "spawnPlacement" && !isSpawnPlacement(value))
-        throw new Error("Invalid Pi Herdsman config field spawnPlacement");
-      if (key === "defaultLeadExecution" && !isLeadExecutionMode(value))
-        throw new Error(
-          "Invalid Pi Herdsman config field defaultLeadExecution",
-        );
-      if (key === "contextRetirement" && typeof value !== "boolean")
-        throw new Error("Invalid Pi Herdsman config field contextRetirement");
-      if (key === "autoActivateManager" && typeof value !== "boolean")
-        throw new Error("Invalid Pi Herdsman config field autoActivateManager");
-      if (
-        key !== "spawnPlacement" &&
-        key !== "defaultLeadExecution" &&
-        key !== "contextRetirement" &&
-        key !== "autoActivateManager" &&
-        !validByteLimit(value)
-      )
-        throw new Error(`Invalid Pi Herdsman config field ${key}`);
-      current[key] = value;
+      if (key === "memoryProjects")
+        current.memoryProjects = parseMemoryProjects(value);
+      else {
+        if (key === "spawnPlacement" && !isSpawnPlacement(value))
+          throw new Error("Invalid Pi Herdsman config field spawnPlacement");
+        if (key === "defaultLeadExecution" && !isLeadExecutionMode(value))
+          throw new Error(
+            "Invalid Pi Herdsman config field defaultLeadExecution",
+          );
+        if (key === "contextRetirement" && typeof value !== "boolean")
+          throw new Error("Invalid Pi Herdsman config field contextRetirement");
+        if (key === "autoActivateManager" && typeof value !== "boolean")
+          throw new Error(
+            "Invalid Pi Herdsman config field autoActivateManager",
+          );
+        if (
+          key !== "spawnPlacement" &&
+          key !== "defaultLeadExecution" &&
+          key !== "contextRetirement" &&
+          key !== "autoActivateManager" &&
+          !validByteLimit(value)
+        )
+          throw new Error(`Invalid Pi Herdsman config field ${key}`);
+        current[key] = value;
+      }
     } else delete current[key];
     if (Object.keys(current).length)
       writeAtomically(path, `${JSON.stringify(current, null, 2)}\n`);

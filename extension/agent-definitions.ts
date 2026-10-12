@@ -79,6 +79,7 @@ const BUILTIN_AGENT_DIR = fileURLToPath(
 export const FLEXIBLE_LEAD_DEFINITION_NAME = "flexible-lead";
 export const ORCHESTRATOR_LEAD_DEFINITION_NAME = "orchestrator-lead";
 export const MANAGED_LEAD_DEFINITION_NAME = "managed-lead";
+export const COMPACTOR_DEFINITION_NAME = "compactor";
 const RESERVED_LEAD_DEFINITION_NAMES = new Set([
   FLEXIBLE_LEAD_DEFINITION_NAME,
   ORCHESTRATOR_LEAD_DEFINITION_NAME,
@@ -88,12 +89,24 @@ const RESERVED_LEAD_DEFINITION_NAMES = new Set([
 export function isReservedLeadDefinition(name: string): boolean {
   return RESERVED_LEAD_DEFINITION_NAMES.has(name);
 }
+
+/** Reserved names are never Agents: no roster entry, delegation, or reference. */
+export function isReservedDefinition(name: string): boolean {
+  return isReservedLeadDefinition(name) || name === COMPACTOR_DEFINITION_NAME;
+}
 const RUNTIME_LEAD_FIELDS = new Set([
   "name",
   "description",
   "bodyMode",
   "tools",
   "excludeTools",
+]);
+const COMPACTOR_FIELDS = new Set([
+  "name",
+  "description",
+  "model",
+  "thinking",
+  "bodyMode",
 ]);
 
 export type FrontmatterValue =
@@ -400,9 +413,7 @@ export type DiscoverAgentDefinitionsOptions = { projectRoot?: string };
 function validateEffectiveAgentReferences(
   definitions: readonly AgentDefinition[],
 ): void {
-  const agents = definitions.filter(
-    ({ name }) => !isReservedLeadDefinition(name),
-  );
+  const agents = definitions.filter(({ name }) => !isReservedDefinition(name));
   const names = new Set(agents.map((definition) => definition.name));
   for (const definition of agents)
     for (const reference of definition.frontmatter.agents ?? [])
@@ -438,6 +449,15 @@ function validateRuntimeLeadLayer(definition: AgentDefinition): void {
       );
 }
 
+function validateCompactorLayer(definition: AgentDefinition): void {
+  if (definition.name !== COMPACTOR_DEFINITION_NAME) return;
+  for (const field of Object.keys(definition.frontmatter))
+    if (!COMPACTOR_FIELDS.has(field))
+      throw new Error(
+        `${definition.path} compactor field ${field}: is not supported`,
+      );
+}
+
 function discoverEffectiveDefinitions(
   options: DiscoverAgentDefinitionsOptions = {},
 ): AgentDefinition[] {
@@ -459,6 +479,7 @@ function discoverEffectiveDefinitions(
   for (const definition of [...bundled, ...project, ...user]) {
     validateManagedLeadLayer(definition);
     validateRuntimeLeadLayer(definition);
+    validateCompactorLayer(definition);
   }
   applyDefinitionLayer(definitions, project, "projectSource");
   applyDefinitionLayer(definitions, user, "overrideSource");
@@ -473,7 +494,7 @@ export function discoverAgentDefinitions(
   options: DiscoverAgentDefinitionsOptions = {},
 ): AgentDefinition[] {
   return discoverEffectiveDefinitions(options)
-    .filter(({ name }) => !isReservedLeadDefinition(name))
+    .filter(({ name }) => !isReservedDefinition(name))
     .map((definition) => withDefaultEnabled(definition));
 }
 
@@ -495,7 +516,7 @@ export async function contextAgentDefinitions(ctx: ExtensionContext) {
   return {
     projectTrusted,
     definitions: effective
-      .filter(({ name }) => !isReservedLeadDefinition(name))
+      .filter(({ name }) => !isReservedDefinition(name))
       .map(withDefaultEnabled),
     leadDefinitions: effective.filter(({ name }) =>
       isReservedLeadDefinition(name),
@@ -532,6 +553,35 @@ export function discoverLeadDefinitions(
     if (!definition) throw new Error(`Lead definition ${name} not found`);
     return definition;
   });
+}
+
+export function discoverCompactorDefinition(
+  options: DiscoverAgentDefinitionsOptions = {},
+): AgentDefinition {
+  const definition = discoverEffectiveDefinitions(options).find(
+    (candidate) => candidate.name === COMPACTOR_DEFINITION_NAME,
+  );
+  if (!definition) throw new Error("Compactor definition not found");
+  return definition;
+}
+
+/**
+ * The effective compactor settings for the caller's project. The project layer
+ * applies only when Pi considers the project trusted.
+ */
+export function resolveCompactorDefinition(ctx: ExtensionContext): {
+  model?: string;
+  thinking?: string;
+  body: string;
+} {
+  const definition = discoverCompactorDefinition(
+    ctx.isProjectTrusted() ? { projectRoot: ctx.cwd } : {},
+  );
+  return {
+    model: configuredModel(definition.frontmatter),
+    thinking: configuredThinking(definition),
+    body: definition.body,
+  };
 }
 
 export function discoverAgent(

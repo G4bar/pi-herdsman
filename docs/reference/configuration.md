@@ -30,7 +30,8 @@ schema is:
   "contextRetirement": true,
   "autoActivateManager": false,
   "inlineAttachmentLimitBytes": 131072,
-  "mailboxPayloadLimitBytes": 131072
+  "mailboxPayloadLimitBytes": 131072,
+  "memoryProjects": []
 }
 ```
 
@@ -44,6 +45,7 @@ An absent file means these defaults:
 | `autoActivateManager`        |              false | boolean                                           |
 | `inlineAttachmentLimitBytes` | `131072` (128 KiB) | integer from 1024 (1 KiB) through 1048576 (1 MiB) |
 | `mailboxPayloadLimitBytes`   | `131072` (128 KiB) | integer from 1024 (1 KiB) through 1048576 (1 MiB) |
+| `memoryProjects`             |               `[]` | array of absolute directory paths                 |
 
 Malformed JSON, a non-object root, unknown fields, and invalid known values
 are errors. Reads do not create the directory or file. Herdsman's human
@@ -77,6 +79,15 @@ When `autoActivateManager` is enabled, a session without a persisted
 workspace. Linked workspaces, unavailable eligibility evidence, or an existing
 Manager leave it as an ordinary Lead. The preference does not persist Manager
 role intent and changing it does not affect the current session.
+
+`memoryProjects` lists the project directories whose ordinary Lead sessions
+share one project memory. Each entry must be an absolute path; entries are
+stored resolved to one form and duplicates are rejected. A session matches an
+entry only when the realpath of its cwd is exactly that directory: parent
+directories and subdirectories do not match. The default is an empty list,
+which leaves every session on Pi's native history. The setting is user-wide on
+purpose: project files never enable memory, because every enabled project
+spends model calls on compaction. See [Project memory](../concepts/memory.md).
 
 Placement affects future starts, not existing agents. `tab` uses one lead-owned
 agents tab, `subtree` gives each lead-direct agent its own tab, and `split`

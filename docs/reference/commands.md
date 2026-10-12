@@ -93,7 +93,8 @@ Ordinary usage retains its owned-session warning.
 ## `/herdsman definitions`
 
 Opens a flat native Definitions list of effective definitions, with reserved
-`flexible-lead`, `orchestrator-lead`, and `managed-lead` first in that order.
+`flexible-lead`, `orchestrator-lead`, `managed-lead`, and `compactor` first in
+that order.
 Project definitions are included when Pi considers the
 project trusted. Each definition shows its contributing source or sources as
 `bundled`, `project`, and/or `global`. Edits write global overrides only.
@@ -101,7 +102,10 @@ project trusted. Each definition shows its contributing source or sources as
 The three reserved Lead definitions are not Agents and remain excluded from
 Agent discovery and delegation. `flexible-lead` and `orchestrator-lead` support
 `Details` only; `managed-lead` supports `Model`, `Thinking`, and `Details`, but
-has no `Enabled` action. Definition edits take effect at the next applicable
+has no `Enabled` action. The reserved `compactor` definition, which carries the
+model and thinking level for project memory compactions, is likewise not an
+Agent and supports `Model`, `Thinking`, and `Details`, without `Enabled`.
+Definition edits take effect at the next applicable
 profile resolution, not by watching files while a profile is active.
 
 The details view shows applicable effective metadata:
@@ -135,8 +139,8 @@ thinking rows display `inherit · <current session value>` when the current
 value is available. Thinking uses Pi's supported levels when the selected
 model is known.
 
-Selecting the managed Lead opens the same Model, Thinking, and Details actions,
-without `Enabled`.
+Selecting the managed Lead or the `compactor` definition opens the same Model,
+Thinking, and Details actions, without `Enabled`.
 
 Selecting either ordinary Lead profile opens `Details` only.
 

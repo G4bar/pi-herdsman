@@ -62,6 +62,14 @@ Definitions list in that order. The ordinary profiles offer Details only;
 `managed-lead` offers Model, Thinking, and Details. See
 [Customizing bundled agents](customizing-agents.md#lead-execution-profiles).
 
+The reserved `compactor` definition is not an Agent either. Herdsman resolves it
+for the direct model calls that summarize the memory of a project listed in
+`memoryProjects`; it appears after the reserved Lead definitions in the flat
+Definitions list, with Model, Thinking, and Details but no Enabled action. Its
+frontmatter supports only `name`, `description`, `model`, `thinking`, and
+`bodyMode` on a matching overlay. See
+[Customizing bundled agents](customizing-agents.md#project-memory-compactor).
+
 ### Permission-aware extensions
 
 Agent definitions may include a `permission:` mapping for compatible
@@ -279,7 +287,8 @@ project/global Markdown definitions and existing Herdsman validation rather than
 a separate configuration interface.
 
 The human `Definitions` menu is a flat list of actionable definitions, with
-reserved `flexible-lead`, `orchestrator-lead`, and `managed-lead` first in that
+reserved `flexible-lead`, `orchestrator-lead`, `managed-lead`, and `compactor`
+first in that
 order. Each row identifies its contributing source or
 sources as `bundled`, `project`, and/or `global`. Model, thinking, and enabled
 settings can be changed through the menu, but edits always write global

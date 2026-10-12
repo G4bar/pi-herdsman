@@ -64,12 +64,14 @@ import {
   configuredToolPolicy,
   configuredModel,
   discoverLeadDefinition,
-  isReservedLeadDefinition,
+  discoverCompactorDefinition,
+  isReservedDefinition,
   matchesToolPattern,
   expandAgentBodyFiles,
   FLEXIBLE_LEAD_DEFINITION_NAME,
   ORCHESTRATOR_LEAD_DEFINITION_NAME,
   MANAGED_LEAD_DEFINITION_NAME,
+  COMPACTOR_DEFINITION_NAME,
   resolveChildModel,
   writePrivatePromptSnapshots,
   type AgentDefinition,
@@ -1430,22 +1432,27 @@ export function createLeadCommandRuntime(host: LeadCommandHost) {
       const loadDefinitions = async () => {
         const { definitions, leadDefinitions } =
           await host.contextAgentDefinitions(ctx);
+        const resolved = (
+          [
+            FLEXIBLE_LEAD_DEFINITION_NAME,
+            ORCHESTRATOR_LEAD_DEFINITION_NAME,
+            MANAGED_LEAD_DEFINITION_NAME,
+          ] as const
+        ).map((name) => {
+          const definition = leadDefinitions.find(
+            (candidate) => candidate.name === name,
+          );
+          if (!definition) throw new Error(`Lead definition ${name} not found`);
+          return definition;
+        });
         return {
           definitions,
-          leadDefinitions: (
-            [
-              FLEXIBLE_LEAD_DEFINITION_NAME,
-              ORCHESTRATOR_LEAD_DEFINITION_NAME,
-              MANAGED_LEAD_DEFINITION_NAME,
-            ] as const
-          ).map((name) => {
-            const definition = leadDefinitions.find(
-              (candidate) => candidate.name === name,
-            );
-            if (!definition)
-              throw new Error(`Lead definition ${name} not found`);
-            return definition;
-          }),
+          leadDefinitions: [
+            ...resolved,
+            discoverCompactorDefinition(
+              ctx.isProjectTrusted() ? { projectRoot: ctx.cwd } : {},
+            ),
+          ],
         };
       };
       const resolveDefinition = async (name: string) => {
@@ -1470,14 +1477,14 @@ export function createLeadCommandRuntime(host: LeadCommandHost) {
           ]
             .filter(Boolean)
             .join(" + ");
-          const reservedLead = isReservedLeadDefinition(definition.name);
+          const reserved = isReservedDefinition(definition.name);
           const runtimeProfile =
             definition.name === FLEXIBLE_LEAD_DEFINITION_NAME ||
             definition.name === ORCHESTRATOR_LEAD_DEFINITION_NAME;
           const description = [
             ...(!runtimeProfile ? [model, thinking] : []),
             sources,
-            ...(!reservedLead && !host.agentDefinitionEnabled(definition)
+            ...(!reserved && !host.agentDefinitionEnabled(definition)
               ? ["disabled"]
               : []),
           ]
@@ -1512,6 +1519,8 @@ export function createLeadCommandRuntime(host: LeadCommandHost) {
           const { model, thinking } = this.executionSettings(ctx, definition);
           const managedDefinition =
             definition.name === MANAGED_LEAD_DEFINITION_NAME;
+          const compactorDefinition =
+            definition.name === COMPACTOR_DEFINITION_NAME;
           const runtimeProfile =
             definition.name === FLEXIBLE_LEAD_DEFINITION_NAME ||
             definition.name === ORCHESTRATOR_LEAD_DEFINITION_NAME;
@@ -1527,7 +1536,9 @@ export function createLeadCommandRuntime(host: LeadCommandHost) {
                       description: model,
                       help: managedDefinition
                         ? "Model for future managed Lead launches. Changes do not affect a running Lead."
-                        : "Model for future Agent generations. When unset, fresh delegation inherits the spawning controller and continuation restores the saved session model.",
+                        : compactorDefinition
+                          ? "Model for project memory compactions. When unset, compactions use the Lead session's current model."
+                          : "Model for future Agent generations. When unset, fresh delegation inherits the spawning controller and continuation restores the saved session model.",
                     },
                   ]
                 : []),
@@ -1539,11 +1550,13 @@ export function createLeadCommandRuntime(host: LeadCommandHost) {
                       description: thinking,
                       help: managedDefinition
                         ? "Thinking level for future managed Lead launches. Changes do not affect a running Lead."
-                        : "Thinking level for future Agent generations. When unset, fresh delegation inherits the spawning controller and continuation restores the saved session level.",
+                        : compactorDefinition
+                          ? "Thinking level for project memory compactions. When unset, compactions use the Lead session's thinking level."
+                          : "Thinking level for future Agent generations. When unset, fresh delegation inherits the spawning controller and continuation restores the saved session level.",
                     },
                   ]
                 : []),
-              ...(!isReservedLeadDefinition(definition.name)
+              ...(!isReservedDefinition(definition.name)
                 ? [
                     {
                       value: "enabled",

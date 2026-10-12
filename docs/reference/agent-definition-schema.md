@@ -123,6 +123,23 @@ profiles modify execution instructions and ordinary tool projection only;
 reserved Lead definitions do not compose or inherit from one another (see
 [ADR 0018](../adr/0018-use-standalone-lead-execution-profiles.md)).
 
+### Reserved compactor definition
+
+`compactor` is a reserved definition that is not an Agent and not a Lead launch
+definition. Herdsman resolves it for the direct model calls that summarize an
+opted-in project's memory. It is excluded from the Agent roster and cannot be
+selected by `delegate_agent`, referenced from `agents`, or disabled. The
+Definitions UI lists it after the three reserved Lead definitions, with `Model`,
+`Thinking`, and `Details…`.
+
+It uses the same `bundled < project < global` overlay engine, and a project
+layer applies only when Pi considers the project trusted. Its frontmatter
+supports only `name`, `description`, `model`, `thinking`, and `bodyMode` on a
+matching overlay. Every other field is rejected rather than ignored, including
+`tools`, `enabled`, `systemPromptMode`, `permission`, `agents`, skills fields,
+and context-inheritance fields. An omitted `model` or `thinking` uses the owning
+Lead session's model and thinking level.
+
 ## Execution settings
 
 `model` and `thinking` are independent optional overrides. An omitted field is

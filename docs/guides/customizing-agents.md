@@ -107,6 +107,33 @@ launches, not already-running Leads. Use `stop_lead` followed by
 `resume_project` when a running project Lead must restart with changed launch
 policy.
 
+## Project memory compactor
+
+The reserved `compactor` definition is neither an Agent nor a Lead launch
+definition. Herdsman resolves it for the direct model calls that summarize the
+memory of a project listed in `memoryProjects`. It follows the same
+`bundled < project < global` precedence, is excluded from the Agent roster and
+delegation, offers no `Enabled` action, and is listed after the reserved Lead
+definitions. Its frontmatter supports only `name`, `description`, `model`,
+`thinking`, and `bodyMode` on a matching overlay; every other field is rejected.
+
+Compactions run often, so pin a cheap, fast model:
+
+```markdown
+---
+name: compactor
+model: anthropic/claude-haiku-4-5
+thinking: high
+---
+```
+
+The bundled body is prompt text and the bundled definition pins no model. An
+omitted `model` or `thinking` uses the owning Lead session's current model and
+thinking level, so setting both is what keeps background summarization off the
+Lead's expensive model. A project overlay lives at
+`<project>/.pi/agents/compactor.md` and applies only when the project is
+trusted; the global override remains `~/.pi/agent/agents/compactor.md`.
+
 ## Minimal model override
 
 ```markdown
@@ -310,13 +337,13 @@ Lead Pi sessions with UI can use:
 ```
 
 The native Definitions menu is a flat list, with `flexible-lead`,
-`orchestrator-lead`, and `managed-lead` first in that order. Each
+`orchestrator-lead`, `managed-lead`, and `compactor` first in that order. Each
 definition identifies its contributing source or sources as `bundled`,
 `project`, and/or `global`. Select a definition to open:
 
 ```text
 flexible-lead / orchestrator-lead: Details…
-managed-lead: Model / Thinking / Details…
+managed-lead / compactor: Model / Thinking / Details…
 ordinary Agent: Model / Thinking / Enabled / Details…
 ```
 

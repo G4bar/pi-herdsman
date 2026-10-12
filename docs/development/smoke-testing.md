@@ -305,8 +305,8 @@ role behavior.
 Verify the native Definitions list shows:
 
 - actionable definitions in one flat list, with reserved
-  `flexible-lead`, `orchestrator-lead`, and `managed-lead` first in that
-  canonical order;
+  `flexible-lead`, `orchestrator-lead`, `managed-lead`, and `compactor` first
+  in that canonical order;
 - contributing source words `bundled`, `project`, and `global`, including
   combinations where multiple sources contribute;
 - unpadded definition-name labels, with model, thinking, and provenance as
@@ -317,8 +317,13 @@ Verify the native Definitions list shows:
 
 All three reserved Lead definitions remain non-Agent. `flexible-lead` and
 `orchestrator-lead` have Details only; `managed-lead` has Model, Thinking, and
-Details, but no Enabled action. Runtime-profile definitions reject launch-only
-fields such as model, thinking, extensions, skills, and context inheritance.
+Details, but no Enabled action. The reserved `compactor` is non-Agent as well:
+it has Model, Thinking, and Details, but no Enabled action, and its model and
+thinking drive project memory compactions. Runtime-profile definitions reject
+launch-only
+fields such as model, thinking, extensions, skills, and context inheritance;
+`compactor` rejects every field except `name`, `description`, `model`,
+`thinking`, and `bodyMode` on a matching overlay.
 
 Structured `list_agents` should still retain exact deterministic metadata.
 

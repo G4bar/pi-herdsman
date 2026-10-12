@@ -120,7 +120,69 @@ test("partial and complete valid configs overlay defaults", () => {
     autoActivateManager: true,
     inlineAttachmentLimitBytes: MIN_BYTE_LIMIT,
     mailboxPayloadLimitBytes: MAX_BYTE_LIMIT,
+    memoryProjects: [],
   });
+});
+
+test("memoryProjects stores normalized absolute paths and rejects malformed lists", () => {
+  realFs.mkdirSync(herdsmanDataRoot(), { recursive: true });
+  const write = (value: unknown) =>
+    realFs.writeFileSync(
+      herdsmanConfigPath(),
+      JSON.stringify({ memoryProjects: value }),
+    );
+  for (const [value, expected] of [
+    [[], []],
+    [["/tmp/pi-herdsman-memory-a"], ["/tmp/pi-herdsman-memory-a"]],
+    [["/tmp/pi-herdsman-memory-a/"], ["/tmp/pi-herdsman-memory-a"]],
+    [
+      [
+        "/tmp/pi-herdsman-memory-b/../pi-herdsman-memory-b",
+        "/tmp/pi-herdsman-memory-c",
+      ],
+      ["/tmp/pi-herdsman-memory-b", "/tmp/pi-herdsman-memory-c"],
+    ],
+  ] as const) {
+    write(value);
+    assert.deepEqual(readConfig(), {
+      ...DEFAULT_CONFIG,
+      memoryProjects: [...expected],
+    });
+  }
+  realFs.writeFileSync(herdsmanConfigPath(), "{}");
+  assert.deepEqual(readConfig().memoryProjects, []);
+  for (const value of [
+    "/tmp/pi-herdsman-memory-a",
+    { "/tmp/pi-herdsman-memory-a": true },
+    [7],
+    ["relative/path"],
+    [""],
+    [["/tmp/pi-herdsman-memory-a"]],
+    ["/tmp/pi-herdsman-memory-a", "/tmp/pi-herdsman-memory-a/"],
+    [
+      "/tmp/pi-herdsman-memory-a",
+      "/tmp/pi-herdsman-memory-a/../pi-herdsman-memory-a",
+    ],
+  ] as const) {
+    write(value);
+    assert.throws(() => readConfig(), /memoryProjects/);
+  }
+  realFs.writeFileSync(herdsmanConfigPath(), "{}");
+  assert.throws(
+    () => updateConfig("memoryProjects", ["relative/path"]),
+    /memoryProjects/,
+  );
+  updateConfig("memoryProjects", [
+    "/tmp/pi-herdsman-memory-a/",
+    "/tmp/pi-herdsman-memory-b",
+  ]);
+  assert.deepEqual(readConfig().memoryProjects, [
+    "/tmp/pi-herdsman-memory-a",
+    "/tmp/pi-herdsman-memory-b",
+  ]);
+  updateConfig("memoryProjects", undefined);
+  assert.deepEqual(readConfig().memoryProjects, []);
+  assert.equal(realFs.existsSync(herdsmanConfigPath()), false);
 });
 
 test("invalid values, malformed JSON, non-object roots, and unknown keys fail clearly", () => {

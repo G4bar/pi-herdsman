@@ -7524,6 +7524,147 @@ test("Definitions exposes managed Lead settings without Agent discovery", async 
   }
 });
 
+test("Definitions configures the reserved compactor after the Lead definitions", async () => {
+  setLeadEnvironment();
+  const overridePath = join(PI_AGENTS_DIR, "compactor.md");
+  const pi = fakePi();
+  registerExtension!(pi.pi as never);
+  const command = pi.commandOptions.get("agents");
+  const prompts: { label: string; options: string[] }[] = [];
+  const context = fakeContext() as any;
+  context.hasUI = true;
+  context.mode = "rpc";
+  context.modelRegistry = {
+    refresh: async () => undefined,
+    getAll: () => [{ provider: "new", id: "model", reasoning: true }],
+    getAvailable: () => [{ provider: "new", id: "model", reasoning: true }],
+  };
+  const visits = new Map<string, number>();
+  context.ui.select = async (label: string, options: string[]) => {
+    prompts.push({ label, options });
+    const visit = visits.get(label) ?? 0;
+    visits.set(label, visit + 1);
+    if (label === "Definitions")
+      return visit === 0
+        ? options.find((option) => option.includes("compactor"))
+        : undefined;
+    if (label === "compactor")
+      return visit < 2
+        ? options.find((option) =>
+            option.startsWith(visit === 0 ? "Model" : "Thinking"),
+          )
+        : undefined;
+    if (label === "Model")
+      return options.find((option) => option.startsWith("model"));
+    if (label === "Thinking")
+      return options.find((option) => option === "high");
+    return undefined;
+  };
+  try {
+    await command.handler("definitions", context);
+    const definitionMenu = prompts.find(({ label }) => label === "Definitions");
+    const names = (definitionMenu?.options ?? []).map(
+      (option) => option.split(/\s{2}/u)[0],
+    );
+    assert.ok(
+      names.indexOf("compactor") > names.indexOf("managed-lead"),
+      JSON.stringify(names),
+    );
+    assert.ok(
+      definitionMenu?.options.some((option) =>
+        /compactor.*bundled/iu.test(option),
+      ),
+      JSON.stringify(definitionMenu),
+    );
+    const openActions = prompts
+      .filter(({ label }) => label === "compactor")
+      .map(({ options }) => options.map((option) => option.split(/\s{2}/u)[0]));
+    assert.deepEqual(openActions[0], ["Model", "Thinking", "Details…"]);
+    assert.equal(openActions.length, 3);
+    assert.match(
+      realFs.readFileSync(overridePath, "utf8"),
+      /model: new\/model/u,
+    );
+    assert.match(realFs.readFileSync(overridePath, "utf8"), /thinking: high/u);
+    assert.equal(
+      discoverAgentDefinitions().some(
+        (definition) => definition.name === "compactor",
+      ),
+      false,
+    );
+  } finally {
+    await pi.events.get("session_shutdown")?.[0]();
+    realFs.rmSync(overridePath, { force: true });
+  }
+});
+
+test("Definitions contextual help describes compactor model and thinking fallback", async () => {
+  setLeadEnvironment();
+  const pi = fakePi();
+  registerExtension!(pi.pi as never);
+  const command = pi.commandOptions.get("agents");
+  const context = fakeContext() as any;
+  context.hasUI = true;
+  context.mode = "tui";
+  let customCall = 0;
+  context.ui.custom = async (factory: any) =>
+    new Promise((resolve) => {
+      const component = factory(
+        { requestRender: () => undefined },
+        {
+          fg: (_color: string, text: string) => text,
+          bold: (text: string) => text,
+        },
+        {},
+        resolve,
+      );
+      const lines = () => component.render(200);
+      const moveTo = (target: string): void => {
+        for (let attempts = 0; attempts < 20; attempts++) {
+          if (
+            lines().some(
+              (line) =>
+                line.trimStart().startsWith("→") && line.includes(target),
+            )
+          )
+            return;
+          component.handleInput("\u001b[B");
+        }
+        throw new Error(`TUI item was not selected: ${target}`);
+      };
+      if (customCall === 0) {
+        customCall++;
+        selectTuiItem(component, "compactor");
+      } else if (customCall === 1) {
+        customCall++;
+        assert.ok(
+          lines().some((line) =>
+            line.includes(
+              "Model for project memory compactions. When unset, compactions use the Lead session's current model.",
+            ),
+          ),
+        );
+        moveTo("Thinking");
+        assert.ok(
+          lines().some((line) =>
+            line.includes(
+              "Thinking level for project memory compactions. When unset, compactions use the Lead session's thinking level.",
+            ),
+          ),
+        );
+        component.handleInput("\u001b");
+      } else {
+        component.handleInput("\u001b");
+      }
+    });
+  try {
+    await command.handler("definitions", context);
+    assert.equal(customCall, 2);
+  } finally {
+    await pi.events.get("session_shutdown")?.[0]();
+  }
+});
+
 test("Definitions contextual help distinguishes managed Lead and Agent launches across visits", async () => {
   setLeadEnvironment();
   const pi = fakePi();
