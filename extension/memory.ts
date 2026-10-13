@@ -100,6 +100,19 @@ const UNBUILT_BYTES = Buffer.byteLength(UNBUILT_LINE, "utf8");
 /** The body of a message that only carried images. Images are not stored. */
 const IMAGE_BODY = "(image)";
 const IMAGE_BODY_BYTES = Buffer.byteLength(IMAGE_BODY, "utf8");
+/**
+ * Herdsman's own custom messages behind these types are a real agent result or
+ * an attention message about one. Every other `pi-herdsman-*` custom message is
+ * runtime state or a role message, which is not project memory.
+ */
+const HERDSMAN_WORK_TYPES: ReadonlySet<string> = new Set([
+  "pi-herdsman-agent-result",
+  "pi-herdsman-agent-ask",
+  "pi-herdsman-agent-stale",
+  "pi-herdsman-agent-lost",
+  "pi-herdsman-agent-attention",
+]);
+const HERDSMAN_CUSTOM_PREFIX = "pi-herdsman-";
 
 function sha256(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
@@ -161,8 +174,18 @@ function entryContent(entry: SessionEntry): string {
   return "";
 }
 
+/** True when a custom message is chat: an agent result, or anyone else's. */
+function workCustomMessage(customType: string): boolean {
+  return (
+    !customType.startsWith(HERDSMAN_CUSTOM_PREFIX) ||
+    HERDSMAN_WORK_TYPES.has(customType)
+  );
+}
+
 function entryParts(entry: SessionEntry): MessagePart[] {
   if (entry.type === "custom_message") {
+    // Herdsman's own state and role messages are not memory.
+    if (!workCustomMessage(entry.customType)) return [];
     const { text, images } = contentText(entry.content);
     if (!text && !images) return [];
     const label = customLabel(entry.details);

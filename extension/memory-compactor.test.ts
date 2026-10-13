@@ -59,6 +59,7 @@ function assistant(
 class FakeCall {
   readonly context: Context;
   readonly reasoning: string | undefined;
+  readonly sessionId: string | undefined;
   aborted = false;
   readonly stream: AsyncIterable<AssistantMessageEvent>;
   private readonly queue: AssistantMessageEvent[] = [];
@@ -67,11 +68,14 @@ class FakeCall {
 
   constructor(
     context: Context,
-    options: { signal?: AbortSignal; reasoning?: string } | undefined,
+    options:
+      | { signal?: AbortSignal; reasoning?: string; sessionId?: string }
+      | undefined,
     emitStart: boolean,
   ) {
     this.context = context;
     this.reasoning = options?.reasoning;
+    this.sessionId = options?.sessionId;
     if (emitStart) this.begin();
     this.stream = { [Symbol.asyncIterator]: () => this.iterate() };
     options?.signal?.addEventListener(
@@ -146,6 +150,8 @@ class FakeRegistry {
     call.respond("summary line");
   emitStart = true;
   throwSync: string | undefined;
+  /** A provider that rejects a request without `options.sessionId`. */
+  requireSessionId = false;
   private readonly models: Model<Api>[];
 
   constructor(models: Model<Api>[]) {
@@ -163,14 +169,16 @@ class FakeRegistry {
   streamSimple(
     model: Model<Api>,
     context: Context,
-    options?: { signal?: AbortSignal; reasoning?: string },
+    options?: { signal?: AbortSignal; reasoning?: string; sessionId?: string },
   ): unknown {
     if (this.throwSync) throw new Error(this.throwSync);
     this.requested.push(model);
     const call = new FakeCall(context, options, this.emitStart);
     const index = this.calls.length;
     this.calls.push(call);
-    this.responder(call, index);
+    if (this.requireSessionId && options?.sessionId === undefined)
+      call.fail("missing x-opencode-session");
+    else this.responder(call, index);
     return call.stream;
   }
 }
@@ -190,6 +198,7 @@ function fakeContext(
   model: Model<Api> | undefined,
   project: string,
   thinkingLevel: string | undefined = "high",
+  sessionId = "session-1",
 ): ExtensionContext {
   return {
     cwd: project,
@@ -197,6 +206,7 @@ function fakeContext(
     model: model ?? registry.getAll()[0],
     thinkingLevel,
     modelRegistry: registry,
+    sessionManager: { getSessionId: () => sessionId },
   } as unknown as ExtensionContext;
 }
 
@@ -686,6 +696,24 @@ test("a synchronous streamSimple failure is requeued and reported", () =>
     assert.equal(store.nodeText([0, 0]), undefined);
     assert.deepEqual(failures, ["no transport"]);
     compactor.stop();
+  }));
+
+// --- provider request options ------------------------------------------------
+
+test("the compaction call carries the Pi session id the provider routes by", () =>
+  withProject(async (project, store) => {
+    addMessage(store, longText());
+    const registry = new FakeRegistry([makeModel("test", "lead")]);
+    registry.requireSessionId = true;
+    const compactor = start(
+      store,
+      fakeContext(registry, undefined, project, "high", "session-1"),
+    );
+    await compactor.whenSettled(0);
+    compactor.stop();
+
+    assert.equal(registry.calls[0]!.sessionId, "session-1");
+    assert.equal(store.nodeText([0, 0]), "summary line");
   }));
 
 // --- model resolution -------------------------------------------------------

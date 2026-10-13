@@ -180,6 +180,8 @@ export function registerMemoryRuntime(
     message: string,
     type: "info" | "warning" | "error" = "warning",
   ): void {
+    // A non-interactive run has no UI, so a warning also goes to stderr.
+    if (type !== "info") console.error(`Project memory: ${message}`);
     try {
       ctx.ui.notify(message, type);
     } catch {
@@ -712,7 +714,11 @@ function gateCall(
   pi: ExtensionAPI,
   memory: ActiveMemory,
   ctx: ExtensionContext,
-  event: { toolName: string; toolCallId: string; input: Record<string, unknown> },
+  event: {
+    toolName: string;
+    toolCallId: string;
+    input: Record<string, unknown>;
+  },
   frozen: FrozenTurn,
 ): { block: true; reason: string } | undefined {
   const checks = gateChecks(event.toolName, event.input, ctx.cwd);
@@ -732,9 +738,8 @@ function gateCall(
             : corpus.text.includes(check.value),
     };
   });
-  const blocked = decisions.filter(
-    ({ check, inView, inCorpus }) =>
-      check.class === "path" ? inView && !inCorpus : !inCorpus,
+  const blocked = decisions.filter(({ check, inView, inCorpus }) =>
+    check.class === "path" ? inView && !inCorpus : !inCorpus,
   );
   // Zooming before acting is the point: an earlier zoom counts only until a
   // block, after which the turn is no longer unprompted.

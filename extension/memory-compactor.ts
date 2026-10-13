@@ -22,6 +22,7 @@ import {
   LEAF_BYTES,
   MemoryStore,
   extractIdentifiers,
+  lineLabel,
   nodeLength,
   nodeStart,
   type MemoryIdentifier,
@@ -119,9 +120,23 @@ export function start(
     : undefined;
   const runner = new CompactorRunner(store, ctx, model, reasoning, callbacks, {
     systemPrompt: `${MEMORY_VIEW_DESCRIPTION}\n\n${definition.body}`,
+    sessionId: sessionIdOf(ctx),
   });
   runner.pump();
   return runner;
+}
+
+/**
+ * The Pi session id. Providers such as OpenCode route a request by it and
+ * reject one without it, so a direct call must carry it like Pi's own do.
+ */
+function sessionIdOf(ctx: ExtensionContext): string | undefined {
+  try {
+    const id = ctx.sessionManager.getSessionId();
+    return typeof id === "string" && id !== "" ? id : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 class CompactorRunner implements MemoryCompactor {
@@ -131,6 +146,7 @@ class CompactorRunner implements MemoryCompactor {
   private readonly reasoning: ModelThinkingLevel | undefined;
   private readonly callbacks: MemoryCompactorCallbacks;
   private readonly systemPrompt: string;
+  private readonly sessionId: string | undefined;
   private readonly controllers = new Set<AbortController>();
   private readonly failures = new Map<string, number>();
   private readonly reported = new Set<string>();
@@ -152,7 +168,7 @@ class CompactorRunner implements MemoryCompactor {
     model: Model<Api>,
     reasoning: ModelThinkingLevel | undefined,
     callbacks: MemoryCompactorCallbacks,
-    options: { systemPrompt: string },
+    options: { systemPrompt: string; sessionId: string | undefined },
   ) {
     this.store = store;
     this.ctx = ctx;
@@ -160,6 +176,7 @@ class CompactorRunner implements MemoryCompactor {
     this.reasoning = reasoning;
     this.callbacks = callbacks;
     this.systemPrompt = options.systemPrompt;
+    this.sessionId = options.sessionId;
   }
 
   onMessage(): void {
@@ -407,6 +424,7 @@ class CompactorRunner implements MemoryCompactor {
         { systemPrompt: this.systemPrompt, messages: [...request] },
         {
           signal: controller.signal,
+          ...(this.sessionId ? { sessionId: this.sessionId } : {}),
           ...(this.reasoning && this.reasoning !== "off"
             ? { reasoning: this.reasoning }
             : {}),
@@ -468,6 +486,12 @@ class CompactorRunner implements MemoryCompactor {
     const failures = (this.failures.get(key) ?? 0) + 1;
     this.failures.set(key, failures);
     this.retry.push(job);
+    // A print-mode process ends long before the report threshold, so the first
+    // failure of a node is logged where a non-interactive run can see it.
+    if (failures === 1)
+      console.error(
+        `Project memory compaction of ${lineLabel(jobLine(job))} failed: ${error}`,
+      );
     if (failures === FAILURES_BEFORE_REPORT && !this.reported.has(key)) {
       this.reported.add(key);
       this.callbacks.onFailure?.({ line: jobLine(job), failures, error });

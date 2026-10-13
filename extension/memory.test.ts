@@ -85,11 +85,15 @@ function toolResultEntry(content: unknown): SessionEntry {
   } as unknown as SessionEntry;
 }
 
-function customMessageEntry(content: unknown, details?: unknown): SessionEntry {
+function customMessageEntry(
+  content: unknown,
+  details?: unknown,
+  customType = "pi-herdsman-agent-result",
+): SessionEntry {
   return {
     ...entryBase(),
     type: "custom_message",
-    customType: "pi-herdsman-agent-result",
+    customType,
     content,
     details,
     display: true,
@@ -200,6 +204,51 @@ test("each Pi entry kind derives its memory messages", () => {
       assert.equal(message.hash, entryHash(entry), name);
     }
   }
+});
+
+test("Herdsman's own runtime messages are not memory messages", () => {
+  const runtimeTypes = [
+    "pi-herdsman-supervisor-state",
+    "pi-herdsman-stop-summary",
+    "pi-herdsman-delegation-guidance",
+    "pi-herdsman-project_message",
+    "pi-herdsman-supervisor_message",
+    "pi-herdsman-peer_message",
+  ];
+  for (const customType of runtimeTypes) {
+    const entry = customMessageEntry("runtime noise", {}, customType);
+    assert.deepEqual(deriveMessages(entry, SESSION), [], customType);
+  }
+});
+
+test("agent results and attention messages stay work", () => {
+  const agentTypes = [
+    "pi-herdsman-agent-result",
+    "pi-herdsman-agent-ask",
+    "pi-herdsman-agent-stale",
+    "pi-herdsman-agent-lost",
+    "pi-herdsman-agent-attention",
+  ];
+  for (const customType of agentTypes) {
+    const entry = customMessageEntry(
+      "done",
+      { agentLabel: "scout" },
+      customType,
+    );
+    assert.deepEqual(
+      deriveMessages(entry, SESSION).map(({ kind, text }) => ({ kind, text })),
+      [{ kind: "work", text: "[scout] done" }],
+      customType,
+    );
+  }
+});
+
+test("a custom message from another extension is still work", () => {
+  const entry = customMessageEntry("notes", {}, "other-extension-notes");
+  assert.deepEqual(
+    deriveMessages(entry, SESSION).map(({ kind }) => kind),
+    ["work"],
+  );
 });
 
 test("entries that are not chat are not memory messages", () => {
