@@ -7,7 +7,7 @@
  * this module owns the Pi events.
  */
 import { readFileSync, readdirSync, realpathSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join, sep } from "node:path";
 import {
   type ContextEvent,
   type ExtensionAPI,
@@ -42,6 +42,9 @@ import {
 
 /** The per-turn settle grace: after this the view freezes with placeholders. */
 export const TURN_SETTLE_GRACE_MS = 30_000;
+/** At most this many images, and this many bytes in all, come back per zoom. */
+const ZOOM_IMAGE_LIMIT = 4;
+const ZOOM_IMAGE_BYTES = 5 * 1024 * 1024;
 const VIEW_OPEN = "<chat>";
 const VIEW_CLOSE = "</chat>";
 
@@ -151,7 +154,6 @@ export function registerMemoryRuntime(
     } catch {
       // A lock that changed owner is not this session's to release.
     }
-    options.onActiveChange?.();
   }
 
   /** Names the live owner, so a second concurrent session is not a mystery. */
@@ -416,12 +418,16 @@ export function registerMemoryRuntime(
   });
 
   pi.on("session_start", (_event, ctx: ExtensionContext) => {
+    const wasActive = active !== undefined;
     try {
       activate(ctx);
     } catch (error) {
       deactivate();
       notify(ctx, `Project memory is inactive: ${reason(error)}`);
     }
+    // A session that no longer owns memory re-projects, so a stale tool set
+    // from the previous session does not carry over.
+    if (wasActive && !active) options.onActiveChange?.();
   });
   pi.on("message_end", (_event, ctx: ExtensionContext) => {
     const memory = owning();
@@ -474,9 +480,13 @@ export function registerMemoryRuntime(
       flush(memory);
     }
     deactivate();
+    if (memory) options.onActiveChange?.();
   });
 
-  return { isActive: () => active !== undefined };
+  // Keys off `owning()` rather than the raw active state: a role change ends
+  // ownership at the next read, and the Lead's tool projection and prompt
+  // section both evaluate this before the turn starts.
+  return { isActive: () => owning() !== undefined };
 }
 
 /** The listed project path the cwd resolves to, or undefined when it is not listed. */
@@ -647,7 +657,15 @@ function zoomResult(
           type: "text",
           text: "[image unavailable: session file missing]",
         });
-      else content.push(...images);
+      else {
+        const bounded = boundedImages(images);
+        content.push(...bounded.images);
+        if (bounded.dropped > 0)
+          content.push({
+            type: "text",
+            text: `[${bounded.dropped} image(s) omitted]`,
+          });
+      }
     }
     return {
       content,
@@ -718,12 +736,11 @@ function formatLocalDate(value: string): string {
   return `${local} ${sign}${pad(Math.floor(size / 60))}:${pad(size % 60)}`;
 }
 
-/** Parsed image blocks per old session file, so each is parsed at most once. */
-const sessionImageCache = new Map<string, Map<string, ImageContent[]>>();
-
 /**
- * The images a record pointed at, or undefined when its session file is gone.
- * The current session is read in memory; an old one is parsed once and cached.
+ * The images a record pointed at, or undefined when its source cannot be read.
+ * The current session is read in memory; an old session file is parsed again on
+ * each call, because zooming into an image is rare and a cache would hold every
+ * image of every session for the life of the process.
  */
 function sourceImages(
   source: MemorySource,
@@ -735,21 +752,58 @@ function sourceImages(
       .find((candidate) => candidate.id === source.entry);
     return entry ? imageBlocks(entry) : [];
   }
-  const cached = sessionImageCache.get(source.session);
-  if (cached) return cached.get(source.entry) ?? [];
+  const file = allowedSessionFile(source.session, ctx);
+  if (file === undefined) return undefined;
   let content: string;
   try {
-    content = readFileSync(source.session, "utf8");
+    content = readFileSync(file, "utf8");
   } catch {
     return undefined;
   }
-  const images = new Map<string, ImageContent[]>();
   for (const entry of parseSessionEntries(content)) {
-    const blocks = imageBlocks(entry);
-    if (blocks.length > 0) images.set(entry.id, blocks);
+    if (entry.id === source.entry) return imageBlocks(entry);
   }
-  sessionImageCache.set(source.session, images);
-  return images.get(source.entry) ?? [];
+  return [];
+}
+
+/**
+ * An image source is read only when it is a `.jsonl` file inside the sessions
+ * directory of the current session. The project log is append-only and could
+ * hold any path, so this keeps a crafted record from reading another file.
+ */
+function allowedSessionFile(
+  session: string,
+  ctx: ExtensionContext,
+): string | undefined {
+  if (!session.endsWith(".jsonl")) return undefined;
+  const current = ctx.sessionManager.getSessionFile();
+  if (current === undefined) return undefined;
+  let root: string;
+  let resolved: string;
+  try {
+    root = realpathSync(dirname(current));
+    resolved = realpathSync(session);
+  } catch {
+    return undefined;
+  }
+  return resolved.startsWith(`${root}${sep}`) ? resolved : undefined;
+}
+
+/** Caps one zoom's images by count and by payload bytes. */
+function boundedImages(images: readonly ImageContent[]): {
+  images: ImageContent[];
+  dropped: number;
+} {
+  const kept: ImageContent[] = [];
+  let bytes = 0;
+  for (const image of images) {
+    if (kept.length >= ZOOM_IMAGE_LIMIT) break;
+    const size = Buffer.byteLength(image.data, "utf8");
+    if (bytes + size > ZOOM_IMAGE_BYTES) break;
+    bytes += size;
+    kept.push(image);
+  }
+  return { images: kept, dropped: images.length - kept.length };
 }
 
 function imageBlocks(entry: SessionEntry | FileEntry): ImageContent[] {

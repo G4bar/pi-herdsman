@@ -202,6 +202,7 @@ type HarnessOptions = {
   thinkingLevel?: string;
   hang?: boolean;
   startCompactor?: MemoryCompactorFactory;
+  onActiveChange?: () => void;
 };
 
 class Harness {
@@ -225,6 +226,9 @@ class Harness {
         ? {}
         : { settleGraceMs: options.settleGraceMs }),
       startCompactor: factory,
+      ...(options.onActiveChange === undefined
+        ? {}
+        : { onActiveChange: options.onActiveChange }),
     });
   }
 
@@ -1048,14 +1052,42 @@ test("a compaction failure notifies once and a shutdown stops the compactor", as
 
 const IMAGE_BLOCK = { type: "image", data: "aGVsbG8=", mimeType: "image/png" };
 
-/** A user entry whose content carries one image, so its record flags `src`. */
-function imageUserEntry(text: string, parentId: string | null = null) {
-  return {
+/**
+ * A user entry whose content carries one image, so its record flags `src`. The
+ * optional `id` lets a test rewrite one entry's file with a different image.
+ */
+function imageUserEntry(
+  text: string,
+  parentId: string | null = null,
+  image: Record<string, unknown> = IMAGE_BLOCK,
+  id?: string,
+) {
+  const entry = {
     ...entryBase(parentId),
     type: "message",
     message: {
       role: "user",
-      content: [{ type: "text", text }, { ...IMAGE_BLOCK }],
+      content: [{ type: "text", text }, { ...image }],
+      timestamp: 0,
+    },
+  };
+  if (id !== undefined) entry.id = id;
+  return entry as unknown as SessionEntry;
+}
+
+/** A user entry whose content carries `count` images of `bytes` data each. */
+function multiImageEntry(text: string, count: number, bytes = 4) {
+  const images = Array.from({ length: count }, () => ({
+    type: "image",
+    data: "a".repeat(bytes),
+    mimeType: "image/png",
+  }));
+  return {
+    ...entryBase(null),
+    type: "message",
+    message: {
+      role: "user",
+      content: [{ type: "text", text }, ...images],
       timestamp: 0,
     },
   } as unknown as SessionEntry;
@@ -1204,9 +1236,11 @@ test("zoom rejects a bad n, a misaligned id and an out-of-range id", async () =>
 test("zoom n = 1 returns the message whole with its images", async () => {
   const project = projectDir();
   withProjects([project]);
+  // A real sessions directory: an old session file is read only from here.
+  const dir = projectDir();
   const session = new TestSession({
     cwd: project,
-    file: "/sessions/current-images.jsonl",
+    file: join(dir, "current-images.jsonl"),
   });
   const harness = new Harness();
   await harness.sessionStart(session);
@@ -1231,8 +1265,7 @@ test("zoom n = 1 returns the message whole with its images", async () => {
   assert.deepEqual(fromCurrent.content[1], IMAGE_BLOCK);
   assert.equal(fromCurrent.details.session, session.file);
 
-  // An older session file: parsed once, and its images come back.
-  const dir = projectDir();
+  // An older session file in the same directory: its images come back.
   const older = imageUserEntry("from before");
   const olderFile = writeSessionFile(dir, "older-session", older);
   store.appendMessage({
@@ -1371,6 +1404,211 @@ test("an empty project reports the empty log to zoom and date", async () => {
   await assert.rejects(
     callMemoryTool(harness, session, "date", { id: 0 }),
     /the log is empty/,
+  );
+  await harness.shutdown(session, "quit");
+});
+
+// --- review fixes -----------------------------------------------------------
+
+test("a mid-turn role change ends ownership without re-projecting tools", async () => {
+  const project = projectDir();
+  withProjects([project]);
+  const session = new TestSession({
+    cwd: project,
+    file: "/sessions/role-midturn.jsonl",
+    entries: [userEntry("hello")],
+  });
+  session.branch = session.entries;
+  let ordinary = true;
+  const changes: number[] = [];
+  const harness = new Harness({
+    isOrdinaryLead: () => ordinary,
+    onActiveChange: () => changes.push(1),
+  });
+  await harness.sessionStart(session);
+  assert.equal(harness.compactors.length, 1);
+  assert.equal(changes.length, 1); // activation notifies once
+
+  // A mid-turn role change deactivates silently: no tool re-projection.
+  ordinary = false;
+  await harness.messageEnd(session);
+  assert.equal(changes.length, 1);
+  assert.equal(harness.compactors[0].stopped, true);
+
+  await harness.shutdown(session, "quit");
+  assert.equal(changes.length, 1);
+});
+
+test("deactivation at a session boundary re-projects the Lead tools", async () => {
+  const project = projectDir();
+  withProjects([project]);
+  const session = new TestSession({
+    cwd: project,
+    file: "/sessions/role-boundary.jsonl",
+  });
+  const changes: number[] = [];
+  const harness = new Harness({ onActiveChange: () => changes.push(1) });
+  await harness.sessionStart(session);
+  assert.equal(changes.length, 1);
+
+  await harness.shutdown(session, "quit");
+  assert.equal(changes.length, 2);
+});
+
+test("zoom refuses an image source outside the sessions directory", async () => {
+  const project = projectDir();
+  withProjects([project]);
+  const sessions = projectDir();
+  const session = new TestSession({
+    cwd: project,
+    file: join(sessions, "current.jsonl"),
+  });
+  const harness = new Harness();
+  await harness.sessionStart(session);
+  const store = harness.compactors[0].store;
+
+  // A real .jsonl file with an image, but outside the sessions directory.
+  const outside = imageUserEntry("outside");
+  const outsideFile = writeSessionFile(
+    projectDir(),
+    "outside-session",
+    outside,
+  );
+  store.appendMessage({
+    kind: "user",
+    text: "outside",
+    size: 7,
+    date: outside.timestamp,
+    src: { session: outsideFile, entry: outside.id, part: 0, images: true },
+    hash: "image-outside",
+  });
+  const result = await callMemoryTool(harness, session, "zoom", {
+    id: 0,
+    n: 1,
+  });
+  assert.equal(result.content[0].text, "user: outside");
+  assert.equal(result.content.length, 2);
+  assert.equal(
+    result.content[1].text,
+    "[image unavailable: session file missing]",
+  );
+
+  // A path with no .jsonl extension is refused before it is read.
+  store.appendMessage({
+    kind: "user",
+    text: "passwd",
+    size: 6,
+    date: outside.timestamp,
+    src: { session: "/etc/passwd", entry: "x", part: 0, images: true },
+    hash: "image-passwd",
+  });
+  const passwd = await callMemoryTool(harness, session, "zoom", {
+    id: 1,
+    n: 1,
+  });
+  assert.equal(passwd.content.length, 2);
+  assert.equal(
+    passwd.content[1].text,
+    "[image unavailable: session file missing]",
+  );
+  await harness.shutdown(session, "quit");
+});
+
+test("zoom re-parses an old session file rather than caching it", async () => {
+  const project = projectDir();
+  withProjects([project]);
+  const sessions = projectDir();
+  const session = new TestSession({
+    cwd: project,
+    file: join(sessions, "current.jsonl"),
+  });
+  const harness = new Harness();
+  await harness.sessionStart(session);
+  const store = harness.compactors[0].store;
+
+  const older = imageUserEntry("first image");
+  const olderFile = writeSessionFile(sessions, "older-session", older);
+  store.appendMessage({
+    kind: "user",
+    text: "first image",
+    size: 11,
+    date: older.timestamp,
+    src: { session: olderFile, entry: older.id, part: 0, images: true },
+    hash: "image-cached",
+  });
+  const first = await callMemoryTool(harness, session, "zoom", { id: 0, n: 1 });
+  assert.deepEqual(first.content[1], IMAGE_BLOCK);
+
+  // The same entry id now carries a different image. A cache would keep the
+  // old one; re-parsing returns the file as it is now.
+  const changed = { type: "image", data: "d29ybGQ=", mimeType: "image/png" };
+  const updated = imageUserEntry("first image", null, changed, older.id);
+  writeSessionFile(sessions, "older-session", updated);
+  const second = await callMemoryTool(harness, session, "zoom", {
+    id: 0,
+    n: 1,
+  });
+  assert.deepEqual(second.content[1], changed);
+  await harness.shutdown(session, "quit");
+});
+
+test("zoom caps the number and size of images it returns", async () => {
+  const project = projectDir();
+  withProjects([project]);
+  const session = new TestSession({
+    cwd: project,
+    file: "/sessions/capped.jsonl",
+  });
+  const harness = new Harness();
+  await harness.sessionStart(session);
+  const store = harness.compactors[0].store;
+
+  // Five small images: four come back and the fifth is noted.
+  const many = multiImageEntry("five images", 5);
+  session.entries = [many];
+  store.appendMessage({
+    kind: "user",
+    text: "five images",
+    size: 11,
+    date: many.timestamp,
+    src: { session: session.file!, entry: many.id, part: 0, images: true },
+    hash: "image-many",
+  });
+  const countCapped = await callMemoryTool(harness, session, "zoom", {
+    id: 0,
+    n: 1,
+  });
+  assert.equal(
+    countCapped.content.filter((block: any) => block.type === "image").length,
+    4,
+  );
+  assert.equal(
+    (countCapped.content.at(-1) as any).text,
+    "[1 image(s) omitted]",
+  );
+
+  // One image past the byte cap: none come back, and the note says so.
+  const big = multiImageEntry("big image", 1, 5 * 1024 * 1024 + 1);
+  session.entries = [big];
+  store.appendMessage({
+    kind: "user",
+    text: "big image",
+    size: 9,
+    date: big.timestamp,
+    src: { session: session.file!, entry: big.id, part: 0, images: true },
+    hash: "image-big",
+  });
+  const bytesCapped = await callMemoryTool(harness, session, "zoom", {
+    id: 1,
+    n: 1,
+  });
+  assert.equal(
+    bytesCapped.content.filter((block: any) => block.type === "image").length,
+    0,
+  );
+  assert.equal(
+    (bytesCapped.content.at(-1) as any).text,
+    "[1 image(s) omitted]",
   );
   await harness.shutdown(session, "quit");
 });
