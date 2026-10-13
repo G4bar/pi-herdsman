@@ -17,7 +17,10 @@ import {
   type SessionBeforeCompactEvent,
   type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
-import { parseSessionEntries } from "@earendil-works/pi-coding-agent";
+import {
+  convertToLlm,
+  parseSessionEntries,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import { readConfig } from "./config.ts";
@@ -66,6 +69,8 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const GATE_REASON_LIMIT = 5;
 /** How often one identifier must be blocked before the reason suggests asking. */
 const GATE_ASK_AFTER = 3;
+/** The durable audit entry the gate appends; it is never corpus text. */
+const GATE_ENTRY_TYPE = "pi-herdsman-memory-gate";
 
 export type MemoryCompactorFactory = (
   store: MemoryStore,
@@ -733,7 +738,7 @@ function gateCall(
   );
   // Zooming before acting is the point: an earlier zoom counts only until a
   // block, after which the turn is no longer unprompted.
-  pi.appendEntry("pi-herdsman-memory-gate", {
+  pi.appendEntry(GATE_ENTRY_TYPE, {
     tool: event.toolName,
     toolCallId: event.toolCallId,
     identifiers: decisions.map(({ check, inView, inCorpus }) => ({
@@ -851,8 +856,7 @@ function turnCorpus(
   frozen: FrozenTurn,
 ): TurnCorpus {
   const branch = ctx.sessionManager.getBranch();
-  const last = branch[branch.length - 1]?.id ?? "";
-  const key = `${frozen.timestamp}|${frozen.anchor ?? ""}|${branch.length}|${last}`;
+  const key = corpusKey(branch, frozen);
   if (memory.corpus && memory.corpus.key === key) return memory.corpus;
   // A branch that no longer holds the anchor keeps every entry, so a value the
   // model saw natively is never blocked.
@@ -864,13 +868,15 @@ function turnCorpus(
   let zoomed = false;
   for (let index = Math.max(start, 0); index < branch.length; index += 1) {
     const entry = branch[index];
-    for (const message of deriveMessages(entry, memory.session))
-      if (
+    // The derivation decides which entries count; the text stays raw and
+    // unclipped, so a value the model saw past the echo clip still counts.
+    const counts = deriveMessages(entry, memory.session).some(
+      (message) =>
         message.kind === "user" ||
         message.kind === "echo" ||
-        message.kind === "work"
-      )
-        text += `\n${message.text}`;
+        message.kind === "work",
+    );
+    if (counts) text += `\n${rawEntryText(entry)}`;
     if (isZoomResult(entry)) zoomed = true;
   }
   const corpus: TurnCorpus = {
@@ -881,6 +887,49 @@ function turnCorpus(
   };
   memory.corpus = corpus;
   return corpus;
+}
+
+/**
+ * The turn's cache key, keyed on the last entry that is not the gate's own
+ * audit entry, so a checked call does not invalidate the corpus it just used.
+ */
+function corpusKey(branch: SessionEntry[], frozen: FrozenTurn): string {
+  let count = 0;
+  let last = "";
+  for (const entry of branch) {
+    if (isGateEntry(entry)) continue;
+    count += 1;
+    last = entry.id;
+  }
+  return `${frozen.timestamp}|${frozen.anchor ?? ""}|${count}|${last}`;
+}
+
+function isGateEntry(entry: SessionEntry): boolean {
+  return entry.type === "custom" && entry.customType === GATE_ENTRY_TYPE;
+}
+
+/** The raw, unclipped text of an entry whose derivation counts in the corpus. */
+function rawEntryText(entry: SessionEntry): string {
+  if (entry.type === "custom_message") return contentBlocksText(entry.content);
+  if (entry.type !== "message") return "";
+  const message = entry.message as { role?: string; content?: unknown };
+  if (message.role === "bashExecution") {
+    const [converted] = convertToLlm([entry.message]);
+    return converted ? contentBlocksText(converted.content) : "";
+  }
+  return contentBlocksText(message.content);
+}
+
+function contentBlocksText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const parts: string[] = [];
+  for (const block of content) {
+    const record = block as { type?: unknown; text?: unknown };
+    if (record.type === "text" && typeof record.text === "string")
+      parts.push(record.text);
+  }
+  return parts.join("\n");
 }
 
 /** The final system prompt of this turn, or empty when Pi cannot render it. */
@@ -909,7 +958,9 @@ function frozenLineFor(
   const matches =
     kind === "path"
       ? (text: string) => pathInText(value, cwd, text)
-      : (text: string) => text.includes(value);
+      : kind === "uuid"
+        ? (text: string) => text.toLowerCase().includes(value)
+        : (text: string) => text.includes(value);
   for (let block = frozen.blocks.length - 1; block >= 0; block -= 1) {
     const rows = frozen.blocks[block].split("\n");
     for (let row = rows.length - 1; row >= 0; row -= 1) {

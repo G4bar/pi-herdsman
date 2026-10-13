@@ -155,6 +155,8 @@ class TestSession {
   signal: AbortSignal | undefined;
   /** The final system prompt the gate may count as seen. */
   systemPrompt = "";
+  /** How often the gate read the prompt, so a corpus cache hit is visible. */
+  systemPromptCalls = 0;
 
   constructor(options: {
     cwd: string;
@@ -195,8 +197,10 @@ class TestSession {
     } as unknown as typeof context.sessionManager;
     const extended = context as unknown as ExtensionContext;
     (extended as { signal?: AbortSignal }).signal = this.signal;
-    (extended as { getSystemPrompt?: () => string }).getSystemPrompt = () =>
-      this.systemPrompt;
+    (extended as { getSystemPrompt?: () => string }).getSystemPrompt = () => {
+      this.systemPromptCalls += 1;
+      return this.systemPrompt;
+    };
     return extended;
   }
 }
@@ -1635,6 +1639,8 @@ test("zoom caps the number and size of images it returns", async () => {
 // --- the zoom gate ----------------------------------------------------------
 
 const GATE_UUID = "11111111-1111-4111-8111-111111111111";
+/** A UUID with hex letters, so its case is observable. */
+const LETTER_UUID = "abcdefab-1234-4abc-8def-abcdefabcdef";
 const OTHER_UUID = "22222222-2222-4222-8222-222222222222";
 
 function chained(texts: string[]): SessionEntry[] {
@@ -1663,6 +1669,41 @@ function gateToolResult(
       content: [{ type: "text", text }],
       isError: false,
       timestamp: Date.now(),
+    },
+  } as unknown as SessionEntry;
+}
+
+/** An assistant message whose only block is a bash tool call. */
+function assistantBashCall(
+  command: string,
+  parentId: string | null,
+): SessionEntry {
+  return {
+    ...entryBase(parentId),
+    type: "message",
+    message: {
+      role: "assistant",
+      content: [{ type: "toolCall", name: "bash", arguments: { command } }],
+    },
+  } as unknown as SessionEntry;
+}
+
+/** The user's own `!cmd`: Pi records it as a `bashExecution` message. */
+function bashExecutionEntry(
+  command: string,
+  parentId: string | null,
+): SessionEntry {
+  return {
+    ...entryBase(parentId),
+    type: "message",
+    message: {
+      role: "bashExecution",
+      command,
+      output: "",
+      exitCode: 0,
+      cancelled: false,
+      truncated: false,
+      timestamp: 0,
     },
   } as unknown as SessionEntry;
 }
@@ -1965,4 +2006,84 @@ test("the third block of one identifier adds the ask-the-user line", async () =>
   assert.doesNotMatch(second.reason, /ask the user/);
   assert.match(third.reason, /ask the user for it/);
   await harness.shutdown(session, "quit");
+});
+
+test("a value past the echo clip is still in the corpus", async () => {
+  const { session, harness } = await gateSession(["opening"]);
+  // `clipEcho` keeps the 30 KB head and tail; this value sits in the middle.
+  const body = `${"x".repeat(20_000)}${GATE_UUID}${"y".repeat(20_000)}`;
+  pushEntry(session, gateToolResult(body, "read", lastId(session)));
+  const result = await harness.toolCall(session, "continue_agent", {
+    session: GATE_UUID,
+    task: "continue",
+  });
+  assert.equal(result, undefined);
+  await harness.shutdown(session, "quit");
+});
+
+test("the view lookup for a UUID ignores case", async () => {
+  const upper = LETTER_UUID.toUpperCase();
+  const { session, harness } = await gateSession([`session ${upper}`]);
+  const result = await harness.toolCall(session, "continue_agent", {
+    session: LETTER_UUID,
+    task: "continue",
+  });
+  assert.equal(result.block, true);
+  assert.ok(result.reason.includes(`zoom ${viewLabel(harness, upper)}`));
+  assert.doesNotMatch(result.reason, /not in the view/);
+  await harness.shutdown(session, "quit");
+});
+
+test("the corpus cache survives the gate's own audit entries", async () => {
+  const { session, harness } = await gateSession(["opening"]);
+  await harness.toolCall(session, "continue_agent", {
+    session: GATE_UUID,
+    task: "go",
+  });
+  const first = session.systemPromptCalls;
+  assert.equal(first, 1);
+  // Pi appends the gate entry to the session; the next call must reuse the corpus.
+  pushEntry(session, {
+    ...entryBase(lastId(session)),
+    type: "custom",
+    customType: "pi-herdsman-memory-gate",
+    data: {},
+  } as unknown as SessionEntry);
+  await harness.toolCall(session, "continue_agent", {
+    session: GATE_UUID,
+    task: "go",
+  });
+  assert.equal(session.systemPromptCalls, first);
+  await harness.shutdown(session, "quit");
+});
+
+test("an assistant bash call is not corpus text but the user's own command is", async () => {
+  // The assistant's tool arguments never count.
+  const assistant = await gateSession(["opening"]);
+  pushEntry(
+    assistant.session,
+    assistantBashCall(`echo ${GATE_UUID}`, lastId(assistant.session)),
+  );
+  const refused = await assistant.harness.toolCall(
+    assistant.session,
+    "continue_agent",
+    { session: GATE_UUID, task: "continue" },
+  );
+  assert.equal(refused.block, true);
+  await assistant.harness.shutdown(assistant.session, "quit");
+
+  // The user's `!cmd` is their own words.
+  const user = await gateSession(["opening"]);
+  pushEntry(
+    user.session,
+    bashExecutionEntry(`echo ${GATE_UUID}`, lastId(user.session)),
+  );
+  assert.equal(
+    await user.harness.toolCall(user.session, "continue_agent", {
+      session: GATE_UUID,
+      task: "continue",
+    }),
+    undefined,
+  );
+  await user.harness.shutdown(user.session, "quit");
 });
