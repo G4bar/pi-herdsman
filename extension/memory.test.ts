@@ -245,7 +245,7 @@ test("agent results and attention messages stay work", () => {
 });
 
 test("coordination messages addressed to the session stay work", () => {
-  for (const kind of COORDINATION_MESSAGE_KINDS) {
+  for (const kind of [...COORDINATION_MESSAGE_KINDS, "project_message"]) {
     const customType = `pi-herdsman-${kind}`;
     assert.equal(HERDSMAN_WORK_TYPES.has(customType), true, customType);
     const entry = customMessageEntry("do X next", {}, customType);

@@ -104,7 +104,8 @@ const IMAGE_BODY_BYTES = Buffer.byteLength(IMAGE_BODY, "utf8");
  * Herdsman's own custom messages behind these types are a real agent result, an
  * attention message about one, or a coordination message addressed to this
  * session (`pi-herdsman-<kind>` for each `COORDINATION_MESSAGE_KINDS` entry in
- * supervision.ts). Every other `pi-herdsman-*` custom message is runtime state
+ * supervision.ts, plus the cross-Lead `project_message` handoff from
+ * lead-runtime.ts). Every other `pi-herdsman-*` custom message is runtime state
  * or a role message, which is not project memory.
  */
 export const HERDSMAN_WORK_TYPES: ReadonlySet<string> = new Set([
@@ -118,6 +119,7 @@ export const HERDSMAN_WORK_TYPES: ReadonlySet<string> = new Set([
   "pi-herdsman-manager_message",
   "pi-herdsman-project_assignment",
   "pi-herdsman-peer_message",
+  "pi-herdsman-project_message",
 ]);
 const HERDSMAN_CUSTOM_PREFIX = "pi-herdsman-";
 
