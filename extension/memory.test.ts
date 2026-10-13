@@ -19,6 +19,7 @@ import {
   COMPACTION_BYTES,
   COMPACTION_TARGET_BYTES,
   ECHO_CHARS,
+  HERDSMAN_WORK_TYPES,
   LEAF_BYTES,
   MemoryStore,
   PAGE_CHARS,
@@ -42,6 +43,7 @@ import {
   type MemoryKind,
   type ViewLine,
 } from "./memory.ts";
+import { COORDINATION_MESSAGE_KINDS } from "./supervision.ts";
 
 const SESSION = "/sessions/1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d.jsonl";
 const DAY_ONE = "2026-01-02T03:04:05.000Z";
@@ -211,9 +213,8 @@ test("Herdsman's own runtime messages are not memory messages", () => {
     "pi-herdsman-supervisor-state",
     "pi-herdsman-stop-summary",
     "pi-herdsman-delegation-guidance",
-    "pi-herdsman-project_message",
-    "pi-herdsman-supervisor_message",
-    "pi-herdsman-peer_message",
+    "pi-herdsman-lead-state",
+    "pi-herdsman-role",
   ];
   for (const customType of runtimeTypes) {
     const entry = customMessageEntry("runtime noise", {}, customType);
@@ -238,6 +239,19 @@ test("agent results and attention messages stay work", () => {
     assert.deepEqual(
       deriveMessages(entry, SESSION).map(({ kind, text }) => ({ kind, text })),
       [{ kind: "work", text: "[scout] done" }],
+      customType,
+    );
+  }
+});
+
+test("coordination messages addressed to the session stay work", () => {
+  for (const kind of COORDINATION_MESSAGE_KINDS) {
+    const customType = `pi-herdsman-${kind}`;
+    assert.equal(HERDSMAN_WORK_TYPES.has(customType), true, customType);
+    const entry = customMessageEntry("do X next", {}, customType);
+    assert.deepEqual(
+      deriveMessages(entry, SESSION).map(({ kind }) => kind),
+      ["work"],
       customType,
     );
   }

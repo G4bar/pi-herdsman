@@ -101,16 +101,23 @@ const UNBUILT_BYTES = Buffer.byteLength(UNBUILT_LINE, "utf8");
 const IMAGE_BODY = "(image)";
 const IMAGE_BODY_BYTES = Buffer.byteLength(IMAGE_BODY, "utf8");
 /**
- * Herdsman's own custom messages behind these types are a real agent result or
- * an attention message about one. Every other `pi-herdsman-*` custom message is
- * runtime state or a role message, which is not project memory.
+ * Herdsman's own custom messages behind these types are a real agent result, an
+ * attention message about one, or a coordination message addressed to this
+ * session (`pi-herdsman-<kind>` for each `COORDINATION_MESSAGE_KINDS` entry in
+ * supervision.ts). Every other `pi-herdsman-*` custom message is runtime state
+ * or a role message, which is not project memory.
  */
-const HERDSMAN_WORK_TYPES: ReadonlySet<string> = new Set([
+export const HERDSMAN_WORK_TYPES: ReadonlySet<string> = new Set([
   "pi-herdsman-agent-result",
   "pi-herdsman-agent-ask",
   "pi-herdsman-agent-stale",
   "pi-herdsman-agent-lost",
   "pi-herdsman-agent-attention",
+  "pi-herdsman-chief_message",
+  "pi-herdsman-lead_message",
+  "pi-herdsman-manager_message",
+  "pi-herdsman-project_assignment",
+  "pi-herdsman-peer_message",
 ]);
 const HERDSMAN_CUSTOM_PREFIX = "pi-herdsman-";
 
