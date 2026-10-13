@@ -26,6 +26,7 @@ import {
   lineLabel,
   markViewCache,
   projectMemoryRoot,
+  viewParts,
   type MemoryMessage,
 } from "./memory.ts";
 import type {
@@ -790,8 +791,8 @@ test("the view replaces history and the tail follows the anchor", async () => {
   assert.deepEqual(injected.messages.slice(1), [messages[1]]);
   const view = injected.messages[0];
   assert.equal(view.role, "user");
-  assert.equal(view.content[0].text, "<chat>");
-  assert.equal(view.content[view.content.length - 1].text, "</chat>");
+  assert.equal(view.content[0].text, "<chat>\n");
+  assert.equal(view.content[view.content.length - 1].text, "</chat>\n");
   assert.ok(
     view.content
       .slice(1, -1)
@@ -2125,11 +2126,7 @@ function markedPayload(blocks: string[], extraMarks = 0): any {
     messages: [
       {
         role: "user",
-        content: [
-          { type: "text", text: "<chat>" },
-          ...blocks.map((text) => ({ type: "text", text })),
-          { type: "text", text: "</chat>" },
-        ],
+        content: viewParts(blocks),
       },
       {
         role: "user",

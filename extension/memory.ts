@@ -437,6 +437,21 @@ export function renderBlocks(
   return blocks;
 }
 
+/**
+ * The view as content parts, one per block. Every part ends in a newline,
+ * wrappers included, so a provider that concatenates text parts without a
+ * separator still keeps every line boundary.
+ */
+export function viewParts(
+  blocks: readonly string[],
+): { type: "text"; text: string }[] {
+  return [
+    { type: "text", text: `${VIEW_OPEN}\n` },
+    ...blocks.map((text) => ({ type: "text" as const, text: `${text}\n` })),
+    { type: "text", text: `${VIEW_CLOSE}\n` },
+  ];
+}
+
 /** Anthropic accepts at most this many cache breakpoints per request. */
 const CACHE_MARK_LIMIT = 4;
 
@@ -454,7 +469,9 @@ function isViewMessage(message: unknown): boolean {
   const content = message.content;
   if (!Array.isArray(content) || content.length === 0) return false;
   const first = content[0];
-  return isRecord(first) && first.type === "text" && first.text === VIEW_OPEN;
+  if (!isRecord(first) || first.type !== "text") return false;
+  const text = first.text;
+  return typeof text === "string" && text.replace(/\n$/, "") === VIEW_OPEN;
 }
 
 /** A whole 4-line block with every line built: a stable cache breakpoint. */
@@ -462,9 +479,10 @@ function isBuiltViewBlock(block: unknown): boolean {
   if (!isRecord(block) || block.type !== "text") return false;
   const text = block.text;
   if (typeof text !== "string") return false;
-  if (text === VIEW_OPEN || text === VIEW_CLOSE) return false;
-  if (text.includes(UNBUILT_LINE)) return false;
-  return text.split("\n").length === VIEW_BLOCK_LINES;
+  const body = text.replace(/\n$/, "");
+  if (body === VIEW_OPEN || body === VIEW_CLOSE) return false;
+  if (body.includes(UNBUILT_LINE)) return false;
+  return body.split("\n").length === VIEW_BLOCK_LINES;
 }
 
 /** Every block Pi could have marked in the payload. */
@@ -516,7 +534,10 @@ export function markViewCache(payload: unknown): ProviderPayload | undefined {
   const target = view.content[at] as PayloadBlock;
   if (target.cache_control !== undefined) return undefined;
   const content = [...view.content];
-  content[at] = { ...target, cache_control: mark };
+  content[at] = {
+    ...target,
+    cache_control: isRecord(mark) ? { ...mark } : mark,
+  };
   const next = [...messages];
   next[viewIndex] = { ...view, content };
   return { ...payload, messages: next };

@@ -1907,7 +1907,7 @@ export async function runScenario(ctx, scenario) {
     case "manager-recovery":
       return runManagerRecoverySmoke(ctx);
     case "memory":
-      return runMemoryScenario({});
+      return runMemoryScenario({ model: ctx.model });
     default:
       throw new Error(`unknown smoke scenario: ${scenario}`);
   }
@@ -4095,12 +4095,14 @@ function cleanupEvidence(owned) {
 // docs/development/smoke-testing.md.
 
 // The mark is Anthropic-specific, so the measurement needs an Anthropic
-// Messages model. The cheapest one reachable with the configured credentials is
-// Haiku through opencode-go; override with `--model` to use another.
-const MEMORY_DEFAULT_MODEL = "opencode-go/claude-haiku-5-5";
+// Messages model. The direct Anthropic provider needs the user's provider
+// extension (pi-black) in the temp agent directory, passed through
+// PI_HERDSMAN_SMOKE_EXTENSIONS; override the model with `--model`.
+const MEMORY_DEFAULT_MODEL = "anthropic/claude-haiku-4-5";
 const MEMORY_COMPACTOR_MODEL = "opencode-go/deepseek-v4.1-flash";
 const MEMORY_TURN_TIMEOUT_MS = 240_000;
 const MEMORY_SHUTDOWN_TIMEOUT_MS = 60_000;
+const MEMORY_KILL_GRACE_MS = 10_000;
 const MEMORY_TURNS = [
   "Reply with at least 900 characters of plain prose describing the number seven, and use no tools.",
   "Reply with at least 900 characters of plain prose describing the number nine, and use no tools.",
@@ -4129,6 +4131,16 @@ function memoryLeadEnv(agentDir, disableMark) {
   return env;
 }
 
+/** Extra extension paths the smoke loads, e.g. pi-black for Anthropic. */
+function memorySmokeExtensions() {
+  const raw = process.env.PI_HERDSMAN_SMOKE_EXTENSIONS;
+  if (!raw) return [];
+  return raw
+    .split(",")
+    .map((value) => value.trim())
+    .filter((value) => value !== "");
+}
+
 /**
  * Drives one Pi RPC session through the fixed prompts and returns its stderr.
  * One JSON record per line, split on LF only; U+2028 can appear inside JSON.
@@ -4138,6 +4150,7 @@ async function memoryRpcRun({
   agentDir,
   sessionDir,
   extension,
+  extensions,
   model,
   prompts,
   disableMark,
@@ -4155,6 +4168,7 @@ async function memoryRpcRun({
       "--no-extensions",
       "--extension",
       extension,
+      ...extensions.flatMap((path) => ["--extension", path]),
       "--no-skills",
       "--no-prompt-templates",
       "--no-context-files",
@@ -4239,12 +4253,17 @@ async function memoryRpcRun({
   } finally {
     child.stdin.end();
     await new Promise((resolve) => {
-      const timer = setTimeout(() => {
+      let killTimer;
+      const termTimer = setTimeout(() => {
         child.kill("SIGTERM");
-        resolve();
+        killTimer = setTimeout(() => {
+          child.kill("SIGKILL");
+          resolve();
+        }, MEMORY_KILL_GRACE_MS);
       }, MEMORY_SHUTDOWN_TIMEOUT_MS);
       child.once("exit", () => {
-        clearTimeout(timer);
+        clearTimeout(termTimer);
+        clearTimeout(killTimer);
         resolve();
       });
     });
@@ -4373,12 +4392,15 @@ async function memoryRunReport(run) {
 
 async function runMemoryScenario(args) {
   const model = args.model ?? MEMORY_DEFAULT_MODEL;
+  const extensions = memorySmokeExtensions();
   const root = await mkdtemp(join(tmpdir(), "pi-herdsman-memory-smoke-"));
   const extension = join(repoRoot, "extension", "index.ts");
   const realAgentDir = join(homedir(), ".pi", "agent");
+  // The arms run in a random order, so a warmed shared prefix cannot favor one.
+  const arms = Math.random() < 0.5 ? [false, true] : [true, false];
   const runs = [];
   try {
-    for (const disableMark of [false, true]) {
+    for (const disableMark of arms) {
       const suffix = disableMark ? "b" : "a";
       const project = join(root, `project-${suffix}`);
       const agentDir = join(root, `agent-${suffix}`);
@@ -4405,6 +4427,7 @@ async function runMemoryScenario(args) {
         agentDir,
         sessionDir,
         extension,
+        extensions,
         model,
         prompts: MEMORY_TURNS,
         disableMark,
@@ -4432,22 +4455,33 @@ async function runMemoryScenario(args) {
       });
     }
 
-    const withMark = await memoryRunReport(runs[0]);
-    const withoutMark = await memoryRunReport(runs[1]);
+    const withMarkRun = runs.find((run) => !run.disableMark);
+    const withoutMarkRun = runs.find((run) => run.disableMark);
+    const withMark = await memoryRunReport(withMarkRun);
+    const withoutMark = await memoryRunReport(withoutMarkRun);
+    const armOrder = arms.map((disableMark) =>
+      disableMark ? "withoutMark" : "withMark",
+    );
     const report = {
       scenario: "memory",
       model,
       compactorModel: MEMORY_COMPACTOR_MODEL,
+      extensions,
+      armOrder,
       prompts: MEMORY_TURNS.length,
       turnRatio: withMark.turnRatio.ratio,
       turnRatioWithoutMark: withoutMark.turnRatio.ratio,
       compactionRatio: withMark.compactionRatio.ratio,
       passed: withMark.turnRatio.ratio >= 0.95,
+      notes: [
+        "The compaction ratio is not attributable to the view mark: both arms run the DeepSeek compactor with the same block-split requests, so its delta is uncontrolled cross-run noise (separate projects and stores, a small sample, and proxy cache accounting). Per-arm compaction call counts are in withMark.compactions and withoutMark.compactions.",
+        `Arm order was randomized: ${armOrder.join(" then ")}.`,
+      ],
       withMark,
       withoutMark,
       stderr: {
-        withMark: runs[0].stderr.slice(-4000),
-        withoutMark: runs[1].stderr.slice(-4000),
+        withMark: withMarkRun.stderr.slice(-4000),
+        withoutMark: withoutMarkRun.stderr.slice(-4000),
       },
     };
     const reportPath = join(tmpdir(), "pi-herdsman-memory-smoke-report.json");

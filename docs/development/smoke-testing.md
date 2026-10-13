@@ -103,7 +103,21 @@ needed. It creates a throwaway project, lists it in `memoryProjects`, and gives
 it a cheap `compactor`. It drives a fixed script of prompts with an Anthropic
 Haiku model at thinking level `low`, once with the view cache mark and once with
 `PI_HERDSMAN_MEMORY_DISABLE_VIEW_MARK=1`, then reads the session file and the
-`pi-herdsman-memory-usage` entries. It prints a JSON report (also written to
+`pi-herdsman-memory-usage` entries. The two arms run in a random order, and the
+report records that order.
+
+`PI_HERDSMAN_SMOKE_EXTENSIONS` is a comma-separated list of extra `--extension`
+paths for the scenario. The direct Anthropic provider needs the user's provider
+extension there (pi-black), because the isolated `--no-extensions` run does not
+discover it; the extension's own identity file (`~/.claude.json`) is read from
+the real home directory and never written. For example:
+
+```sh
+PI_HERDSMAN_SMOKE_EXTENSIONS="$HOME/.pi/agent/git/github.com/paoloanzn/pi-black/extensions/pi-black.ts" \
+  npm run smoke -- memory --model anthropic/claude-haiku-4-5
+```
+
+The scenario prints a JSON report (also written to
 `<tmp>/pi-herdsman-memory-smoke-report.json`) with the turn and compaction
 cache-read ratios, the turn count, the batch merges, and the store and session
 bytes per message, and fails when the marked turn ratio is below 95%.

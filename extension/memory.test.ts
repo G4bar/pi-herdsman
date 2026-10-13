@@ -38,6 +38,7 @@ import {
   renderBlocks,
   renderLine,
   renderView,
+  viewParts,
   type IdentifierKind,
   type MemoryIdentifier,
   type MemoryKind,
@@ -730,6 +731,23 @@ test("the view renders lines, blocks and lookups", () => {
     blocks.map((block) => block.split("\n").length),
     [4, 1],
   );
+});
+
+test("view parts keep every line when concatenated without a separator", () => {
+  const blocks = ["0|alpha\n1|beta\n2|gamma\n3|delta", "4|epsilon"];
+  const text = viewParts(blocks)
+    .map((part) => part.text)
+    .join("");
+  assert.deepEqual(text.split("\n"), [
+    "<chat>",
+    "0|alpha",
+    "1|beta",
+    "2|gamma",
+    "3|delta",
+    "4|epsilon",
+    "</chat>",
+    "",
+  ]);
 });
 
 test("the latest view line holds the newest mention", () => {

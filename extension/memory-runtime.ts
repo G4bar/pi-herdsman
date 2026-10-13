@@ -38,6 +38,7 @@ import {
   nodeStart,
   projectMemoryRoot,
   renderLine,
+  viewParts,
   type DerivedMessage,
   type MemorySource,
   type ViewLine,
@@ -556,6 +557,7 @@ export function registerMemoryRuntime(
     const frozen = owning()?.frozen;
     if (!frozen || frozen.fallback) return;
     if (ctx.model?.api !== "anthropic-messages") return;
+    // test-only: smoke A/B disables the mark to measure its effect.
     if (process.env.PI_HERDSMAN_MEMORY_DISABLE_VIEW_MARK === "1") return;
     try {
       return markViewCache(event.payload);
@@ -710,12 +712,11 @@ function tailCount(
 
 /** The view as one synthetic user message: the wrappers and the blocks. */
 function viewMessage(frozen: FrozenTurn): ContextMessage {
-  const content: TextContent[] = [
-    { type: "text", text: VIEW_OPEN },
-    ...frozen.blocks.map((text) => ({ type: "text" as const, text })),
-    { type: "text", text: VIEW_CLOSE },
-  ];
-  return { role: "user", content, timestamp: frozen.timestamp };
+  return {
+    role: "user",
+    content: viewParts(frozen.blocks),
+    timestamp: frozen.timestamp,
+  };
 }
 
 function closeQuietly(store: MemoryStore): void {
@@ -931,7 +932,7 @@ function corpusKey(branch: SessionEntry[], frozen: FrozenTurn): string {
   let count = 0;
   let last = "";
   for (const entry of branch) {
-    if (isGateEntry(entry)) continue;
+    if (isGateEntry(entry) || isUsageEntry(entry)) continue;
     count += 1;
     last = entry.id;
   }
@@ -940,6 +941,10 @@ function corpusKey(branch: SessionEntry[], frozen: FrozenTurn): string {
 
 function isGateEntry(entry: SessionEntry): boolean {
   return entry.type === "custom" && entry.customType === GATE_ENTRY_TYPE;
+}
+
+function isUsageEntry(entry: SessionEntry): boolean {
+  return entry.type === "custom" && entry.customType === USAGE_ENTRY_TYPE;
 }
 
 /** The raw, unclipped text of an entry whose derivation counts in the corpus. */

@@ -21,13 +21,12 @@ import { resolveCompactorDefinition } from "./agent-definitions.ts";
 import {
   LEAF_BYTES,
   MemoryStore,
-  VIEW_CLOSE,
-  VIEW_OPEN,
   extractIdentifiers,
   lineLabel,
   markViewCache,
   nodeLength,
   nodeStart,
+  viewParts,
   type MemoryIdentifier,
   type MemoryJob,
   type NodeInputs,
@@ -432,8 +431,9 @@ class CompactorRunner implements MemoryCompactor {
             ? { reasoning: this.reasoning }
             : {}),
           // The same view mark the Lead's requests get, so the compaction view
-          // prefix survives across calls on Anthropic.
-          ...(this.model.api === "anthropic-messages"
+          // prefix survives across calls on Anthropic. The smoke A/B disables it.
+          ...(this.model.api === "anthropic-messages" &&
+          process.env.PI_HERDSMAN_MEMORY_DISABLE_VIEW_MARK !== "1"
             ? { onPayload: (payload: unknown) => markViewCache(payload) }
             : {}),
         },
@@ -576,15 +576,7 @@ function userMessage(text: string): Message {
 
 /** The compaction view as one user message of 4-line blocks, like the Lead's. */
 function viewMessage(blocks: string[]): Message {
-  return {
-    role: "user",
-    content: [
-      { type: "text", text: VIEW_OPEN },
-      ...blocks.map((text) => ({ type: "text" as const, text })),
-      { type: "text", text: VIEW_CLOSE },
-    ],
-    timestamp: Date.now(),
-  };
+  return { role: "user", content: viewParts(blocks), timestamp: Date.now() };
 }
 
 function messageText(message: AssistantMessage): string {
