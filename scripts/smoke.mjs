@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFile, spawnSync } from "node:child_process";
+import { execFile, spawn, spawnSync } from "node:child_process";
 import {
   access,
   lstat,
@@ -9,12 +9,13 @@ import {
   readdir,
   realpath,
   rm,
+  stat,
   symlink,
   unlink,
   writeFile,
 } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs, promisify } from "node:util";
@@ -27,6 +28,7 @@ const scenarioNames = [
   "continuation",
   "chief-tree",
   "manager-recovery",
+  "memory",
 ];
 const SMOKE_MODEL_KEY = "pi-herdsman.smoke-model";
 const MAX_SOCKET_PATH_BYTES = 100;
@@ -1886,6 +1888,8 @@ export function initialPromptForScenario(scenario, ctx) {
       return "Reply exactly with PI_HERDSMAN_CHIEF_TREE_STARTUP.";
     case "manager-recovery":
       return undefined;
+    case "memory":
+      return undefined;
     default:
       throw new Error(`unknown smoke scenario: ${scenario}`);
   }
@@ -1902,6 +1906,8 @@ export async function runScenario(ctx, scenario) {
       return runChiefTreeSmoke(ctx);
     case "manager-recovery":
       return runManagerRecoverySmoke(ctx);
+    case "memory":
+      return runMemoryScenario({});
     default:
       throw new Error(`unknown smoke scenario: ${scenario}`);
   }
@@ -2517,7 +2523,6 @@ async function runContinuationSmoke(ctx) {
 }
 
 async function runManagerRecoverySmoke(ctx) {
-  const deadline = Date.now() + 6 * 60_000;
   const branch = `herdsman/smoke-manager-recovery-${randomUUID()}`;
   const contextMarker = `MANAGER_RECOVERY_CONTEXT_${randomUUID()}`;
   ctx.managerRecovery = {
@@ -3457,7 +3462,7 @@ async function runChiefTreeSmoke(ctx) {
   };
 
   // Establish the exact pre-Chief assistant branch before changing roles.
-  const startup = await waitForEvidence(
+  await waitForEvidence(
     ctx,
     "chief-tree-startup",
     async () => {
@@ -4083,8 +4088,387 @@ function cleanupEvidence(owned) {
   return `session=${owned.sessionName ?? "not-created"} host-tab=${owned.hostTabId ?? "not-created"} host-pane=${owned.hostPaneId ?? "not-created"}`;
 }
 
+// --- memory scenario ---------------------------------------------------------
+//
+// The smoke runner cannot drive a multi-turn ordinary Lead session, so this
+// scenario drives Pi in RPC mode with the Lead environment instead. See
+// docs/development/smoke-testing.md.
+
+// The mark is Anthropic-specific, so the measurement needs an Anthropic
+// Messages model. The cheapest one reachable with the configured credentials is
+// Haiku through opencode-go; override with `--model` to use another.
+const MEMORY_DEFAULT_MODEL = "opencode-go/claude-haiku-5-5";
+const MEMORY_COMPACTOR_MODEL = "opencode-go/deepseek-v4.1-flash";
+const MEMORY_TURN_TIMEOUT_MS = 240_000;
+const MEMORY_SHUTDOWN_TIMEOUT_MS = 60_000;
+const MEMORY_TURNS = [
+  "Reply with at least 900 characters of plain prose describing the number seven, and use no tools.",
+  "Reply with at least 900 characters of plain prose describing the number nine, and use no tools.",
+  "Reply with at least 900 characters of plain prose describing the number twelve, and use no tools.",
+  "Reply with at least 900 characters of plain prose describing the number fifteen, and use no tools.",
+  "Reply with at least 900 characters of plain prose describing the number twenty-one, and use no tools.",
+  "Reply with at least 900 characters of plain prose describing the number eighteen, and use no tools.",
+  "Reply with at least 900 characters of plain prose describing the number twenty-four, and use no tools.",
+  "Reply with at least 900 characters of plain prose describing the number thirty, and use no tools.",
+];
+
+/** The store directory key, matching `projectMemoryKey` in extension/memory.ts. */
+function memoryStoreKey(project) {
+  return createHash("sha256").update(project, "utf8").digest("hex").slice(0, 16);
+}
+
+async function copyFile(from, to) {
+  await writeFile(to, await readFile(from));
+}
+
+/** The environment an ordinary Lead runs with: no managed-agent mailbox. */
+function memoryLeadEnv(agentDir, disableMark) {
+  const env = { ...process.env, PI_CODING_AGENT_DIR: agentDir, HERDR_ENV: "1" };
+  delete env.PI_HERDSMAN_MAILBOX;
+  if (disableMark) env.PI_HERDSMAN_MEMORY_DISABLE_VIEW_MARK = "1";
+  return env;
+}
+
+/**
+ * Drives one Pi RPC session through the fixed prompts and returns its stderr.
+ * One JSON record per line, split on LF only; U+2028 can appear inside JSON.
+ */
+async function memoryRpcRun({
+  project,
+  agentDir,
+  sessionDir,
+  extension,
+  model,
+  prompts,
+  disableMark,
+}) {
+  const child = spawn(
+    "pi",
+    [
+      "--mode",
+      "rpc",
+      "--model",
+      model,
+      "--thinking",
+      "low",
+      "--approve",
+      "--no-extensions",
+      "--extension",
+      extension,
+      "--no-skills",
+      "--no-prompt-templates",
+      "--no-context-files",
+      "--no-mcp",
+      "--session-dir",
+      sessionDir,
+    ],
+    {
+      cwd: project,
+      env: memoryLeadEnv(agentDir, disableMark),
+      stdio: ["pipe", "pipe", "pipe"],
+    },
+  );
+  let stdoutBuffer = "";
+  let stderr = "";
+  let nextId = 0;
+  const pending = new Map();
+  const settleWaiters = [];
+  const onRecord = (record) => {
+    if (record.type === "response" && typeof record.id === "string") {
+      const resolve = pending.get(record.id);
+      if (resolve) {
+        pending.delete(record.id);
+        resolve(record);
+      }
+    } else if (record.type === "agent_settled") {
+      const resolve = settleWaiters.shift();
+      if (resolve) resolve(record);
+    }
+  };
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    stdoutBuffer += chunk;
+    let at;
+    while ((at = stdoutBuffer.indexOf("\n")) !== -1) {
+      const line = stdoutBuffer.slice(0, at).replace(/\r$/, "");
+      stdoutBuffer = stdoutBuffer.slice(at + 1);
+      if (line === "") continue;
+      try {
+        onRecord(JSON.parse(line));
+      } catch {
+        // A torn or non-protocol line is not a record.
+      }
+    }
+  });
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  const send = (command) =>
+    new Promise((resolve, reject) => {
+      const id = `memory-${nextId++}`;
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        reject(new Error(`rpc ${command.type} timed out`));
+      }, MEMORY_TURN_TIMEOUT_MS);
+      pending.set(id, (record) => {
+        clearTimeout(timer);
+        resolve(record);
+      });
+      child.stdin.write(`${JSON.stringify({ ...command, id })}\n`);
+    });
+  const waitSettled = () =>
+    new Promise((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error("agent_settled timed out")),
+        MEMORY_TURN_TIMEOUT_MS,
+      );
+      settleWaiters.push((record) => {
+        clearTimeout(timer);
+        resolve(record);
+      });
+    });
+  try {
+    for (const message of prompts) {
+      const settled = waitSettled();
+      const response = await send({ type: "prompt", message });
+      if (!response.success)
+        throw new Error(`prompt rejected: ${response.error ?? "unknown"}`);
+      await settled;
+    }
+  } finally {
+    child.stdin.end();
+    await new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        child.kill("SIGTERM");
+        resolve();
+      }, MEMORY_SHUTDOWN_TIMEOUT_MS);
+      child.once("exit", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+  }
+  return { stderr };
+}
+
+/** The newest session JSONL under a session directory. */
+async function newestSessionFile(dir) {
+  const found = [];
+  const walk = async (path) => {
+    for (const entry of await readdir(path, { withFileTypes: true })) {
+      const child = join(path, entry.name);
+      if (entry.isDirectory()) await walk(child);
+      else if (entry.name.endsWith(".jsonl")) found.push(child);
+    }
+  };
+  await walk(dir);
+  const measured = await Promise.all(
+    found.map(async (path) => ({ path, mtime: (await stat(path)).mtimeMs })),
+  );
+  measured.sort((a, b) => b.mtime - a.mtime);
+  return measured[0]?.path;
+}
+
+function ratioOf(usage) {
+  const input = usage.input ?? 0;
+  const cacheRead = usage.cacheRead ?? 0;
+  const cacheWrite = usage.cacheWrite ?? 0;
+  const total = input + cacheRead + cacheWrite;
+  return { input, cacheRead, cacheWrite, total, ratio: total ? cacheRead / total : 0 };
+}
+
+/** Sums one usage list into the cache-read ratio the phase defines. */
+function summedRatio(usages) {
+  let cacheRead = 0;
+  let total = 0;
+  for (const usage of usages) {
+    const value = ratioOf(usage);
+    cacheRead += value.cacheRead;
+    total += value.total;
+  }
+  return { cacheRead, total, ratio: total ? cacheRead / total : 0 };
+}
+
+/** One run's turn, compaction and disk numbers. */
+async function memoryRunReport(run) {
+  const assistant = run.entries.filter(
+    (entry) =>
+      entry.type === "message" &&
+      entry.message?.role === "assistant" &&
+      entry.message.usage,
+  );
+  const usage = run.entries.filter(
+    (entry) =>
+      entry.type === "custom" && entry.customType === "pi-herdsman-memory-usage",
+  );
+  const gate = run.entries.filter(
+    (entry) =>
+      entry.type === "custom" && entry.customType === "pi-herdsman-memory-gate",
+  );
+  // The run's first call writes the cache; every later call is measured.
+  const turns = assistant.slice(1).map((entry) => ratioOf(entry.message.usage));
+  const compactions = usage.map((entry) => ratioOf(entry.data));
+
+  let storeBytes = 0;
+  let memoryMessages = 0;
+  let batchMerges = 0;
+  const walk = async (path, kind) => {
+    let entries;
+    try {
+      entries = await readdir(path, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const child = join(path, entry.name);
+      if (entry.isDirectory()) {
+        await walk(child, entry.name);
+        continue;
+      }
+      const content = await readFile(child, "utf8");
+      storeBytes += Buffer.byteLength(content, "utf8");
+      for (const line of content.split("\n")) {
+        if (line === "") continue;
+        let record;
+        try {
+          record = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (kind === "main") memoryMessages += 1;
+        else if (kind === "tree" && typeof record.l === "number" && record.l > 0)
+          batchMerges += 1;
+      }
+    }
+  };
+  await walk(run.storeRoot, "");
+
+  const sessionBytes = Buffer.byteLength(
+    await readFile(run.sessionFile, "utf8"),
+    "utf8",
+  );
+  const sessionMessages = run.entries.filter(
+    (entry) => entry.type === "message",
+  ).length;
+
+  return {
+    turns: turns.length,
+    turnRatio: summedRatio(assistant.slice(1).map((e) => e.message.usage)),
+    compactionRatio: summedRatio(usage.map((e) => e.data)),
+    perTurn: turns,
+    compactions: compactions.length,
+    gateEntries: gate.length,
+    batchMerges,
+    memoryMessages,
+    sessionMessages,
+    storeBytes,
+    sessionBytes,
+    storeBytesPerMessage: memoryMessages ? storeBytes / memoryMessages : 0,
+    sessionBytesPerMessage: sessionMessages
+      ? sessionBytes / sessionMessages
+      : 0,
+  };
+}
+
+async function runMemoryScenario(args) {
+  const model = args.model ?? MEMORY_DEFAULT_MODEL;
+  const root = await mkdtemp(join(tmpdir(), "pi-herdsman-memory-smoke-"));
+  const extension = join(repoRoot, "extension", "index.ts");
+  const realAgentDir = join(homedir(), ".pi", "agent");
+  const runs = [];
+  try {
+    for (const disableMark of [false, true]) {
+      const suffix = disableMark ? "b" : "a";
+      const project = join(root, `project-${suffix}`);
+      const agentDir = join(root, `agent-${suffix}`);
+      const sessionDir = join(root, `sessions-${suffix}`);
+      await mkdir(join(project, ".pi", "agents"), { recursive: true });
+      await writeFile(
+        join(project, ".pi", "agents", "compactor.md"),
+        `---\nname: compactor\nbodyMode: append\nmodel: ${MEMORY_COMPACTOR_MODEL}\nthinking: medium\n---\n`,
+      );
+      await mkdir(join(agentDir, "pi-herdsman"), { recursive: true });
+      const realProject = await realpath(project);
+      await writeFile(
+        join(agentDir, "pi-herdsman", "config.json"),
+        `${JSON.stringify({ memoryProjects: [realProject] })}\n`,
+      );
+      await copyFile(join(realAgentDir, "auth.json"), join(agentDir, "auth.json"));
+      await copyFile(
+        join(realAgentDir, "models.json"),
+        join(agentDir, "models.json"),
+      );
+      await mkdir(sessionDir, { recursive: true });
+      const run = await memoryRpcRun({
+        project,
+        agentDir,
+        sessionDir,
+        extension,
+        model,
+        prompts: MEMORY_TURNS,
+        disableMark,
+      });
+      const sessionFile = await newestSessionFile(sessionDir);
+      if (!sessionFile)
+        throw new Error(
+          `no session file in ${sessionDir}; stderr: ${run.stderr.slice(-2000)}`,
+        );
+      const entries = (await readFile(sessionFile, "utf8"))
+        .split("\n")
+        .filter((line) => line !== "")
+        .map((line) => JSON.parse(line));
+      runs.push({
+        disableMark,
+        sessionFile,
+        entries,
+        storeRoot: join(
+          agentDir,
+          "pi-herdsman",
+          "memory",
+          memoryStoreKey(realProject),
+        ),
+        stderr: run.stderr,
+      });
+    }
+
+    const withMark = await memoryRunReport(runs[0]);
+    const withoutMark = await memoryRunReport(runs[1]);
+    const report = {
+      scenario: "memory",
+      model,
+      compactorModel: MEMORY_COMPACTOR_MODEL,
+      prompts: MEMORY_TURNS.length,
+      turnRatio: withMark.turnRatio.ratio,
+      turnRatioWithoutMark: withoutMark.turnRatio.ratio,
+      compactionRatio: withMark.compactionRatio.ratio,
+      passed: withMark.turnRatio.ratio >= 0.95,
+      withMark,
+      withoutMark,
+      stderr: {
+        withMark: runs[0].stderr.slice(-4000),
+        withoutMark: runs[1].stderr.slice(-4000),
+      },
+    };
+    const reportPath = join(tmpdir(), "pi-herdsman-memory-smoke-report.json");
+    await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+    return { report, reportPath };
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
 async function main() {
   const args = parseSmokeArgs(process.argv.slice(2));
+  if (args.scenario === "memory") {
+    const { report, reportPath } = await runMemoryScenario(args);
+    console.log(
+      `smoke memory: ${report.passed ? "PASS" : "FAIL"}\n${JSON.stringify(report, null, 2)}`,
+    );
+    console.log(`report: ${reportPath}`);
+    if (!report.passed) process.exitCode = 1;
+    return;
+  }
   const pkg = JSON.parse(
     await readFile(join(repoRoot, "package.json"), "utf8"),
   );

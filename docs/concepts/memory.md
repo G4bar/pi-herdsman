@@ -24,6 +24,10 @@ for one line is split over several messages in a row. A summary that dropped
 exact values ends with the `…[ids]` marker, so the Lead knows to zoom before
 using them.
 
+The view is sent as 4-line blocks, and cross-turn view caching relies on
+provider prefix caching: on Anthropic, Herdsman adds one cache mark at the last
+fully built block of the view.
+
 ## Opt-in
 
 Memory is off unless the project's directory is listed in the user-wide

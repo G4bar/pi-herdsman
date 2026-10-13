@@ -21,8 +21,11 @@ import { resolveCompactorDefinition } from "./agent-definitions.ts";
 import {
   LEAF_BYTES,
   MemoryStore,
+  VIEW_CLOSE,
+  VIEW_OPEN,
   extractIdentifiers,
   lineLabel,
+  markViewCache,
   nodeLength,
   nodeStart,
   type MemoryIdentifier,
@@ -328,7 +331,7 @@ class CompactorRunner implements MemoryCompactor {
       return;
     }
     const request: Message[] = [
-      userMessage(this.store.renderCompaction(line)),
+      viewMessage(this.store.renderCompactionBlocks(line)),
       userMessage(this.task(inputs)),
     ];
     const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
@@ -427,6 +430,11 @@ class CompactorRunner implements MemoryCompactor {
           ...(this.sessionId ? { sessionId: this.sessionId } : {}),
           ...(this.reasoning && this.reasoning !== "off"
             ? { reasoning: this.reasoning }
+            : {}),
+          // The same view mark the Lead's requests get, so the compaction view
+          // prefix survives across calls on Anthropic.
+          ...(this.model.api === "anthropic-messages"
+            ? { onPayload: (payload: unknown) => markViewCache(payload) }
             : {}),
         },
       );
@@ -564,6 +572,19 @@ function frontier(from: number, limit: number): ViewLine[] {
 
 function userMessage(text: string): Message {
   return { role: "user", content: text, timestamp: Date.now() };
+}
+
+/** The compaction view as one user message of 4-line blocks, like the Lead's. */
+function viewMessage(blocks: string[]): Message {
+  return {
+    role: "user",
+    content: [
+      { type: "text", text: VIEW_OPEN },
+      ...blocks.map((text) => ({ type: "text" as const, text })),
+      { type: "text", text: VIEW_CLOSE },
+    ],
+    timestamp: Date.now(),
+  };
 }
 
 function messageText(message: AssistantMessage): string {

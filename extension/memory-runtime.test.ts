@@ -22,7 +22,9 @@ import { updateConfig } from "./config.ts";
 import { ProcessLockOccupiedError } from "./lock.ts";
 import {
   MemoryStore,
+  UNBUILT_LINE,
   lineLabel,
+  markViewCache,
   projectMemoryRoot,
   type MemoryMessage,
 } from "./memory.ts";
@@ -307,6 +309,21 @@ class Harness {
       session.context(),
     );
     return result as { messages: any[] } | undefined;
+  }
+
+  async beforeProviderRequest(
+    session: TestSession,
+    payload: unknown,
+    api = "anthropic-messages",
+  ): Promise<unknown> {
+    const ctx = session.context();
+    (ctx as { model?: unknown }).model = { api };
+    const [result] = await this.emit(
+      "before_provider_request",
+      { type: "before_provider_request", payload },
+      ctx,
+    );
+    return result;
   }
 
   async beforeCompact(session: TestSession, reason: string): Promise<unknown> {
@@ -2086,4 +2103,201 @@ test("an assistant bash call is not corpus text but the user's own command is", 
     undefined,
   );
   await user.harness.shutdown(user.session, "quit");
+});
+
+// --- the view cache mark ----------------------------------------------------
+
+const CACHE_MARK = { type: "ephemeral" };
+
+/** One fully built 4-line view block, as `renderBlocks` would emit it. */
+function builtBlock(index: number): string {
+  return [0, 1, 2, 3]
+    .map((row) => `${index * 4 + row}|summary ${index * 4 + row}`)
+    .join("\n");
+}
+
+/** An Anthropic Messages payload whose first message is the injected view. */
+function markedPayload(blocks: string[], extraMarks = 0): any {
+  const payload: any = {
+    model: "claude-haiku-4-5",
+    system: [{ type: "text", text: "system", cache_control: CACHE_MARK }],
+    tools: [{ name: "zoom", cache_control: CACHE_MARK }],
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "<chat>" },
+          ...blocks.map((text) => ({ type: "text", text })),
+          { type: "text", text: "</chat>" },
+        ],
+      },
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "next", cache_control: CACHE_MARK },
+        ],
+      },
+    ],
+  };
+  for (let index = 0; index < extraMarks; index += 1)
+    payload.tools.push({ name: `tool-${index}`, cache_control: CACHE_MARK });
+  return payload;
+}
+
+function countMarks(payload: unknown): number {
+  return JSON.stringify(payload).split("cache_control").length - 1;
+}
+
+test("the view mark lands on the last fully built block", () => {
+  const payload = markedPayload([builtBlock(0), builtBlock(1)]);
+  const result = markViewCache(payload) as any;
+  assert.ok(result);
+  // content: 0 <chat>, 1 block0, 2 block1, 3 </chat>.
+  assert.deepEqual(result.messages[0].content[2].cache_control, CACHE_MARK);
+  assert.equal(result.messages[0].content[1].cache_control, undefined);
+  assert.equal(countMarks(result), countMarks(payload) + 1);
+
+  // Everything but the added mark is deep-equal to the input.
+  const stripped = JSON.parse(JSON.stringify(result));
+  delete stripped.messages[0].content[2].cache_control;
+  assert.deepEqual(stripped, JSON.parse(JSON.stringify(payload)));
+});
+
+test("a placeholder in the last block moves the mark to the previous block", () => {
+  const last = [
+    "4|summary 4",
+    "5|summary 5",
+    `6|${UNBUILT_LINE}`,
+    "7|summary 7",
+  ].join("\n");
+  const result = markViewCache(markedPayload([builtBlock(0), last])) as any;
+  assert.ok(result);
+  assert.deepEqual(result.messages[0].content[1].cache_control, CACHE_MARK);
+  assert.equal(result.messages[0].content[2].cache_control, undefined);
+});
+
+test("the view mark is a no-op on unexpected shapes", () => {
+  for (const payload of [
+    undefined,
+    null,
+    "text",
+    { messages: "not an array" },
+    { messages: [] },
+    { messages: [{ role: "user", content: "plain" }] },
+    { messages: [{ role: "user", content: [{ type: "text", text: "<chat>" }] }] },
+  ])
+    assert.equal(markViewCache(payload), undefined);
+});
+
+test("the view mark is a no-op when four marks already exist", () => {
+  const payload = markedPayload([builtBlock(0)], 1);
+  assert.equal(countMarks(payload), 4);
+  assert.equal(markViewCache(payload), undefined);
+});
+
+test("the view mark is a no-op when no block is fully built", () => {
+  const partial = "0|summary 0\n1|summary 1";
+  const unbuilt = `0|${UNBUILT_LINE}\n1|summary 1\n2|summary 2\n3|summary 3`;
+  assert.equal(markViewCache(markedPayload([partial, unbuilt])), undefined);
+});
+
+test("the handler marks only an active memory's Anthropic view", async () => {
+  const project = projectDir();
+  withProjects([project]);
+  const prompt = userEntry("first message");
+  const session = new TestSession({
+    cwd: project,
+    file: "/sessions/mark.jsonl",
+    entries: [prompt],
+  });
+  session.branch = [prompt];
+  const harness = new Harness();
+  await harness.sessionStart(session);
+
+  const payload = () => markedPayload([builtBlock(0)]);
+
+  // No frozen view yet: the turn has not started.
+  assert.equal(
+    await harness.beforeProviderRequest(session, payload()),
+    undefined,
+  );
+
+  await harness.beforeAgentStart(session);
+  const marked = (await harness.beforeProviderRequest(
+    session,
+    payload(),
+  )) as any;
+  assert.ok(marked);
+  assert.deepEqual(marked.messages[0].content[1].cache_control, CACHE_MARK);
+
+  // A non-Anthropic model is left alone.
+  assert.equal(
+    await harness.beforeProviderRequest(
+      session,
+      payload(),
+      "openai-completions",
+    ),
+    undefined,
+  );
+  await harness.shutdown(session, "quit");
+
+  // Memory inactive: the project is no longer listed.
+  withProjects([]);
+  const inactive = new TestSession({
+    cwd: project,
+    file: "/sessions/inactive-mark.jsonl",
+    entries: [prompt],
+  });
+  inactive.branch = [prompt];
+  const other = new Harness();
+  await other.sessionStart(inactive);
+  await other.beforeAgentStart(inactive);
+  assert.equal(
+    await other.beforeProviderRequest(inactive, payload()),
+    undefined,
+  );
+  await other.shutdown(inactive, "quit");
+  withProjects([project]);
+});
+
+test("usage entries are appended per compaction", async () => {
+  const project = projectDir();
+  withProjects([project]);
+  const prompt = userEntry("first message");
+  const session = new TestSession({
+    cwd: project,
+    file: "/sessions/usage.jsonl",
+    entries: [prompt],
+  });
+  session.branch = [prompt];
+  const harness = new Harness();
+  await harness.sessionStart(session);
+  harness.compactors[0].options.onUsage?.({
+    line: [0, 0],
+    input: 1,
+    output: 2,
+    cacheRead: 3,
+    cacheWrite: 4,
+    retries: 0,
+  });
+  assert.deepEqual(
+    harness.pi.entries.filter(
+      (entry: any) => entry.customType === "pi-herdsman-memory-usage",
+    ),
+    [
+      {
+        type: "custom",
+        customType: "pi-herdsman-memory-usage",
+        data: {
+          node: [0, 0],
+          input: 1,
+          output: 2,
+          cacheRead: 3,
+          cacheWrite: 4,
+          retries: 0,
+        },
+      },
+    ],
+  );
+  await harness.shutdown(session, "quit");
 });

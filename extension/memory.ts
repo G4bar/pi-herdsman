@@ -95,6 +95,8 @@ export const COMPACTION_BYTES = 32_000;
 export const COMPACTION_TARGET_BYTES = 16_000;
 /** The view is sent as blocks of this many lines, for the cache marks. */
 export const VIEW_BLOCK_LINES = 4;
+export const VIEW_OPEN = "<chat>";
+export const VIEW_CLOSE = "</chat>";
 export const UNBUILT_LINE = "(not summarized yet: zoom it)";
 const UNBUILT_BYTES = Buffer.byteLength(UNBUILT_LINE, "utf8");
 /** The body of a message that only carried images. Images are not stored. */
@@ -415,7 +417,7 @@ export function renderView(
   textOf: (line: ViewLine) => string | undefined,
 ): string {
   const rendered = lines.map((line) => renderLine(line, textOf(line)));
-  return ["<chat>", ...rendered, "</chat>"].join("\n");
+  return [VIEW_OPEN, ...rendered, VIEW_CLOSE].join("\n");
 }
 
 /** The view as an ordered list of blocks, for the cache marks. */
@@ -433,6 +435,91 @@ export function renderBlocks(
         .join("\n"),
     );
   return blocks;
+}
+
+/** Anthropic accepts at most this many cache breakpoints per request. */
+const CACHE_MARK_LIMIT = 4;
+
+/** An Anthropic Messages request payload, as the provider adapter builds it. */
+type ProviderPayload = Record<string, unknown>;
+
+type PayloadBlock = { type?: unknown; text?: unknown; cache_control?: unknown };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isViewMessage(message: unknown): boolean {
+  if (!isRecord(message) || message.role !== "user") return false;
+  const content = message.content;
+  if (!Array.isArray(content) || content.length === 0) return false;
+  const first = content[0];
+  return isRecord(first) && first.type === "text" && first.text === VIEW_OPEN;
+}
+
+/** A whole 4-line block with every line built: a stable cache breakpoint. */
+function isBuiltViewBlock(block: unknown): boolean {
+  if (!isRecord(block) || block.type !== "text") return false;
+  const text = block.text;
+  if (typeof text !== "string") return false;
+  if (text === VIEW_OPEN || text === VIEW_CLOSE) return false;
+  if (text.includes(UNBUILT_LINE)) return false;
+  return text.split("\n").length === VIEW_BLOCK_LINES;
+}
+
+/** Every block Pi could have marked in the payload. */
+function payloadBlocks(payload: ProviderPayload): PayloadBlock[] {
+  const blocks: PayloadBlock[] = [];
+  const push = (value: unknown) => {
+    if (isRecord(value)) blocks.push(value as PayloadBlock);
+  };
+  if (Array.isArray(payload.system)) payload.system.forEach(push);
+  if (Array.isArray(payload.tools)) payload.tools.forEach(push);
+  if (Array.isArray(payload.messages))
+    for (const message of payload.messages)
+      if (isRecord(message) && Array.isArray(message.content))
+        message.content.forEach(push);
+  return blocks;
+}
+
+/**
+ * Adds one Anthropic cache mark to the last fully built 4-line block of the
+ * injected `<chat>` view, so the view prefix survives across turns. Returns the
+ * replacement payload, or undefined when the payload is not one to mark: a
+ * shape mismatch is a no-op, because caching is efficiency, not correctness
+ * (ADR 0009).
+ */
+export function markViewCache(payload: unknown): ProviderPayload | undefined {
+  if (!isRecord(payload)) return undefined;
+  const messages = payload.messages;
+  if (!Array.isArray(messages)) return undefined;
+  const viewIndex = messages.findIndex(isViewMessage);
+  if (viewIndex === -1) return undefined;
+  const blocks = payloadBlocks(payload);
+  if (
+    blocks.filter((block) => block.cache_control !== undefined).length >=
+    CACHE_MARK_LIMIT
+  )
+    return undefined;
+  const mark = blocks.find((block) => block.cache_control !== undefined)
+    ?.cache_control;
+  if (mark === undefined) return undefined;
+  const view = messages[viewIndex] as Record<string, unknown>;
+  if (!Array.isArray(view.content)) return undefined;
+  let at = -1;
+  for (let index = view.content.length - 1; index >= 0; index -= 1)
+    if (isBuiltViewBlock(view.content[index])) {
+      at = index;
+      break;
+    }
+  if (at === -1) return undefined;
+  const target = view.content[at] as PayloadBlock;
+  if (target.cache_control !== undefined) return undefined;
+  const content = [...view.content];
+  content[at] = { ...target, cache_control: mark };
+  const next = [...messages];
+  next[viewIndex] = { ...view, content };
+  return { ...payload, messages: next };
 }
 
 // --- identifiers ------------------------------------------------------------
@@ -835,6 +922,11 @@ export class MemoryStore {
 
   renderChatBlocks(): string[] {
     return renderBlocks(this.chat, (line) => this.nodeText(line));
+  }
+
+  renderCompactionBlocks(line?: ViewLine): string[] {
+    const lines = line ? this.compactionLinesBefore(line) : this.compaction;
+    return renderBlocks(lines, (entry) => this.nodeText(entry));
   }
 
   /** The latest view line whose summary contains `text`. */

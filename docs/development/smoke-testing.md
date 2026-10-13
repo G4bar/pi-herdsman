@@ -55,8 +55,9 @@ managed descendants do not load the probe.
 
 The available scenarios are `core` (nested delegation and candidate-extension
 propagation), `continuation` (persisted Pi-session continuation across managed
-generations), `chief-tree` (current Chief/session_tree behavior), and
-`manager-recovery` (Manager delegation, review messaging, `stop_lead`, missing
+generations), `chief-tree` (current Chief/session_tree behavior), `memory`
+(cross-turn view caching in an ordinary Lead session), and `manager-recovery`
+(Manager delegation, review messaging, `stop_lead`, missing
 worktree reconstruction with exact Pi-session continuity, retained project
 messages across Manager turnover, and Herdr-driven project retirement).
 `chief-tree` records ordinary Lead, Chief, and post-`session_tree` tool
@@ -93,6 +94,19 @@ evidence of a pass. It does not replace or reconfigure the installed
 Herdsman, copy normal Pi settings or extensions, or run as part of
 `npm run validate`. Run selected scenarios according to the change being
 verified; `npm run smoke` defaults to `core`.
+
+The `memory` scenario runs outside Herdr: the harness cannot drive a
+multi-turn ordinary Lead session, so it drives Pi in RPC mode with the Lead
+environment (an isolated `PI_CODING_AGENT_DIR` and `HERDR_ENV=1`, no managed
+mailbox) and loads this worktree's `extension/index.ts` directly, so no build is
+needed. It creates a throwaway project, lists it in `memoryProjects`, and gives
+it a cheap `compactor`. It drives a fixed script of prompts with an Anthropic
+Haiku model at thinking level `low`, once with the view cache mark and once with
+`PI_HERDSMAN_MEMORY_DISABLE_VIEW_MARK=1`, then reads the session file and the
+`pi-herdsman-memory-usage` entries. It prints a JSON report (also written to
+`<tmp>/pi-herdsman-memory-smoke-report.json`) with the turn and compaction
+cache-read ratios, the turn count, the batch merges, and the store and session
+bytes per message, and fails when the marked turn ratio is below 95%.
 
 ## Runtime preflight
 

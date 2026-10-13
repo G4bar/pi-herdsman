@@ -28,9 +28,12 @@ import { ProcessLockOccupiedError, readProcessLockStatus } from "./lock.ts";
 import {
   MemoryStore,
   VIEW_BLOCK_LINES,
+  VIEW_CLOSE,
+  VIEW_OPEN,
   deriveMessages,
   extractIdentifiers,
   lineLabel,
+  markViewCache,
   nodeAt,
   nodeStart,
   projectMemoryRoot,
@@ -51,8 +54,6 @@ export const TURN_SETTLE_GRACE_MS = 30_000;
 /** At most this many images, and this many bytes in all, come back per zoom. */
 const ZOOM_IMAGE_LIMIT = 4;
 const ZOOM_IMAGE_BYTES = 5 * 1024 * 1024;
-const VIEW_OPEN = "<chat>";
-const VIEW_CLOSE = "</chat>";
 /** The tools the zoom gate examines; every other call passes through. */
 const GATED_TOOLS: ReadonlySet<string> = new Set([
   "delegate_agent",
@@ -71,6 +72,8 @@ const GATE_REASON_LIMIT = 5;
 const GATE_ASK_AFTER = 3;
 /** The durable audit entry the gate appends; it is never corpus text. */
 const GATE_ENTRY_TYPE = "pi-herdsman-memory-gate";
+/** The durable usage entry each compaction call appends, for the harness. */
+const USAGE_ENTRY_TYPE = "pi-herdsman-memory-usage";
 
 export type MemoryCompactorFactory = (
   store: MemoryStore,
@@ -280,6 +283,17 @@ export function registerMemoryRuntime(
         compactor = startCompactor(store, ctx, {
           thinkingLevel: pi.getThinkingLevel(),
           onFailure: (failure) => reportCompactionFailure(failure),
+          // The harness reads these entries to measure cache use; they are never
+          // sent to the model.
+          onUsage: (usage) =>
+            pi.appendEntry(USAGE_ENTRY_TYPE, {
+              node: usage.line,
+              input: usage.input,
+              output: usage.output,
+              cacheRead: usage.cacheRead,
+              cacheWrite: usage.cacheWrite,
+              retries: usage.retries,
+            }),
         });
       } catch (error) {
         closeQuietly(store);
@@ -534,6 +548,21 @@ export function registerMemoryRuntime(
     }
     const tail = count === 0 ? [] : event.messages.slice(-count);
     return { messages: [viewMessage(frozen), ...tail] };
+  });
+  // One cache mark at the view, so its prefix survives across turns. Pi marks
+  // the system prompt, the tools and the last user block; without this mark
+  // each turn ends differently and rewrites the whole view (ADR 0009).
+  pi.on("before_provider_request", (event, ctx: ExtensionContext) => {
+    const frozen = owning()?.frozen;
+    if (!frozen || frozen.fallback) return;
+    if (ctx.model?.api !== "anthropic-messages") return;
+    if (process.env.PI_HERDSMAN_MEMORY_DISABLE_VIEW_MARK === "1") return;
+    try {
+      return markViewCache(event.payload);
+    } catch {
+      // Caching is efficiency, not correctness: a shape mismatch is a no-op.
+      return undefined;
+    }
   });
   pi.on("session_before_compact", (event: SessionBeforeCompactEvent) => {
     if (!owning()) return;
