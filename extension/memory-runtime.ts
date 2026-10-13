@@ -6,8 +6,8 @@
  * The store owns the log and the view math, the compactor owns the model calls;
  * this module owns the Pi events.
  */
-import { readFileSync, readdirSync, realpathSync } from "node:fs";
-import { dirname, join, sep } from "node:path";
+import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import {
   type ContextEvent,
   type ExtensionAPI,
@@ -24,7 +24,10 @@ import { readConfig } from "./config.ts";
 import { ProcessLockOccupiedError, readProcessLockStatus } from "./lock.ts";
 import {
   MemoryStore,
+  VIEW_BLOCK_LINES,
   deriveMessages,
+  extractIdentifiers,
+  lineLabel,
   nodeAt,
   nodeStart,
   projectMemoryRoot,
@@ -47,6 +50,22 @@ const ZOOM_IMAGE_LIMIT = 4;
 const ZOOM_IMAGE_BYTES = 5 * 1024 * 1024;
 const VIEW_OPEN = "<chat>";
 const VIEW_CLOSE = "</chat>";
+/** The tools the zoom gate examines; every other call passes through. */
+const GATED_TOOLS: ReadonlySet<string> = new Set([
+  "delegate_agent",
+  "continue_agent",
+  "reply_agent",
+  "steer_agent",
+  "interrupt_agent",
+  "edit",
+  "write",
+]);
+/** A full UUID: `continue_agent.session` is a UUID or a session path. */
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** How many blocked identifiers one reason names. */
+const GATE_REASON_LIMIT = 5;
+/** How often one identifier must be blocked before the reason suggests asking. */
+const GATE_ASK_AFTER = 3;
 
 export type MemoryCompactorFactory = (
   store: MemoryStore,
@@ -102,7 +121,31 @@ type ActiveMemory = {
   frozen: FrozenTurn | undefined;
   /** True once a compaction failure was reported, so an outage notifies once. */
   reported: boolean;
+  /** This turn's verbatim corpus, cached until the branch grows. */
+  corpus: TurnCorpus | undefined;
+  /** True once a gated call blocked this turn, so `zoomBefore` stops counting. */
+  gateBlocked: boolean;
+  /** How often each identifier was blocked this turn. */
+  blockCounts: Map<string, number>;
 };
+
+/** The text this turn already showed verbatim: prompt, tool results, user text. */
+type TurnCorpus = {
+  /** Identifies the branch state the corpus was built from. */
+  key: string;
+  /** The text as seen, for case-sensitive membership. */
+  text: string;
+  /** The lowercased text, so UUIDs compare case-insensitively. */
+  lower: string;
+  /** True when a `zoom` result is already earlier in this turn. */
+  zoomed: boolean;
+};
+
+/** The identifier classes the gate distinguishes. */
+type GateClass = "uuid" | "ref" | "path";
+
+/** One identifier an action relies on. */
+type GateCheck = { value: string; class: GateClass };
 
 /**
  * Memory belongs to an ordinary Lead session only: a Lead process that is
@@ -247,6 +290,9 @@ export function registerMemoryRuntime(
         freezing: false,
         frozen: undefined,
         reported: false,
+        corpus: undefined,
+        gateBlocked: false,
+        blockCounts: new Map(),
       };
       options.onActiveChange?.();
     }
@@ -264,6 +310,9 @@ export function registerMemoryRuntime(
     memory.frozen = undefined;
     memory.scanned = 0;
     memory.logged.clear();
+    memory.corpus = undefined;
+    memory.gateBlocked = false;
+    memory.blockCounts.clear();
     backfill(memory);
   }
 
@@ -327,6 +376,9 @@ export function registerMemoryRuntime(
     if (!memory) return;
     memory.ctx = ctx;
     memory.frozen = undefined;
+    memory.corpus = undefined;
+    memory.gateBlocked = false;
+    memory.blockCounts.clear();
     try {
       // The anchor is read before the wait: whatever lands while waiting is
       // part of the turn's tail, never only of the view.
@@ -442,6 +494,22 @@ export function registerMemoryRuntime(
     if (!memory) return;
     memory.ctx = ctx;
     flush(memory);
+  });
+  // The zoom gate: an action may only use identifiers this turn already showed
+  // verbatim. It reads the frozen view, so it never blocks a line the model was
+  // told to zoom, and a `zoom` result earlier in the turn makes a value pass.
+  pi.on("tool_call", (event: any, ctx: ExtensionContext) => {
+    const memory = owning();
+    if (!memory) return;
+    const frozen = memory.frozen;
+    if (!frozen || frozen.fallback) return;
+    if (!GATED_TOOLS.has(event.toolName)) return;
+    try {
+      return gateCall(pi, memory, ctx, event, frozen);
+    } catch {
+      // A gate failure must not fail the turn; the tool runs unchecked.
+      return undefined;
+    }
   });
   pi.on("before_agent_start", async (_event, ctx: ExtensionContext) => {
     await freezeTurn(ctx);
@@ -625,6 +693,242 @@ function closeQuietly(store: MemoryStore): void {
 function reason(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   return message.replace(/^Error: /, "");
+}
+
+// --- zoom gate --------------------------------------------------------------
+
+/**
+ * Blocks a gated call whose identifiers this turn has not shown verbatim, and
+ * records one gate entry per checked call. Strict values (`uuid`, `ref`) must be
+ * in the corpus; a path only when the frozen view holds it and the corpus does
+ * not, because the Lead may build a path from a listing.
+ */
+function gateCall(
+  pi: ExtensionAPI,
+  memory: ActiveMemory,
+  ctx: ExtensionContext,
+  event: { toolName: string; toolCallId: string; input: Record<string, unknown> },
+  frozen: FrozenTurn,
+): { block: true; reason: string } | undefined {
+  const checks = gateChecks(event.toolName, event.input, ctx.cwd);
+  if (checks.length === 0) return undefined;
+  const corpus = turnCorpus(memory, ctx, frozen);
+  const decisions = checks.map((check) => {
+    const line = frozenLineFor(frozen, check.value, check.class, ctx.cwd);
+    return {
+      check,
+      line,
+      inView: line !== undefined,
+      inCorpus:
+        check.class === "path"
+          ? pathInText(check.value, ctx.cwd, corpus.text)
+          : check.class === "uuid"
+            ? corpus.lower.includes(check.value)
+            : corpus.text.includes(check.value),
+    };
+  });
+  const blocked = decisions.filter(
+    ({ check, inView, inCorpus }) =>
+      check.class === "path" ? inView && !inCorpus : !inCorpus,
+  );
+  // Zooming before acting is the point: an earlier zoom counts only until a
+  // block, after which the turn is no longer unprompted.
+  pi.appendEntry("pi-herdsman-memory-gate", {
+    tool: event.toolName,
+    toolCallId: event.toolCallId,
+    identifiers: decisions.map(({ check, inView, inCorpus }) => ({
+      value: check.value,
+      class: check.class,
+      inView,
+      inCorpus,
+    })),
+    blocked: blocked.length > 0,
+    zoomBefore: corpus.zoomed && !memory.gateBlocked,
+  });
+  if (blocked.length === 0) return undefined;
+  const reasonLines: string[] = [];
+  for (const { check, line } of blocked.slice(0, GATE_REASON_LIMIT)) {
+    const count = (memory.blockCounts.get(check.value) ?? 0) + 1;
+    memory.blockCounts.set(check.value, count);
+    const ask = count >= GATE_ASK_AFTER ? "; ask the user for it" : "";
+    if (line)
+      reasonLines.push(
+        `blocked: "${check.value}" not seen verbatim this turn; zoom ${lineLabel(line)}${ask}`,
+      );
+    else
+      reasonLines.push(
+        `blocked: "${check.value}" not seen verbatim this turn and not in the view; get it from a tool result or the user first${ask}`,
+      );
+  }
+  reasonLines.push(
+    "Retry the call after the zoom result arrives; a zoom and the action can be sent in the same batch.",
+  );
+  memory.gateBlocked = true;
+  return { block: true, reason: reasonLines.join("\n") };
+}
+
+/** Every identifier the given call must have seen verbatim this turn. */
+function gateChecks(
+  toolName: string,
+  input: Record<string, unknown>,
+  cwd: string,
+): GateCheck[] {
+  switch (toolName) {
+    case "delegate_agent":
+      return [...freeTextChecks(input.task), ...fileChecks(input.files)];
+    case "continue_agent":
+      return [
+        ...freeTextChecks(input.task),
+        ...sessionChecks(input.session),
+        ...fileChecks(input.files),
+      ];
+    case "reply_agent":
+    case "steer_agent":
+    case "interrupt_agent":
+      return [...freeTextChecks(input.message), ...fileChecks(input.files)];
+    case "edit":
+      return pathChecks(input.path);
+    case "write":
+      return writePathChecks(input.path, cwd);
+    default:
+      return [];
+  }
+}
+
+/** `uuid` and `ref` in free text; paths are never taken from prose. */
+function freeTextChecks(value: unknown): GateCheck[] {
+  if (typeof value !== "string") return [];
+  return extractIdentifiers(value).flatMap((identifier) =>
+    identifier.kind === "uuid" || identifier.kind === "ref"
+      ? [{ value: identifier.value, class: identifier.kind }]
+      : [],
+  );
+}
+
+/** A `result:` file entry is a ref; every other entry is a path. */
+function fileChecks(files: unknown): GateCheck[] {
+  if (!Array.isArray(files)) return [];
+  const checks: GateCheck[] = [];
+  for (const entry of files) {
+    if (typeof entry !== "string" || entry === "") continue;
+    checks.push(
+      entry.startsWith("result:")
+        ? { value: entry, class: "ref" }
+        : { value: entry, class: "path" },
+    );
+  }
+  return checks;
+}
+
+/** `continue_agent.session` is a UUID, or a session path when it is not. */
+function sessionChecks(value: unknown): GateCheck[] {
+  if (typeof value !== "string" || value === "") return [];
+  return [
+    UUID.test(value)
+      ? { value: value.toLowerCase(), class: "uuid" }
+      : { value, class: "path" },
+  ];
+}
+
+/** A field known to hold a path is taken whole, never through the extractor. */
+function pathChecks(value: unknown): GateCheck[] {
+  return typeof value === "string" && value !== ""
+    ? [{ value, class: "path" }]
+    : [];
+}
+
+/** A new file cannot have been seen yet, so `write` to one is not gated. */
+function writePathChecks(value: unknown, cwd: string): GateCheck[] {
+  if (typeof value !== "string" || value === "") return [];
+  if (!existsSync(resolve(cwd, value))) return [];
+  return [{ value, class: "path" }];
+}
+
+/** This turn's verbatim corpus, cached until the branch state changes. */
+function turnCorpus(
+  memory: ActiveMemory,
+  ctx: ExtensionContext,
+  frozen: FrozenTurn,
+): TurnCorpus {
+  const branch = ctx.sessionManager.getBranch();
+  const last = branch[branch.length - 1]?.id ?? "";
+  const key = `${frozen.timestamp}|${frozen.anchor ?? ""}|${branch.length}|${last}`;
+  if (memory.corpus && memory.corpus.key === key) return memory.corpus;
+  // A branch that no longer holds the anchor keeps every entry, so a value the
+  // model saw natively is never blocked.
+  const start =
+    frozen.anchor === null
+      ? 0
+      : branch.findIndex((entry) => entry.id === frozen.anchor) + 1;
+  let text = systemPromptOf(ctx);
+  let zoomed = false;
+  for (let index = Math.max(start, 0); index < branch.length; index += 1) {
+    const entry = branch[index];
+    for (const message of deriveMessages(entry, memory.session))
+      if (
+        message.kind === "user" ||
+        message.kind === "echo" ||
+        message.kind === "work"
+      )
+        text += `\n${message.text}`;
+    if (isZoomResult(entry)) zoomed = true;
+  }
+  const corpus: TurnCorpus = {
+    key,
+    text,
+    lower: text.toLowerCase(),
+    zoomed,
+  };
+  memory.corpus = corpus;
+  return corpus;
+}
+
+/** The final system prompt of this turn, or empty when Pi cannot render it. */
+function systemPromptOf(ctx: ExtensionContext): string {
+  try {
+    const prompt = ctx.getSystemPrompt();
+    return typeof prompt === "string" ? prompt : "";
+  } catch {
+    return "";
+  }
+}
+
+function isZoomResult(entry: SessionEntry): boolean {
+  if (entry.type !== "message") return false;
+  const message = entry.message as { role?: string; toolName?: string };
+  return message.role === "toolResult" && message.toolName === "zoom";
+}
+
+/** The latest frozen view line holding the value, or undefined. */
+function frozenLineFor(
+  frozen: FrozenTurn,
+  value: string,
+  kind: GateClass,
+  cwd: string,
+): ViewLine | undefined {
+  const matches =
+    kind === "path"
+      ? (text: string) => pathInText(value, cwd, text)
+      : (text: string) => text.includes(value);
+  for (let block = frozen.blocks.length - 1; block >= 0; block -= 1) {
+    const rows = frozen.blocks[block].split("\n");
+    for (let row = rows.length - 1; row >= 0; row -= 1) {
+      const line = frozen.lines[block * VIEW_BLOCK_LINES + row];
+      if (line && matches(rows[row])) return line;
+    }
+  }
+  return undefined;
+}
+
+/** The forms a path is matched by: as given, absolute, and cwd-relative. */
+function pathForms(value: string, cwd: string): string[] {
+  const absolute = resolve(cwd, value);
+  const relativePath = relative(cwd, absolute);
+  return [...new Set([value, absolute, relativePath].filter(Boolean))];
+}
+
+function pathInText(value: string, cwd: string, text: string): boolean {
+  return pathForms(value, cwd).some((form) => text.includes(form));
 }
 
 // --- zoom and date ----------------------------------------------------------

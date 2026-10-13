@@ -22,6 +22,7 @@ import { updateConfig } from "./config.ts";
 import { ProcessLockOccupiedError } from "./lock.ts";
 import {
   MemoryStore,
+  lineLabel,
   projectMemoryRoot,
   type MemoryMessage,
 } from "./memory.ts";
@@ -152,6 +153,8 @@ class TestSession {
   entries: SessionEntry[];
   branch: SessionEntry[];
   signal: AbortSignal | undefined;
+  /** The final system prompt the gate may count as seen. */
+  systemPrompt = "";
 
   constructor(options: {
     cwd: string;
@@ -192,6 +195,8 @@ class TestSession {
     } as unknown as typeof context.sessionManager;
     const extended = context as unknown as ExtensionContext;
     (extended as { signal?: AbortSignal }).signal = this.signal;
+    (extended as { getSystemPrompt?: () => string }).getSystemPrompt = () =>
+      this.systemPrompt;
     return extended;
   }
 }
@@ -311,6 +316,20 @@ class Harness {
         willRetry: false,
         signal: new AbortController().signal,
       },
+      session.context(),
+    );
+    return result;
+  }
+
+  async toolCall(
+    session: TestSession,
+    toolName: string,
+    input: Record<string, unknown>,
+    toolCallId = "call-1",
+  ): Promise<any> {
+    const [result] = await this.emit(
+      "tool_call",
+      { type: "tool_call", toolName, toolCallId, input },
       session.context(),
     );
     return result;
@@ -1610,5 +1629,340 @@ test("zoom caps the number and size of images it returns", async () => {
     (bytesCapped.content.at(-1) as any).text,
     "[1 image(s) omitted]",
   );
+  await harness.shutdown(session, "quit");
+});
+
+// --- the zoom gate ----------------------------------------------------------
+
+const GATE_UUID = "11111111-1111-4111-8111-111111111111";
+const OTHER_UUID = "22222222-2222-4222-8222-222222222222";
+
+function chained(texts: string[]): SessionEntry[] {
+  const entries: SessionEntry[] = [];
+  let parent: string | null = null;
+  for (const text of texts) {
+    const entry = userEntry(text, parent);
+    entries.push(entry);
+    parent = entry.id;
+  }
+  return entries;
+}
+
+function gateToolResult(
+  text: string,
+  toolName: string,
+  parentId: string | null,
+): SessionEntry {
+  return {
+    ...entryBase(parentId),
+    type: "message",
+    message: {
+      role: "toolResult",
+      toolCallId: `gate-${entryCounter}`,
+      toolName,
+      content: [{ type: "text", text }],
+      isError: false,
+      timestamp: Date.now(),
+    },
+  } as unknown as SessionEntry;
+}
+
+function pushEntry(session: TestSession, entry: SessionEntry): void {
+  session.entries = [...session.entries, entry];
+  session.branch = session.entries;
+}
+
+function lastId(session: TestSession): string | null {
+  return session.branch[session.branch.length - 1]?.id ?? null;
+}
+
+function gateEntries(harness: Harness): any[] {
+  return harness.pi.entries
+    .filter((entry: any) => entry.customType === "pi-herdsman-memory-gate")
+    .map((entry: any) => entry.data);
+}
+
+/** A frozen turn whose view is the given texts, with an empty corpus. */
+async function gateSession(
+  view: string[],
+  systemPrompt = "",
+): Promise<{ project: string; session: TestSession; harness: Harness }> {
+  const project = projectDir();
+  withProjects([project]);
+  const entries = chained(view);
+  const session = new TestSession({
+    cwd: project,
+    file: "/sessions/gate.jsonl",
+    entries,
+  });
+  session.branch = entries;
+  session.systemPrompt = systemPrompt;
+  const harness = new Harness();
+  await harness.sessionStart(session);
+  await harness.beforeAgentStart(session);
+  return { project, session, harness };
+}
+
+/** The `id+n` label the frozen view holds for a value. */
+function viewLabel(harness: Harness, value: string): string {
+  const line = harness.compactors[0].store.latestLineContaining(value);
+  assert.ok(line, `the view holds ${value}`);
+  return lineLabel(line);
+}
+
+test("the gate blocks a strict UUID that only the view holds", async () => {
+  const { session, harness } = await gateSession([`session ${GATE_UUID}`]);
+  const result = await harness.toolCall(session, "continue_agent", {
+    session: GATE_UUID,
+    task: "continue",
+  });
+  assert.equal(result.block, true);
+  assert.ok(result.reason.includes(`zoom ${viewLabel(harness, GATE_UUID)}`));
+  assert.match(result.reason, /not seen verbatim this turn/);
+  assert.doesNotMatch(result.reason, /not in the view/);
+  assert.match(result.reason, /Retry the call after the zoom result arrives/);
+  await harness.shutdown(session, "quit");
+});
+
+test("the same UUID from this turn's zoom result is allowed", async () => {
+  const { session, harness } = await gateSession(["opening"]);
+  pushEntry(
+    session,
+    gateToolResult(`session ${GATE_UUID}`, "zoom", lastId(session)),
+  );
+  const result = await harness.toolCall(session, "continue_agent", {
+    session: GATE_UUID,
+    task: "continue",
+  });
+  assert.equal(result, undefined);
+  await harness.shutdown(session, "quit");
+});
+
+test("a UUID the user typed this turn passes, whatever its case", async () => {
+  const { session, harness } = await gateSession(["opening"]);
+  pushEntry(
+    session,
+    userEntry(`session ${GATE_UUID.toUpperCase()}`, lastId(session)),
+  );
+  const result = await harness.toolCall(session, "continue_agent", {
+    session: GATE_UUID,
+    task: "continue",
+  });
+  assert.equal(result, undefined);
+  await harness.shutdown(session, "quit");
+});
+
+test("a ref the user typed this turn is allowed", async () => {
+  const { session, harness } = await gateSession(["opening"]);
+  pushEntry(
+    session,
+    userEntry("use result:researcher#1", lastId(session)),
+  );
+  const result = await harness.toolCall(session, "delegate_agent", {
+    definition: "researcher",
+    task: "do it",
+    files: ["result:researcher#1"],
+  });
+  assert.equal(result, undefined);
+  await harness.shutdown(session, "quit");
+});
+
+test("a ref that appears nowhere is blocked as not in the view", async () => {
+  const { session, harness } = await gateSession(["opening"]);
+  const result = await harness.toolCall(session, "delegate_agent", {
+    definition: "researcher",
+    task: "copy result:nowhere#1",
+  });
+  assert.equal(result.block, true);
+  assert.match(
+    result.reason,
+    /blocked: "result:nowhere#1" not seen verbatim this turn and not in the view/,
+  );
+  await harness.shutdown(session, "quit");
+});
+
+test("an edit path only the view holds is blocked until a read shows it", async () => {
+  const { project, session, harness } = await gateSession([
+    "see docs/notes.md",
+  ]);
+  const relativePath = "docs/notes.md";
+  const absolutePath = join(project, relativePath);
+
+  const blocked = await harness.toolCall(session, "edit", {
+    path: relativePath,
+    edits: [{ oldText: "a", newText: "b" }],
+  });
+  assert.equal(blocked.block, true);
+  assert.match(blocked.reason, /not seen verbatim this turn/);
+
+  pushEntry(
+    session,
+    gateToolResult(`read ${absolutePath}`, "read", lastId(session)),
+  );
+  assert.equal(
+    await harness.toolCall(session, "edit", { path: relativePath, edits: [] }),
+    undefined,
+  );
+  assert.equal(
+    await harness.toolCall(session, "edit", { path: absolutePath, edits: [] }),
+    undefined,
+  );
+  await harness.shutdown(session, "quit");
+});
+
+test("write creates a new file but is blocked on an existing one held by the view", async () => {
+  const { project, session, harness } = await gateSession([
+    "overwrite existing.md",
+  ]);
+  assert.equal(
+    await harness.toolCall(session, "write", { path: "new.md", content: "x" }),
+    undefined,
+  );
+  writeFileSync(join(project, "existing.md"), "old");
+  const blocked = await harness.toolCall(session, "write", {
+    path: "existing.md",
+    content: "new",
+  });
+  assert.equal(blocked.block, true);
+  await harness.shutdown(session, "quit");
+});
+
+test("a path that appears nowhere is allowed", async () => {
+  const { session, harness } = await gateSession(["opening"]);
+  assert.equal(
+    await harness.toolCall(session, "edit", {
+      path: "missing/gone.md",
+      edits: [],
+    }),
+    undefined,
+  );
+  await harness.shutdown(session, "quit");
+});
+
+test("the agent, label and definition fields are never checked", async () => {
+  const { session, harness } = await gateSession(["opening"]);
+  pushEntry(
+    session,
+    userEntry("use result:researcher#1", lastId(session)),
+  );
+  // The agent is a UUID that appears nowhere; only the ref inside the message
+  // is checked, so the call passes.
+  assert.equal(
+    await harness.toolCall(session, "reply_agent", {
+      agent: OTHER_UUID,
+      message: "use result:researcher#1",
+    }),
+    undefined,
+  );
+  assert.equal(
+    await harness.toolCall(session, "delegate_agent", {
+      definition: "researcher",
+      task: "do it",
+      label: "fresh-label",
+      files: ["result:researcher#1"],
+    }),
+    undefined,
+  );
+  await harness.shutdown(session, "quit");
+});
+
+test("the gate is inert without memory, a freeze or with the fallback", async () => {
+  // No session_start: memory owns nothing.
+  const off = projectDir();
+  withProjects([off]);
+  const offSession = new TestSession({ cwd: off, file: "/sessions/off.jsonl" });
+  const offHarness = new Harness();
+  assert.equal(
+    await offHarness.toolCall(offSession, "continue_agent", {
+      session: GATE_UUID,
+      task: "go",
+    }),
+    undefined,
+  );
+
+  // Started, but no turn has frozen a view.
+  const cold = projectDir();
+  withProjects([cold]);
+  const coldSession = new TestSession({
+    cwd: cold,
+    file: "/sessions/cold.jsonl",
+    entries: chained(["opening"]),
+  });
+  coldSession.branch = coldSession.entries;
+  const coldHarness = new Harness();
+  await coldHarness.sessionStart(coldSession);
+  assert.equal(
+    await coldHarness.toolCall(coldSession, "continue_agent", {
+      session: GATE_UUID,
+      task: "go",
+    }),
+    undefined,
+  );
+  await coldHarness.shutdown(coldSession, "quit");
+
+  // A fallback turn: the tail no longer maps onto the view.
+  const { session, harness } = await gateSession(["opening"]);
+  pushEntry(session, compactionEntry(lastId(session)));
+  await harness.context(session, []);
+  assert.equal(
+    await harness.toolCall(session, "continue_agent", {
+      session: GATE_UUID,
+      task: "go",
+    }),
+    undefined,
+  );
+  await harness.shutdown(session, "quit");
+});
+
+test("a gate entry records each identifier and the zoomBefore state", async () => {
+  const { session, harness } = await gateSession(["opening"]);
+  pushEntry(session, gateToolResult(GATE_UUID, "zoom", lastId(session)));
+  await harness.toolCall(session, "continue_agent", {
+    session: GATE_UUID,
+    task: "go",
+  });
+  // Still unprompted: no block has happened yet.
+  await harness.toolCall(session, "continue_agent", {
+    session: GATE_UUID,
+    task: "go again",
+  });
+  const blocked = await harness.toolCall(session, "delegate_agent", {
+    definition: "researcher",
+    task: "use result:nowhere#1",
+  });
+  assert.equal(blocked.block, true);
+  // The block ends the unprompted streak.
+  await harness.toolCall(session, "continue_agent", {
+    session: GATE_UUID,
+    task: "after",
+  });
+
+  const entries = gateEntries(harness);
+  assert.equal(entries.length, 4);
+  assert.deepEqual(
+    entries.map((entry) => entry.zoomBefore),
+    [true, true, true, false],
+  );
+  assert.deepEqual(
+    entries.map((entry) => entry.blocked),
+    [false, false, true, false],
+  );
+  assert.equal(entries[0].tool, "continue_agent");
+  assert.equal(entries[0].toolCallId, "call-1");
+  assert.deepEqual(entries[0].identifiers, [
+    { value: GATE_UUID, class: "uuid", inView: false, inCorpus: true },
+  ]);
+  await harness.shutdown(session, "quit");
+});
+
+test("the third block of one identifier adds the ask-the-user line", async () => {
+  const { session, harness } = await gateSession(["opening"]);
+  const input = { definition: "researcher", task: "use result:nowhere#1" };
+  const first = await harness.toolCall(session, "delegate_agent", input);
+  const second = await harness.toolCall(session, "delegate_agent", input);
+  const third = await harness.toolCall(session, "delegate_agent", input);
+  assert.doesNotMatch(first.reason, /ask the user/);
+  assert.doesNotMatch(second.reason, /ask the user/);
+  assert.match(third.reason, /ask the user for it/);
   await harness.shutdown(session, "quit");
 });
