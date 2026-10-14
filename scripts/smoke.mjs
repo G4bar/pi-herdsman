@@ -4515,9 +4515,11 @@ async function writeMemoryFixture(project) {
     join(project, ".pi", "settings.json"),
     `${JSON.stringify({ compaction: { reserveTokens: MEMORY_RESERVE_TOKENS } }, null, 2)}\n`,
   );
+  // Only the cheap model is pinned: the thinking level stays the bundled
+  // default, so a quality run measures what ships.
   await writeFile(
     join(project, ".pi", "agents", "compactor.md"),
-    `---\nname: compactor\nbodyMode: append\nmodel: ${MEMORY_COMPACTOR_MODEL}\nthinking: medium\n---\n`,
+    `---\nname: compactor\nbodyMode: append\nmodel: ${MEMORY_COMPACTOR_MODEL}\n---\n`,
   );
   await writeFile(
     join(project, "README.md"),

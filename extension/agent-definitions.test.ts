@@ -620,7 +620,7 @@ test("reserves the layered compactor definition outside the Agent roster", () =>
   const bundled = withPiAgentDir(global, () => discoverCompactorDefinition());
   assert.equal(bundled.name, COMPACTOR_DEFINITION_NAME);
   assert.equal(bundled.frontmatter.model, undefined);
-  assert.equal(bundled.frontmatter.thinking, undefined);
+  assert.equal(bundled.frontmatter.thinking, "low");
   assert.equal(isReservedDefinition(COMPACTOR_DEFINITION_NAME), true);
   assert.equal(isReservedLeadDefinition(COMPACTOR_DEFINITION_NAME), false);
   assert.equal(isReservedDefinition("scout"), false);
@@ -692,7 +692,7 @@ test("reserves the layered compactor definition outside the Agent roster", () =>
     resolveCompactorDefinition(compactorContext(project, false)),
   );
   assert.equal(untrusted.model, undefined);
-  assert.equal(untrusted.thinking, undefined);
+  assert.equal(untrusted.thinking, "low");
   assert.equal(untrusted.body, bundled.body);
 
   writeFileSync(

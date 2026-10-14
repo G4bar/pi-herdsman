@@ -822,15 +822,15 @@ test("the compactor inherits the Lead model when the definition sets none", () =
     assert.equal(registry.requested[0], inherited);
   }));
 
-test("the thinkingLevel option supplies the Lead level when the context omits it", () =>
+test("the bundled thinking level is sent instead of the Lead's", () =>
   withProject(async (project, store) => {
     addMessage(store, longText());
     const model = makeModel("test", "lead");
     const registry = new FakeRegistry([model]);
     const compactor = start(
       store,
-      fakeContext(registry, model, project, undefined),
-      { thinkingLevel: "low" },
+      fakeContext(registry, model, project, "max"),
+      { thinkingLevel: "max" },
     );
     await compactor.whenSettled(0);
     compactor.stop();

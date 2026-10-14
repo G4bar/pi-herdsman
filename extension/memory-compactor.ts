@@ -91,6 +91,31 @@ export type MemoryCompactorOptions = MemoryCompactorCallbacks & {
   thinkingLevel?: ModelThinkingLevel;
 };
 
+/**
+ * One node build as the model receives it. Built by
+ * {@link buildCompactionRequest}, so the offline bench replays exactly what the
+ * runtime sends.
+ */
+export type CompactionRequest = {
+  systemPrompt: string;
+  messages: Message[];
+};
+
+/**
+ * The system prompt and messages of one node build: the compaction view as
+ * context, then the node's own task.
+ */
+export function buildCompactionRequest(
+  inputs: NodeInputs,
+  blocks: readonly string[],
+  body: string,
+): CompactionRequest {
+  return {
+    systemPrompt: `${MEMORY_VIEW_DESCRIPTION}\n\n${body}`,
+    messages: [viewMessage(blocks), userMessage(task(inputs))],
+  };
+}
+
 export type MemoryCompactor = {
   /** A new message or node may have made work ready; try to start it. */
   onMessage(): void;
@@ -140,7 +165,7 @@ export function start(
     ? clampThinkingLevel(model, requested as ModelThinkingLevel)
     : undefined;
   const runner = new CompactorRunner(store, ctx, model, reasoning, callbacks, {
-    systemPrompt: `${MEMORY_VIEW_DESCRIPTION}\n\n${definition.body}`,
+    body: definition.body,
     sessionId: sessionIdOf(ctx),
   });
   runner.pump();
@@ -166,7 +191,7 @@ class CompactorRunner implements MemoryCompactor {
   private readonly model: Model<Api>;
   private readonly reasoning: ModelThinkingLevel | undefined;
   private readonly callbacks: MemoryCompactorCallbacks;
-  private readonly systemPrompt: string;
+  private readonly body: string;
   private readonly sessionId: string | undefined;
   private readonly controllers = new Set<AbortController>();
   private readonly failures = new Map<string, number>();
@@ -195,14 +220,14 @@ class CompactorRunner implements MemoryCompactor {
     model: Model<Api>,
     reasoning: ModelThinkingLevel | undefined,
     callbacks: MemoryCompactorCallbacks,
-    options: { systemPrompt: string; sessionId: string | undefined },
+    options: { body: string; sessionId: string | undefined },
   ) {
     this.store = store;
     this.ctx = ctx;
     this.model = model;
     this.reasoning = reasoning;
     this.callbacks = callbacks;
-    this.systemPrompt = options.systemPrompt;
+    this.body = options.body;
     this.sessionId = options.sessionId;
   }
 
@@ -396,10 +421,11 @@ class CompactorRunner implements MemoryCompactor {
       this.fail(job, "node inputs are not available");
       return;
     }
-    const request: Message[] = [
-      viewMessage(this.store.renderCompactionBlocks(line)),
-      userMessage(this.task(inputs)),
-    ];
+    const request = buildCompactionRequest(
+      inputs,
+      this.store.renderCompactionBlocks(line),
+      this.body,
+    );
     const usage = {
       input: 0,
       output: 0,
@@ -421,7 +447,7 @@ class CompactorRunner implements MemoryCompactor {
     // Only `stop()` drops a finished build: a drain lets it through the
     // normal append, which writes the node line before `view.json`.
     if (this.stopped || !built) return;
-    const text = this.markLossy(inputs, built.text);
+    const text = markLossy(inputs, built.text);
     this.store.appendNode(line, text);
     this.failures.delete(jobKey(job));
     this.notify();
@@ -447,7 +473,7 @@ class CompactorRunner implements MemoryCompactor {
    * after a usable line exists keeps that line instead of throwing it away.
    */
   private async build(
-    request: Message[],
+    request: CompactionRequest,
     usage: {
       input: number;
       output: number;
@@ -485,27 +511,26 @@ class CompactorRunner implements MemoryCompactor {
       const size = Buffer.byteLength(text, "utf8");
       if (shortest === undefined || size < Buffer.byteLength(shortest, "utf8"))
         shortest = text;
-      if (size <= LEAF_BYTES) return { text, retries: attempt };
+      const retry = overLengthRetry(message, text);
+      if (!retry) return { text, retries: attempt };
       if (attempt === MAX_LENGTH_RETRIES) break;
-      request.push(
-        message,
-        userMessage(
-          tooLongTask({ bytes: size, cut: firstBytes(text, LEAF_BYTES) }),
-        ),
-      );
+      request.messages.push(...retry);
     }
     if (shortest === undefined) return undefined;
     return { text: shortest, retries: MAX_LENGTH_RETRIES };
   }
 
   /** One direct model call, with its own abort controller. */
-  private async call(request: Message[]): Promise<AssistantMessage> {
+  private async call(request: CompactionRequest): Promise<AssistantMessage> {
     const controller = new AbortController();
     this.controllers.add(controller);
     try {
       const stream = this.ctx.modelRegistry.streamSimple(
         this.model,
-        { systemPrompt: this.systemPrompt, messages: [...request] },
+        {
+          systemPrompt: request.systemPrompt,
+          messages: [...request.messages],
+        },
         {
           signal: controller.signal,
           ...(this.sessionId ? { sessionId: this.sessionId } : {}),
@@ -535,40 +560,6 @@ class CompactorRunner implements MemoryCompactor {
     } finally {
       this.controllers.delete(controller);
     }
-  }
-
-  private task(inputs: NodeInputs): string {
-    return inputs.kind === "message"
-      ? compressTask({
-          id: inputs.id,
-          kind: inputs.messageKind,
-          text: inputs.text,
-        })
-      : mergeTask({
-          line: inputs.line,
-          first: inputs.first,
-          second: inputs.second,
-        });
-  }
-
-  /**
-   * The deterministic lossy marker: a line that dropped an input identifier,
-   * or whose merge child was already lossy, ends with ` …[ids]`.
-   */
-  private markLossy(inputs: NodeInputs, text: string): string {
-    if (text.endsWith(LOSSY_MARKER)) return text;
-    const drops = (source: string) =>
-      extractIdentifiers(source).some(
-        (identifier) => !keepsIdentifier(text, identifier),
-      );
-    const lossy =
-      inputs.kind === "message"
-        ? drops(inputs.text)
-        : inputs.first.endsWith(LOSSY_MARKER) ||
-          inputs.second.endsWith(LOSSY_MARKER) ||
-          drops(inputs.first) ||
-          drops(inputs.second);
-    return lossy ? `${text} ${LOSSY_MARKER}` : text;
   }
 
   private fail(job: MemoryJob, error: string): void {
@@ -657,7 +648,7 @@ function userMessage(text: string): Message {
 }
 
 /** The compaction view as one user message of 4-line blocks, like the Lead's. */
-function viewMessage(blocks: string[]): Message {
+function viewMessage(blocks: readonly string[]): Message {
   return { role: "user", content: viewParts(blocks), timestamp: Date.now() };
 }
 
@@ -665,6 +656,67 @@ function messageText(message: AssistantMessage): string {
   return message.content
     .map((block) => (block.type === "text" ? block.text : ""))
     .join("");
+}
+
+/**
+ * The line of one model answer, normalized: trimmed, newlines flattened and any
+ * leading `id+n|` head the model added dropped.
+ */
+export function assistantText(message: AssistantMessage): string {
+  return normalizeOutput(messageText(message));
+}
+
+/**
+ * The conversation after an over-length line: the model's own answer, then the
+ * "Too long" task with the first bytes of the line it must shorten.
+ * `undefined` when the line already fits.
+ */
+export function overLengthRetry(
+  message: AssistantMessage,
+  text: string,
+): Message[] | undefined {
+  const bytes = Buffer.byteLength(text, "utf8");
+  if (bytes <= LEAF_BYTES) return undefined;
+  return [
+    message,
+    userMessage(tooLongTask({ bytes, cut: firstBytes(text, LEAF_BYTES) })),
+  ];
+}
+
+/** The task one node build sends: its message, or its two child lines. */
+function task(inputs: NodeInputs): string {
+  return inputs.kind === "message"
+    ? compressTask({
+        id: inputs.id,
+        kind: inputs.messageKind,
+        text: inputs.text,
+      })
+    : mergeTask({
+        line: inputs.line,
+        first: inputs.first,
+        second: inputs.second,
+      });
+}
+
+/**
+ * The deterministic lossy marker: a line that dropped an input identifier, or
+ * whose merge child was already lossy, ends with ` …[ids]`. The bench applies
+ * the same rule, so its lossy share is the runtime's.
+ */
+export function markLossy(inputs: NodeInputs, text: string): string {
+  if (text.endsWith(LOSSY_MARKER)) return text;
+  const drops = (source: string) =>
+    extractIdentifiers(source).some(
+      (identifier) => !keepsIdentifier(text, identifier),
+    );
+  const lossy =
+    inputs.kind === "message"
+      ? drops(inputs.text)
+      : inputs.first.endsWith(LOSSY_MARKER) ||
+        inputs.second.endsWith(LOSSY_MARKER) ||
+        drops(inputs.first) ||
+        drops(inputs.second);
+  return lossy ? `${text} ${LOSSY_MARKER}` : text;
 }
 
 /** A UUID is stored lowercase, so its comparison ignores case. */

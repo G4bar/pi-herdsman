@@ -129,7 +129,8 @@ order.
 - `native`: the project is not listed, so Pi compacts natively.
 
 Both arms share the fixture, the fixed script of prompts, the Lead model
-(`opencode-go/deepseek-v4.1-flash`), a cheap `compactor` definition, and a
+(`opencode-go/deepseek-v4.1-flash`), a `compactor` definition with a cheap model
+and the bundled thinking level, and a
 project `.pi/settings.json` whose `compaction.reserveTokens` puts Pi's native
 threshold near 60k tokens. The script writes the exact early values the probes
 score, then spends the bulk on large fixture reads, test runs, a second and

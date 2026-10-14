@@ -57,7 +57,10 @@ a long existing session costs about two compactor calls per imported message.
 
 The reserved `compactor` definition builds the tree with direct model calls, not
 as a managed session. It resolves model and thinking level through the normal
-definition layers, so a project or the user can give it a cheaper model. See
+definition layers, so a project or the user can give it a cheaper model. The
+bundled definition pins `thinking: low`: the compactor runs on every message, so
+it starts cheap instead of inheriting an expensive Lead's thinking level. An
+overlay can still replace it. See
 [Customizing bundled Agents](../guides/customizing-agents.md#project-memory-compactor).
 
 Compaction costs about two model calls per logged message.

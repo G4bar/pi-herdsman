@@ -1,6 +1,7 @@
 ---
 name: compactor
 description: Writes one project-memory line from a message or two adjacent lines.
+thinking: low
 ---
 
 # Compactions
