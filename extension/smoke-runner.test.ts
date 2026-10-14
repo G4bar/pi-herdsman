@@ -59,6 +59,7 @@ import {
   memoryMarkdown,
   memoryScenarioOptions,
   horizonPlan,
+  horizonValidity,
   formatSmokeFailure,
   herdrErrorCode,
   managerDiagnosticLines,
@@ -638,6 +639,10 @@ test("memory-horizon gates its own arms, runs, cap and quick flags", () => {
     () => parseSmokeArgs(["memory-horizon", "--arms", "native"]),
     /--arms entries must be one of/,
   );
+  assert.throws(
+    () => parseSmokeArgs(["memory-horizon", "--arms", "memory,memory"]),
+    /--arms must not repeat an arm/,
+  );
   for (const cost of ["0", "-1", "free"])
     assert.throws(
       () => parseSmokeArgs(["memory-horizon", `--max-cost=${cost}`]),
@@ -696,6 +701,126 @@ test("memory-horizon plans five segments, its default arms and the cost cap", ()
 
   const fresh = horizonPlan({ withFresh: true, maxCost: undefined });
   assert.deepEqual(fresh.arms, ["memory", "native-continue", "native-fresh"]);
+  // `--with-fresh` adds the arm to an explicit list, and never repeats it.
+  assert.deepEqual(
+    horizonPlan({ arms: ["memory"], withFresh: true, maxCost: undefined }).arms,
+    ["memory", "native-fresh"],
+  );
+  assert.deepEqual(
+    horizonPlan({
+      arms: ["native-fresh", "memory"],
+      withFresh: true,
+      maxCost: undefined,
+    }).arms,
+    ["native-fresh", "memory"],
+  );
+});
+
+test("memory-horizon validity reports errors, missing stores and thin checks", () => {
+  const store = {
+    viewBytes: 100,
+    viewNodes: 10,
+    unbuilt: 0,
+    messages: 10,
+    builtShare: 1,
+  };
+  const segment = (overrides = {}) => ({
+    index: 1,
+    turns: 4,
+    costUsd: 0.01,
+    leadCalls: [],
+    nativeCompactions: 0,
+    errors: [],
+    store,
+    ...overrides,
+  });
+  const validity = (overrides = {}) =>
+    horizonValidity({
+      arm: "memory",
+      quick: false,
+      segments: [segment(), segment({ index: 2 })],
+      errors: [],
+      nativeCompactions: 0,
+      aborted: false,
+      plannedSegments: 2,
+      ...overrides,
+    });
+  assert.deepEqual(validity(), []);
+  // A store that never appeared is not a built share of 1.
+  assert.match(
+    validity({
+      segments: [segment(), segment({ index: 2, store: undefined })],
+    })[0],
+    /segment 2 ended with no project memory store/,
+  );
+  assert.match(
+    validity({
+      segments: [segment({ store: { ...store, viewNodes: 0 } })],
+      plannedSegments: 1,
+    })[0],
+    /segment 1 ended with no project memory store/,
+  );
+  assert.match(
+    validity({
+      segments: [segment({ store: { ...store, builtShare: 0.5 } })],
+      plannedSegments: 1,
+    })[0],
+    /ended below 0\.95 built nodes/,
+  );
+  assert.deepEqual(
+    validity({
+      arm: "native-continue",
+      segments: [segment({ store: undefined })],
+      nativeCompactions: 8,
+      plannedSegments: 1,
+    }),
+    [],
+  );
+  // The baseline's compaction rule is skipped only in --quick.
+  assert.match(
+    validity({
+      arm: "native-continue",
+      segments: [segment({ store: undefined })],
+      nativeCompactions: 5,
+      plannedSegments: 1,
+    })[0],
+    /native compactions 5 below 8/,
+  );
+  assert.deepEqual(
+    validity({
+      arm: "native-continue",
+      quick: true,
+      segments: [segment({ store: undefined })],
+      nativeCompactions: 5,
+      plannedSegments: 1,
+    }),
+    [],
+  );
+  const failed = validity({
+    segments: [segment({ errors: ["segment 1: prompt rejected"] })],
+    errors: ["segment 1: prompt rejected"],
+    plannedSegments: 1,
+  });
+  assert.match(failed[0], /turn: segment 1: prompt rejected/);
+  assert.match(
+    validity({
+      segments: [segment({ killed: "SIGKILL" })],
+      plannedSegments: 1,
+    })[0],
+    /needed SIGKILL/,
+  );
+  // An aborted run reports the segments it ran, not a missing-segment issue.
+  assert.ok(
+    validity({
+      segments: [segment()],
+      aborted: true,
+      plannedSegments: 5,
+    }).every((issue) => !/ran 1 of 5/.test(issue)),
+  );
+  assert.match(
+    validity({ segments: [segment()], plannedSegments: 5 })[0],
+    /ran 1 of 5 segments/,
+  );
 });
 
 test("runScenario forwards memory scenario options", () => {

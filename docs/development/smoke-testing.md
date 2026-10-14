@@ -175,7 +175,10 @@ estimate built from per-turn cost constants recorded in
 phase 12 `thinking: low` compactor cost per message), and starts nothing without
 `--yes`. `--max-cost` is a hard stop, not advice: the harness checks the
 cumulative cost between turns and reports the run as `incomplete` when it is
-exceeded. `--quick` runs two four-turn segments plus three probes instead of the
+exceeded. The gate and the estimate cover the Lead's own usage plus the
+compactor's surfaced usage; a delegated agent's usage is not surfaced, so the
+real provider spend can pass the cap by the delegations' share. `--quick` runs
+two four-turn segments plus three probes instead of the
 full script, for harness debugging; it skips the compaction-count check and says
 so in the report.
 

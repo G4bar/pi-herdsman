@@ -173,6 +173,8 @@ export function parseSmokeArgs(args) {
       throw new Error(
         `--arms entries must be one of ${HORIZON_ARMS.join(", ")}`,
       );
+    if (new Set(arms).size !== arms.length)
+      throw new Error("--arms must not repeat an arm");
   }
   const withFresh = values["with-fresh"] ?? false;
   if (withFresh) horizonOnly("--with-fresh");
@@ -5993,11 +5995,12 @@ function horizonTurnCostUsd(arm) {
 export function horizonPlan(args) {
   const quick = args.quick ?? false;
   const segments = horizonScript({ quick });
+  const requestedArms = args.arms ?? ["memory", "native-continue"];
+  // `--with-fresh` adds the informational arm to whatever `--arms` asked for.
   const arms =
-    args.arms ??
-    (args.withFresh
-      ? ["memory", "native-continue", "native-fresh"]
-      : ["memory", "native-continue"]);
+    args.withFresh && !requestedArms.includes("native-fresh")
+      ? [...requestedArms, "native-fresh"]
+      : [...requestedArms];
   const maxCost = args.maxCost ?? MEMORY_HORIZON_DEFAULT_MAX_COST;
   const turns = segments.reduce((count, steps) => count + steps.length, 0);
   const estimateUsd = (runs) =>
@@ -6025,7 +6028,7 @@ function horizonAssumptions(plan) {
     `Lead $${MEMORY_HORIZON_LEAD_USD_PER_TURN.toFixed(4)} per turn, from the phase 10 baseline memory arm ($0.0566 over 32 turns).`,
     `compactor $${MEMORY_HORIZON_COMPACTOR_USD_PER_MESSAGE.toFixed(4)} per message at the phase 12 default (thinking low: $0.1923 over 178 messages) times ${MEMORY_HORIZON_MESSAGES_PER_TURN.toFixed(2)} messages per turn, so $${(MEMORY_HORIZON_MESSAGES_PER_TURN * MEMORY_HORIZON_COMPACTOR_USD_PER_MESSAGE).toFixed(4)} per memory-arm turn.`,
     "A native arm is charged its Lead turns only: native summarization usage is not surfaced in the Lead session.",
-    "Sub-agent usage is not surfaced either, so the three delegations are not estimated.",
+    "The estimate and the cost gate cover Lead plus compactor-surfaced spend only: a delegated agent's usage is not surfaced, so the real provider spend can pass the cap by the delegations' share.",
     `Estimated $${plan.estimateUsd.toFixed(2)} for ${plan.arms.length} arms x ${plan.runs} run(s) x ${plan.turns} turns; the cap is $${plan.maxCost.toFixed(2)} and stops the run as incomplete.`,
   ];
 }
@@ -6156,6 +6159,58 @@ async function horizonSegmentEvidence({
 }
 
 /**
+ * The validity rules for one arm-run: any turn error or stall, a segment
+ * process that needed SIGKILL, a memory segment that ended without a store or
+ * below the built-node share, an interrupted run's remaining segments, and the
+ * `native-continue` baseline's compaction count.
+ */
+export function horizonValidity({
+  arm,
+  quick,
+  segments,
+  errors,
+  nativeCompactions,
+  aborted,
+  plannedSegments,
+}) {
+  const builtShares = segments
+    .map((segment) => segment.store?.builtShare)
+    .filter((share) => share !== undefined);
+  const issues = [
+    ...errors.map((error) => `turn: ${error}`),
+    ...segments
+      .filter((segment) => segment.killed === "SIGKILL")
+      .map((segment) => `segment ${segment.index} needed SIGKILL`),
+  ];
+  if (!aborted && segments.length !== plannedSegments)
+    issues.push(`ran ${segments.length} of ${plannedSegments} segments`);
+  if (
+    !quick &&
+    arm === "native-continue" &&
+    nativeCompactions < MEMORY_HORIZON_MIN_NATIVE_COMPACTIONS
+  )
+    issues.push(
+      `native compactions ${nativeCompactions} below ${MEMORY_HORIZON_MIN_NATIVE_COMPACTIONS}`,
+    );
+  if (arm === "memory") {
+    // A store that never appeared is not a built share of 1: it is no memory at
+    // all, and the 95% rule has nothing to check.
+    const storeless = segments.filter(
+      (segment) => !segment.store || segment.store.viewNodes === 0,
+    );
+    if (storeless.length)
+      issues.push(
+        `segment ${storeless.map((segment) => segment.index).join(", ")} ended with no project memory store`,
+      );
+    if (builtShares.some((share) => share < MEMORY_HORIZON_BUILT_NODE_SHARE))
+      issues.push(
+        `a segment ended below ${MEMORY_HORIZON_BUILT_NODE_SHARE} built nodes`,
+      );
+  }
+  return issues;
+}
+
+/**
  * One arm, one run: every segment against the same project, agent directory and
  * session directory. `memory` and `native-fresh` start a new Pi process (and so
  * a new session file) per segment; `native-continue` adds `--continue`.
@@ -6245,8 +6300,15 @@ async function runHorizonArm({
         },
       });
     } catch (error) {
-      if (!(error instanceof HorizonBudgetExceeded)) throw error;
-      aborted = true;
+      // A fatal turn or a failed spawn is this segment's error, not the end of
+      // the run: the arm is reported invalid with the rest of its evidence.
+      if (error instanceof HorizonBudgetExceeded) aborted = true;
+      else
+        result = {
+          errors: [`segment ${index + 1}: ${error?.message ?? error}`],
+          stderr: "",
+          killed: undefined,
+        };
     }
     const segment = await horizonSegmentEvidence({
       sessionDir,
@@ -6274,36 +6336,19 @@ async function runHorizonArm({
   );
   const probes = scored.flatMap((value) => value.probes);
   const promptTokens = segments.flatMap((segment) => segment.leadCalls);
-  const builtShares = segments
-    .map((segment) => segment.store?.builtShare)
-    .filter((share) => share !== undefined);
   const nativeCompactions = segments.reduce(
     (total, segment) => total + segment.nativeCompactions,
     0,
   );
-  const issues = [
-    ...errors.map((error) => `turn: ${error}`),
-    ...segments
-      .filter((segment) => segment.killed === "SIGKILL")
-      .map((segment) => `segment ${segment.index} needed SIGKILL`),
-  ];
-  if (!aborted && segments.length !== plan.segments.length)
-    issues.push(`ran ${segments.length} of ${plan.segments.length} segments`);
-  if (
-    !plan.quick &&
-    arm === "native-continue" &&
-    nativeCompactions < MEMORY_HORIZON_MIN_NATIVE_COMPACTIONS
-  )
-    issues.push(
-      `native compactions ${nativeCompactions} below ${MEMORY_HORIZON_MIN_NATIVE_COMPACTIONS}`,
-    );
-  if (
-    arm === "memory" &&
-    builtShares.some((share) => share < MEMORY_HORIZON_BUILT_NODE_SHARE)
-  )
-    issues.push(
-      `a segment ended below ${MEMORY_HORIZON_BUILT_NODE_SHARE} built nodes`,
-    );
+  const issues = horizonValidity({
+    arm,
+    quick: plan.quick,
+    segments,
+    errors,
+    nativeCompactions,
+    aborted,
+    plannedSegments: plan.segments.length,
+  });
   return {
     arm,
     run,
@@ -6433,7 +6478,8 @@ async function runMemoryHorizonScenario(args) {
         plan.quick
           ? "--quick: two four-turn segments and three probes; the native compaction check is skipped, so this run does not judge the A/B."
           : `native-continue must compact at least ${MEMORY_HORIZON_MIN_NATIVE_COMPACTIONS} times.`,
-        `The memory arm must end every segment with at least ${MEMORY_HORIZON_BUILT_NODE_SHARE} of its view nodes built (the phase 11 drain).`,
+        `The memory arm must end every segment with at least ${MEMORY_HORIZON_BUILT_NODE_SHARE} of its view nodes built (the phase 11 drain), and with a store to check.`,
+        "The cost gate covers Lead plus compactor-surfaced spend only; a delegated agent's usage is not surfaced, so the cap can be passed by the delegations' share.",
         "Probe scores are phase 15's; this run scores only the --quick probe set.",
       ],
       results: Object.fromEntries(
