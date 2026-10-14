@@ -58,6 +58,7 @@ import {
   memoryRunReport,
   memoryMarkdown,
   memoryScenarioOptions,
+  horizonPlan,
   formatSmokeFailure,
   herdrErrorCode,
   managerDiagnosticLines,
@@ -452,6 +453,11 @@ test("smoke CLI parses scenarios and one-off model overrides", async () => {
     allowAnthropic: false,
     managerReadyTimeoutMs: undefined,
     managerRecoveryDiagnostics: false,
+    runs: undefined,
+    arms: undefined,
+    withFresh: false,
+    maxCost: undefined,
+    quick: false,
   });
   assert.deepEqual(parseSmokeArgs(["memory-quality", "--yes"]), {
     scenario: "memory-quality",
@@ -461,6 +467,11 @@ test("smoke CLI parses scenarios and one-off model overrides", async () => {
     allowAnthropic: false,
     managerReadyTimeoutMs: undefined,
     managerRecoveryDiagnostics: false,
+    runs: undefined,
+    arms: undefined,
+    withFresh: false,
+    maxCost: undefined,
+    quick: false,
   });
   for (const scenario of [
     "core",
@@ -469,6 +480,7 @@ test("smoke CLI parses scenarios and one-off model overrides", async () => {
     "manager-recovery",
     "memory-cache",
     "memory-quality",
+    "memory-horizon",
   ])
     assert.equal(parseSmokeArgs([scenario]).scenario, scenario);
   assert.deepEqual(
@@ -481,6 +493,11 @@ test("smoke CLI parses scenarios and one-off model overrides", async () => {
       allowAnthropic: false,
       managerReadyTimeoutMs: undefined,
       managerRecoveryDiagnostics: false,
+      runs: undefined,
+      arms: undefined,
+      withFresh: false,
+      maxCost: undefined,
+      quick: false,
     },
   );
   assert.deepEqual(
@@ -493,6 +510,11 @@ test("smoke CLI parses scenarios and one-off model overrides", async () => {
       allowAnthropic: false,
       managerReadyTimeoutMs: undefined,
       managerRecoveryDiagnostics: false,
+      runs: undefined,
+      arms: undefined,
+      withFresh: false,
+      maxCost: undefined,
+      quick: false,
     },
   );
   assert.throws(() => parseSmokeArgs(["core", "extra"]));
@@ -511,6 +533,11 @@ test("memory smoke gates anthropic models and keeps artifacts outside the repo",
     allowAnthropic: false,
     managerReadyTimeoutMs: undefined,
     managerRecoveryDiagnostics: false,
+    runs: undefined,
+    arms: undefined,
+    withFresh: false,
+    maxCost: undefined,
+    quick: false,
   };
   assert.deepEqual(parseSmokeArgs(["memory-cache"]), {
     ...base,
@@ -562,6 +589,115 @@ test("memory smoke gates anthropic models and keeps artifacts outside the repo",
   );
 });
 
+test("memory-horizon gates its own arms, runs, cap and quick flags", () => {
+  const base = {
+    model: undefined,
+    yes: false,
+    keep: undefined,
+    allowAnthropic: false,
+    managerReadyTimeoutMs: undefined,
+    managerRecoveryDiagnostics: false,
+    runs: undefined,
+    arms: undefined,
+    withFresh: false,
+    maxCost: undefined,
+    quick: false,
+  };
+  assert.deepEqual(parseSmokeArgs(["memory-horizon"]), {
+    ...base,
+    scenario: "memory-horizon",
+  });
+  assert.deepEqual(
+    parseSmokeArgs([
+      "memory-horizon",
+      "--arms",
+      "memory, native-fresh",
+      "--runs",
+      "3",
+      "--max-cost",
+      "1.50",
+      "--with-fresh",
+      "--quick",
+    ]),
+    {
+      ...base,
+      scenario: "memory-horizon",
+      arms: ["memory", "native-fresh"],
+      runs: 3,
+      maxCost: 1.5,
+      withFresh: true,
+      quick: true,
+    },
+  );
+  for (const runs of ["0", "9", "many", "1.5"])
+    assert.throws(
+      () => parseSmokeArgs(["memory-horizon", "--runs", runs]),
+      /--runs must be a positive integer/,
+    );
+  assert.throws(
+    () => parseSmokeArgs(["memory-horizon", "--arms", "native"]),
+    /--arms entries must be one of/,
+  );
+  for (const cost of ["0", "-1", "free"])
+    assert.throws(
+      () => parseSmokeArgs(["memory-horizon", `--max-cost=${cost}`]),
+      /--max-cost must be a positive number/,
+    );
+  for (const [flag, value] of [
+    ["--runs", "2"],
+    ["--arms", "memory"],
+    ["--max-cost", "1"],
+  ])
+    assert.throws(
+      () => parseSmokeArgs(["memory-quality", flag, value]),
+      new RegExp(`${flag} is only valid for memory-horizon`),
+    );
+  assert.throws(
+    () => parseSmokeArgs(["core", "--with-fresh"]),
+    /--with-fresh is only valid for memory-horizon/,
+  );
+  assert.throws(
+    () => parseSmokeArgs(["core", "--quick"]),
+    /--quick is only valid for memory-horizon/,
+  );
+});
+
+test("memory-horizon plans five segments, its default arms and the cost cap", () => {
+  const dflt = horizonPlan({ maxCost: undefined });
+  assert.deepEqual(dflt.arms, ["memory", "native-continue"]);
+  assert.equal(dflt.runs, 2);
+  assert.equal(dflt.segments.length, 5);
+  assert.equal(dflt.turns, 80);
+  assert.deepEqual(
+    dflt.segments.map((steps) => steps.length),
+    [16, 16, 16, 16, 16],
+  );
+  assert.equal(dflt.quick, false);
+  assert.ok(!dflt.reduced);
+  // The third segment carries the mid-run probe set, so it is one of the two
+  // segments the compacting baseline has to fill.
+  assert.equal(dflt.segments[2].filter((step) => step.settles === 2).length, 1);
+
+  const quick = horizonPlan({ quick: true, maxCost: undefined });
+  assert.equal(quick.runs, 1);
+  assert.equal(quick.turns, 11);
+  assert.deepEqual(
+    quick.segments.map((steps) => steps.length),
+    [4, 7],
+  );
+  assert.equal(quick.segments[1].filter((step) => step.probe).length, 3);
+
+  // A cap the estimate cannot cover drops the run count to 1.
+  const capped = horizonPlan({ maxCost: 0.5 });
+  assert.ok(capped.estimateUsd > 0);
+  assert.equal(capped.runs, 1);
+  assert.ok(capped.reduced);
+  assert.ok(capped.estimateUsd <= 3);
+
+  const fresh = horizonPlan({ withFresh: true, maxCost: undefined });
+  assert.deepEqual(fresh.arms, ["memory", "native-continue", "native-fresh"]);
+});
+
 test("runScenario forwards memory scenario options", () => {
   assert.deepEqual(
     memoryScenarioOptions({
@@ -575,6 +711,11 @@ test("runScenario forwards memory scenario options", () => {
       yes: true,
       keep: "/tmp/keep",
       allowAnthropic: true,
+      runs: undefined,
+      arms: undefined,
+      withFresh: undefined,
+      maxCost: undefined,
+      quick: undefined,
     },
   );
 });
@@ -932,6 +1073,11 @@ test("manager-recovery timeout is bounded and scoped to its ready handshake", ()
       allowAnthropic: false,
       managerReadyTimeoutMs: 45_000,
       managerRecoveryDiagnostics: true,
+      runs: undefined,
+      arms: undefined,
+      withFresh: false,
+      maxCost: undefined,
+      quick: false,
     },
   );
   for (const timeout of ["0", "-1", "1.5", "600001", "many"])

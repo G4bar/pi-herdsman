@@ -38,6 +38,7 @@ const scenarioNames = [
   "manager-recovery",
   "memory-cache",
   "memory-quality",
+  "memory-horizon",
 ];
 const SMOKE_MODEL_KEY = "pi-herdsman.smoke-model";
 const MAX_SOCKET_PATH_BYTES = 100;
@@ -50,6 +51,9 @@ const MODEL_STALL_MS = 120_000;
 const CLEANUP_TIMEOUT_MS = 30_000;
 const DEFAULT_MANAGER_READY_TIMEOUT_MS = 6 * 60_000;
 const MAX_MANAGER_READY_TIMEOUT_MS = 10 * 60_000;
+/** The arms `memory-horizon` can run; `native-continue` is the fair baseline. */
+const HORIZON_ARMS = ["memory", "native-continue", "native-fresh"];
+const MAX_HORIZON_RUNS = 8;
 const MANAGER_DIAGNOSTIC_PREFIX = "[pi-herdsman-manager-diagnostic] ";
 const HERDR_ROUTING_KEYS = [
   "HERDR_SOCKET_PATH",
@@ -88,6 +92,11 @@ export function parseSmokeArgs(args) {
       "allow-anthropic": { type: "boolean" },
       "manager-ready-timeout-ms": { type: "string" },
       "manager-recovery-diagnostics": { type: "boolean" },
+      runs: { type: "string" },
+      arms: { type: "string" },
+      "with-fresh": { type: "boolean" },
+      "max-cost": { type: "string" },
+      quick: { type: "boolean" },
     },
   });
   const scenario = parseScenario(positionals);
@@ -112,16 +121,18 @@ export function parseSmokeArgs(args) {
       "--manager-recovery-diagnostics is only valid for manager-recovery",
     );
   const memoryScenario =
-    scenario === "memory-cache" || scenario === "memory-quality";
+    scenario === "memory-cache" ||
+    scenario === "memory-quality" ||
+    scenario === "memory-horizon";
   const allowAnthropic = values["allow-anthropic"] ?? false;
   if (allowAnthropic && !memoryScenario)
     throw new Error(
-      "--allow-anthropic is only valid for memory-cache and memory-quality",
+      "--allow-anthropic is only valid for memory-cache, memory-quality and memory-horizon",
     );
   if (values.keep !== undefined) {
     if (!memoryScenario)
       throw new Error(
-        "--keep is only valid for memory-cache and memory-quality",
+        "--keep is only valid for memory-cache, memory-quality and memory-horizon",
       );
     const keep = resolve(values.keep);
     if (insideDirectory(repoRoot, keep))
@@ -135,6 +146,45 @@ export function parseSmokeArgs(args) {
     !allowAnthropic
   )
     throw new Error("an anthropic/* model needs --allow-anthropic");
+  const horizonOnly = (flag) => {
+    if (scenario !== "memory-horizon")
+      throw new Error(`${flag} is only valid for memory-horizon`);
+  };
+  const runs = values.runs === undefined ? undefined : Number(values.runs);
+  if (values.runs !== undefined) {
+    horizonOnly("--runs");
+    if (
+      !/^\d+$/.test(values.runs) ||
+      !Number.isSafeInteger(runs) ||
+      runs < 1 ||
+      runs > MAX_HORIZON_RUNS
+    )
+      throw new Error(
+        `--runs must be a positive integer no greater than ${MAX_HORIZON_RUNS}`,
+      );
+  }
+  const arms = values.arms
+    ?.split(",")
+    .map((arm) => arm.trim())
+    .filter((arm) => arm !== "");
+  if (values.arms !== undefined) {
+    horizonOnly("--arms");
+    if (!arms.length || arms.some((arm) => !HORIZON_ARMS.includes(arm)))
+      throw new Error(
+        `--arms entries must be one of ${HORIZON_ARMS.join(", ")}`,
+      );
+  }
+  const withFresh = values["with-fresh"] ?? false;
+  if (withFresh) horizonOnly("--with-fresh");
+  const quick = values.quick ?? false;
+  if (quick) horizonOnly("--quick");
+  const maxCost =
+    values["max-cost"] === undefined ? undefined : Number(values["max-cost"]);
+  if (values["max-cost"] !== undefined) {
+    horizonOnly("--max-cost");
+    if (!Number.isFinite(maxCost) || maxCost <= 0)
+      throw new Error("--max-cost must be a positive number of USD");
+  }
   return {
     scenario,
     model: values.model,
@@ -143,6 +193,11 @@ export function parseSmokeArgs(args) {
     allowAnthropic,
     managerReadyTimeoutMs,
     managerRecoveryDiagnostics,
+    runs,
+    arms,
+    withFresh,
+    maxCost,
+    quick,
   };
 }
 
@@ -1938,6 +1993,7 @@ export function initialPromptForScenario(scenario, ctx) {
       return undefined;
     case "memory-cache":
     case "memory-quality":
+    case "memory-horizon":
       return undefined;
     default:
       throw new Error(`unknown smoke scenario: ${scenario}`);
@@ -1950,6 +2006,11 @@ export function memoryScenarioOptions(ctx) {
     yes: ctx.yes,
     keep: ctx.keep,
     allowAnthropic: ctx.allowAnthropic,
+    runs: ctx.runs,
+    arms: ctx.arms,
+    withFresh: ctx.withFresh,
+    maxCost: ctx.maxCost,
+    quick: ctx.quick,
   };
 }
 
@@ -1968,6 +2029,8 @@ export async function runScenario(ctx, scenario) {
       return runMemoryCacheScenario(memoryScenarioOptions(ctx));
     case "memory-quality":
       return runMemoryScenario(memoryScenarioOptions(ctx));
+    case "memory-horizon":
+      return runMemoryHorizonScenario(memoryScenarioOptions(ctx));
     default:
       throw new Error(`unknown smoke scenario: ${scenario}`);
   }
@@ -4505,15 +4568,46 @@ function memorySuiteSource() {
   ].join("\n");
 }
 
-/** The fixture both arms share. */
-async function writeMemoryFixture(project) {
+/**
+ * The horizon scenario's cheap bulk turn: about 7 KB (2k tokens) of
+ * deterministic log lines per call, so a turn costs context without a large
+ * file read. Facts the probes ask about never live in this file.
+ */
+function horizonEmitSource() {
+  return [
+    'const topic = process.argv[2] ?? "topic";',
+    "const lines = Number(process.argv[3] ?? 40);",
+    "for (let i = 0; i < lines; i++) {",
+    '  const token = ((i * 2654435761) % 4294967296).toString(16).padStart(8, "0");',
+    '  console.log(`[${topic}] step ${i} ok token ${token} elapsed ${(i * 13) % 997} ms ${".".repeat(120)}`);',
+    "}",
+    "",
+  ].join("\n");
+}
+
+/**
+ * The fixture an arm shares. The horizon scenario needs the native threshold
+ * low enough to compact many times, and no file that holds a fact its probes
+ * ask about: every early fact is planted in the user's own turns.
+ */
+async function writeMemoryFixture(project, { horizon = false } = {}) {
   await mkdir(join(project, ".pi", "agents"), { recursive: true });
   await mkdir(join(project, "src"), { recursive: true });
   await mkdir(join(project, "scripts"), { recursive: true });
   await mkdir(join(project, "plans", "billing"), { recursive: true });
   await writeFile(
     join(project, ".pi", "settings.json"),
-    `${JSON.stringify({ compaction: { reserveTokens: MEMORY_RESERVE_TOKENS } }, null, 2)}\n`,
+    `${JSON.stringify(
+      {
+        compaction: {
+          reserveTokens: horizon
+            ? MEMORY_HORIZON_RESERVE_TOKENS
+            : MEMORY_RESERVE_TOKENS,
+        },
+      },
+      null,
+      2,
+    )}\n`,
   );
   // Only the cheap model is pinned: the thinking level stays the bundled
   // default, so a quality run measures what ships.
@@ -4525,6 +4619,14 @@ async function writeMemoryFixture(project) {
     join(project, "README.md"),
     "# Billing fixture\n\nA small project used by the memory smoke scenario.\n",
   );
+  if (horizon) {
+    await writeFile(
+      join(project, "src", "format.mjs"),
+      "export function formatAmount(value) {\n  return value.toFixed(2);\n}\n\nexport function formatInvoice(invoice) {\n  return `${invoice.id}: ${formatAmount(invoice.total)}`;\n}\n",
+    );
+    await writeFile(join(project, "scripts", "emit.mjs"), horizonEmitSource());
+    return;
+  }
   await writeFile(
     join(project, "src", "config.mjs"),
     `export const port = 5433;\nexport const database = "postgres";\nexport const apiPrefix = "/v2";\n`,
@@ -4712,6 +4814,11 @@ function memoryScript() {
 /**
  * Drives one Pi RPC session through the script and returns its stderr. One JSON
  * record per line, split on LF only; U+2028 can appear inside JSON.
+ *
+ * `continueSession` resumes the newest session in `sessionDir` (`--continue`),
+ * which is how the `native-continue` arm keeps one growing session across
+ * segments. `onTurn` runs after every step, so a run can stop between turns;
+ * throwing from it still shuts the child down.
  */
 async function memoryRpcRun({
   project,
@@ -4722,6 +4829,8 @@ async function memoryRpcRun({
   model,
   steps,
   disableMark = false,
+  continueSession = false,
+  onTurn,
 }) {
   const child = spawn(
     "pi",
@@ -4743,6 +4852,7 @@ async function memoryRpcRun({
       "--no-mcp",
       "--session-dir",
       sessionDir,
+      ...(continueSession ? ["--continue"] : []),
     ],
     {
       cwd: project,
@@ -4827,6 +4937,7 @@ async function memoryRpcRun({
       settleWaiters.push(waiter);
     });
   const errors = [];
+  let killed;
   try {
     for (const [index, step] of steps.entries()) {
       // Best-effort attribution: a tardy settle from a timed-out step can resolve the next wait.
@@ -4844,6 +4955,7 @@ async function memoryRpcRun({
       } catch (error) {
         errors.push(`step ${index}: ${error.message}`);
       }
+      if (onTurn) await onTurn();
     }
   } finally {
     child.stdin.end();
@@ -4851,8 +4963,10 @@ async function memoryRpcRun({
       let killTimer;
       const termTimer = setTimeout(() => {
         child.kill("SIGTERM");
+        killed = "SIGTERM";
         killTimer = setTimeout(() => {
           child.kill("SIGKILL");
+          killed = "SIGKILL";
           resolve();
         }, MEMORY_KILL_GRACE_MS);
       }, MEMORY_SHUTDOWN_TIMEOUT_MS);
@@ -4863,7 +4977,7 @@ async function memoryRpcRun({
       });
     });
   }
-  return { stderr, errors };
+  return { stderr, errors, killed };
 }
 
 /** The newest session JSONL under a session directory. */
@@ -5662,13 +5776,734 @@ async function runMemoryScenario(args) {
   }
 }
 
+// --- memory-horizon scenario -------------------------------------------------
+//
+// UniiChat's claims show over a long horizon, not in 32 turns, so this scenario
+// runs five segments of about sixteen turns. A segment is one Pi process, which
+// is what `/new` and a restart do.
+//
+// - `memory`: the project is listed in `memoryProjects`; every segment is a new
+//   session file in the same project store.
+// - `native-continue`: not listed, and each segment after the first passes
+//   `--continue`, so one session file grows and native compaction handles it.
+//   This is the fair baseline: the strongest continuity a Pi user can get.
+// - `native-fresh` (opt-in): not listed, a new session per segment. The floor,
+//   and excluded from any win rule.
+//
+// The arms share the fixture, the script, the Lead model, the delegations and
+// the native threshold, so the only difference is project memory. Phases 15-16
+// add the probe sets, the scoring and the full runs. See
+// docs/development/smoke-testing.md.
+
+/** Pi compacts when contextTokens > contextWindow - reserveTokens. */
+const MEMORY_HORIZON_NATIVE_THRESHOLD = 24_000;
+const MEMORY_HORIZON_RESERVE_TOKENS =
+  MEMORY_CONTEXT_WINDOW - MEMORY_HORIZON_NATIVE_THRESHOLD;
+/** The baseline must compact this often for the A/B to mean anything. */
+const MEMORY_HORIZON_MIN_NATIVE_COMPACTIONS = 8;
+/** At every memory-arm segment end this share of view nodes must be built. */
+const MEMORY_HORIZON_BUILT_NODE_SHARE = 0.95;
+const MEMORY_HORIZON_DEFAULT_RUNS = 2;
+const MEMORY_HORIZON_DEFAULT_MAX_COST = 3;
+/** `--quick` keeps the first turns of two segments, then three probes. */
+const MEMORY_HORIZON_QUICK_TURNS = 4;
+/**
+ * The estimate's per-turn constants, both recorded in
+ * `plans/unii-memory/results/`: the Lead figure is the phase 10 baseline's
+ * memory-arm Lead USD over its 32 fixed turns, and the compactor figure is the
+ * phase 12 bench's `thinking: low` arm (the shipped default) over the baseline
+ * store's 178 messages.
+ */
+const MEMORY_HORIZON_LEAD_USD_PER_TURN = 0.0566 / 32;
+const MEMORY_HORIZON_MESSAGES_PER_TURN = 178 / 32;
+const MEMORY_HORIZON_COMPACTOR_USD_PER_MESSAGE = 0.1923 / 178;
+
+/**
+ * Exact early values the horizon script plants in the user's own turns, never
+ * in a fixture file. The probes score them; phase 15 owns the probe sets.
+ */
+const HORIZON_FACTS = {
+  planPath: "plans/billing/HORIZON.md",
+  engine: "Postgres 16",
+  port: "5433",
+  forbiddenDatabase: "MySQL",
+  apiPrefix: "/v2",
+  errorLine:
+    "ERR_BILLING_PORT: expected 5432 but got 5433 in src/config.mjs:12",
+  phrase: "the billing spike is the only thing that matters this quarter",
+  retryLimit: "7",
+  flagName: "billing_v2_shadow",
+  correctedApiPrefix: "/v3",
+  correctedPort: "5434",
+};
+
+/** Thrown by the cost gate; the run stops and reports `incomplete`. */
+class HorizonBudgetExceeded extends Error {}
+
+/** Cheap bulk turns: about 7 KB of `emit.mjs` output each to summarize. */
+function horizonBulkSteps(count, offset) {
+  const topics = [
+    "billing",
+    "ledger",
+    "invoices",
+    "retries",
+    "audit",
+    "webhooks",
+    "tenants",
+    "exports",
+  ];
+  const asks = [
+    "Reply with the number of lines it printed and its last line.",
+    "Reply with the number of lines it printed, in one line.",
+    "Reply with the step number on its last line.",
+    "Reply with the token on its first line.",
+  ];
+  return Array.from({ length: count }, (_, index) => ({
+    prompt: `Run \`node scripts/emit.mjs ${topics[(offset + index) % topics.length]} 40\` and read no other file. ${asks[index % asks.length]}`,
+  }));
+}
+
+/**
+ * One segment's steps: the facts and delegations of segments 1-3 first, then
+ * cheap bulk. Segments 3 and 5 are where phase 15 asks its probe sets.
+ */
+function horizonSegment(segment) {
+  switch (segment) {
+    case 1:
+      return [
+        {
+          prompt: `Standing decision for this project: we run ${HORIZON_FACTS.engine} on port ${HORIZON_FACTS.port}, we never use ${HORIZON_FACTS.forbiddenDatabase}, and the API prefix is ${HORIZON_FACTS.apiPrefix}. Acknowledge in one short sentence and do not use tools.`,
+        },
+        {
+          prompt: `Keep this in mind too: ${HORIZON_FACTS.phrase}. Acknowledge in one line and do not use tools.`,
+        },
+        {
+          prompt: `The billing suite failed a minute ago with exactly this line: ${HORIZON_FACTS.errorLine}. Keep that line as it is and do not use tools.`,
+        },
+        {
+          prompt: `Write a short plan to ${HORIZON_FACTS.planPath} that records the standing decision and that exact error line. Use the write tool, then reply done.`,
+        },
+        {
+          prompt:
+            "Delegate one scout (definition scout, label scout-1) to inspect this project and report its file layout and what scripts/emit.mjs prints. Do not delegate further. When its result arrives, reply with its agent session id and its result ref.",
+          settles: 2,
+        },
+        ...horizonBulkSteps(11, 0),
+      ];
+    case 2:
+      return [
+        {
+          prompt: `Second decision: the billing client retries at most ${HORIZON_FACTS.retryLimit} times, and the feature flag for the new path is ${HORIZON_FACTS.flagName}. Acknowledge in one line and do not use tools.`,
+        },
+        {
+          prompt: `Append a '## Retries' section to ${HORIZON_FACTS.planPath} naming the retry limit and the flag. Use the edit tool.`,
+        },
+        {
+          prompt:
+            "Delegate one scout (definition scout, label scout-2) to inspect src/format.mjs and scripts/emit.mjs and report what they export and print. Do not delegate further. Reply done when delegated.",
+          settles: 2,
+        },
+        ...horizonBulkSteps(13, 6),
+      ];
+    case 3:
+      return [
+        {
+          prompt: `Correction: the API prefix is now ${HORIZON_FACTS.correctedApiPrefix}, not ${HORIZON_FACTS.apiPrefix}. Acknowledge in one line and do not use tools.`,
+        },
+        {
+          prompt: `Append a '## Prefix' section to ${HORIZON_FACTS.planPath} recording the prefix we use now. Use the edit tool.`,
+        },
+        {
+          prompt: `Delegate one reviewer (definition reviewer, label reviewer-1) to review ${HORIZON_FACTS.planPath} for correctness and missing cases. Do not delegate further; review directly. Reply done when delegated.`,
+          settles: 2,
+        },
+        ...horizonBulkSteps(13, 2),
+      ];
+    case 4:
+      return [
+        {
+          prompt: `Another correction: billing moved to port ${HORIZON_FACTS.correctedPort}, so ${HORIZON_FACTS.correctedApiPrefix} on ${HORIZON_FACTS.correctedPort} is current. Acknowledge in one line and do not use tools.`,
+        },
+        {
+          prompt: `Append a '## Port' section to ${HORIZON_FACTS.planPath} recording the port we use now. Use the edit tool.`,
+        },
+        ...horizonBulkSteps(14, 3),
+      ];
+    default:
+      return [
+        {
+          prompt: `Read ${HORIZON_FACTS.planPath} and reply with its section headings, in order.`,
+        },
+        ...horizonBulkSteps(15, 5),
+      ];
+  }
+}
+
+/** Three probes over the segment 1 facts, so `--quick` can score something. */
+function horizonQuickProbes() {
+  return [
+    {
+      name: "planPath",
+      prompt:
+        "Cold recall, no hints: what is the exact path of the plan file I asked you to write? Reply with just the path.",
+      contains: [HORIZON_FACTS.planPath],
+    },
+    {
+      name: "decision",
+      prompt:
+        "Cold recall, no hints: which database port did we decide to use, and which database did we forbid? Reply in one line.",
+      contains: [HORIZON_FACTS.port, HORIZON_FACTS.forbiddenDatabase],
+    },
+    {
+      name: "errorLine",
+      prompt:
+        "Cold recall, no hints: what exact error line did the billing suite fail with? Reply with just that line.",
+      contains: [HORIZON_FACTS.errorLine],
+    },
+  ];
+}
+
+/** The script: one step list per segment. Phase 15 adds the probe sets. */
+function horizonScript({ quick = false } = {}) {
+  if (!quick) return [1, 2, 3, 4, 5].map(horizonSegment);
+  const segments = [1, 2].map((segment) =>
+    horizonSegment(segment).slice(0, MEMORY_HORIZON_QUICK_TURNS),
+  );
+  const last = segments[segments.length - 1];
+  segments[segments.length - 1] = [
+    ...last,
+    ...horizonQuickProbes().map((probe) => ({ ...probe, probe: true })),
+  ];
+  return segments;
+}
+
+/** One turn's assumed cost: the Lead's calls plus the memory arm's compactor. */
+function horizonTurnCostUsd(arm) {
+  if (arm !== "memory") return MEMORY_HORIZON_LEAD_USD_PER_TURN;
+  return (
+    MEMORY_HORIZON_LEAD_USD_PER_TURN +
+    MEMORY_HORIZON_MESSAGES_PER_TURN * MEMORY_HORIZON_COMPACTOR_USD_PER_MESSAGE
+  );
+}
+
+/**
+ * The arms, run count and cost estimate for one invocation. The run count drops
+ * to 1 when the estimate for the requested one would exceed the cap.
+ */
+export function horizonPlan(args) {
+  const quick = args.quick ?? false;
+  const segments = horizonScript({ quick });
+  const arms =
+    args.arms ??
+    (args.withFresh
+      ? ["memory", "native-continue", "native-fresh"]
+      : ["memory", "native-continue"]);
+  const maxCost = args.maxCost ?? MEMORY_HORIZON_DEFAULT_MAX_COST;
+  const turns = segments.reduce((count, steps) => count + steps.length, 0);
+  const estimateUsd = (runs) =>
+    arms.reduce((total, arm) => total + horizonTurnCostUsd(arm), 0) *
+    turns *
+    runs;
+  const requested = args.runs ?? (quick ? 1 : MEMORY_HORIZON_DEFAULT_RUNS);
+  const reduced = requested > 1 && estimateUsd(requested) > maxCost;
+  const runs = reduced ? 1 : requested;
+  return {
+    quick,
+    segments,
+    arms,
+    turns,
+    runs,
+    maxCost,
+    reduced,
+    estimateUsd: estimateUsd(runs),
+  };
+}
+
+/** The cost assumptions behind the estimate, printed with it and in the report. */
+function horizonAssumptions(plan) {
+  return [
+    `Lead $${MEMORY_HORIZON_LEAD_USD_PER_TURN.toFixed(4)} per turn, from the phase 10 baseline memory arm ($0.0566 over 32 turns).`,
+    `compactor $${MEMORY_HORIZON_COMPACTOR_USD_PER_MESSAGE.toFixed(4)} per message at the phase 12 default (thinking low: $0.1923 over 178 messages) times ${MEMORY_HORIZON_MESSAGES_PER_TURN.toFixed(2)} messages per turn, so $${(MEMORY_HORIZON_MESSAGES_PER_TURN * MEMORY_HORIZON_COMPACTOR_USD_PER_MESSAGE).toFixed(4)} per memory-arm turn.`,
+    "A native arm is charged its Lead turns only: native summarization usage is not surfaced in the Lead session.",
+    "Sub-agent usage is not surfaced either, so the three delegations are not estimated.",
+    `Estimated $${plan.estimateUsd.toFixed(2)} for ${plan.arms.length} arms x ${plan.runs} run(s) x ${plan.turns} turns; the cap is $${plan.maxCost.toFixed(2)} and stops the run as incomplete.`,
+  ];
+}
+
+/** The estimate printed before `--yes` starts anything. */
+function memoryHorizonEstimate(plan) {
+  return [
+    "memory-horizon smoke estimate:",
+    `  arms: ${plan.arms.join(", ")} (${plan.runs} run(s) each)`,
+    `  script: ${plan.segments.length} segments, ${plan.turns} Lead turns (${plan.segments.map((steps) => steps.length).join(" + ")})`,
+    `  Lead and agents: ${MEMORY_LEAD_MODEL}`,
+    `  compactor: ${MEMORY_COMPACTOR_MODEL} (thinking low, the phase 12 default)`,
+    `  native compaction threshold: ${MEMORY_HORIZON_NATIVE_THRESHOLD} tokens`,
+    ...horizonAssumptions(plan).map((line) => `  ${line}`),
+    plan.reduced
+      ? "  --runs was reduced to 1: the estimate for the requested runs exceeds the cap"
+      : "",
+    "  real provider calls; the run is long and costs real usage",
+    "re-run with --yes to start",
+  ]
+    .filter((line) => line !== "")
+    .join("\n");
+}
+
+/**
+ * Real delegation needs the invoking Herdr workspace, exactly as
+ * `memory-quality` does: the isolated agent directory has to carry Herdr's Pi
+ * integration. Fail before any spend.
+ */
+async function requireHerdrWorkspace(realAgentDir) {
+  const integration = join(realAgentDir, "extensions", "herdr-agent-state.ts");
+  try {
+    await access(integration);
+  } catch {
+    throw new Error(
+      `memory-horizon delegates real agents and must run from a Herdr-managed Pi session: ${integration} is missing`,
+    );
+  }
+  return integration;
+}
+
+/**
+ * The cumulative cost gate. `--max-cost` is a hard stop, not advice: it is
+ * checked between turns, against everything the run has spent so far.
+ */
+function horizonBudget(maxCost) {
+  let spentBefore = 0;
+  let spent = 0;
+  return {
+    limit: maxCost,
+    get spent() {
+      return spent;
+    },
+    startRun: () => {
+      spentBefore = spent;
+    },
+    observe: (sessionCost) => {
+      spent = spentBefore + sessionCost;
+      if (spent > maxCost)
+        throw new HorizonBudgetExceeded(
+          `spent $${spent.toFixed(2)} over the $${maxCost.toFixed(2)} cap`,
+        );
+    },
+    settle: (armCost) => {
+      spent = spentBefore + armCost;
+    },
+  };
+}
+
+/** One session's own cost: the Lead's usage plus the compactor's estimated cost. */
+function memorySessionCost(entries) {
+  const lead = assistantUsages(entries).reduce(
+    (total, usage) => total + (usage.cost?.total ?? 0),
+    0,
+  );
+  return lead + compactorCost(compactorUsages(entries)).cost;
+}
+
+/** The entries a session file gained since the last read of it. */
+async function newSessionEntries(sessionDir, consumed) {
+  const sessionFile = await newestSessionFile(sessionDir);
+  if (!sessionFile) return { sessionFile: undefined, entries: [] };
+  const all = memoryJsonl(await readFile(sessionFile, "utf8"));
+  const from = consumed.get(sessionFile) ?? 0;
+  consumed.set(sessionFile, all.length);
+  return { sessionFile, entries: all.slice(from) };
+}
+
+/** One arm-run at the end of one segment: what the segment cost and built. */
+async function horizonSegmentEvidence({
+  sessionDir,
+  storeRoot,
+  consumed,
+  index,
+  steps,
+  run,
+}) {
+  const { sessionFile, entries } = await newSessionEntries(
+    sessionDir,
+    consumed,
+  );
+  const store = await memoryStoreStats(storeRoot);
+  return {
+    index: index + 1,
+    turns: steps.length,
+    sessionFile,
+    entries,
+    costUsd: memorySessionCost(entries),
+    leadCalls: assistantUsages(entries)
+      .map((usage) => ratioOf(usage))
+      .map((value) => value.total),
+    nativeCompactions: entries.filter((entry) => entry.type === "compaction")
+      .length,
+    killed: run.killed,
+    errors: run.errors,
+    store: store
+      ? {
+          viewBytes: store.viewBytes,
+          viewNodes: store.viewNodes,
+          unbuilt: store.unbuilt,
+          messages: store.messages,
+          builtShare: store.viewNodes
+            ? (store.viewNodes - store.unbuilt) / store.viewNodes
+            : 1,
+        }
+      : undefined,
+  };
+}
+
+/**
+ * One arm, one run: every segment against the same project, agent directory and
+ * session directory. `memory` and `native-fresh` start a new Pi process (and so
+ * a new session file) per segment; `native-continue` adds `--continue`.
+ */
+async function runHorizonArm({
+  arm,
+  run,
+  plan,
+  root,
+  extension,
+  extensions,
+  model,
+  realAgentDir,
+  herdrIntegration,
+  budget,
+}) {
+  const project = join(root, `${arm}-run${run}-project`);
+  const agentDir = join(root, `${arm}-run${run}-agent`);
+  const sessionDir = join(root, `${arm}-run${run}-sessions`);
+  await writeMemoryFixture(project, { horizon: true });
+  await mkdir(join(agentDir, "pi-herdsman"), { recursive: true });
+  await mkdir(join(agentDir, "agents"), { recursive: true });
+  await mkdir(join(agentDir, "extensions"), { recursive: true });
+  const realProject = await realpath(project);
+  await writeFile(
+    join(agentDir, "pi-herdsman", "config.json"),
+    `${JSON.stringify({ memoryProjects: arm === "memory" ? [realProject] : [] })}\n`,
+  );
+  for (const definition of ["scout", "reviewer"])
+    await writeFile(
+      join(agentDir, "agents", `${definition}.md`),
+      `---\nname: ${definition}\nbodyMode: append\nmodel: ${MEMORY_AGENT_MODEL}\nthinking: low\n---\n`,
+    );
+  await copyFile(join(realAgentDir, "auth.json"), join(agentDir, "auth.json"));
+  await copyFile(
+    join(realAgentDir, "models.json"),
+    join(agentDir, "models.json"),
+  );
+  await copyFile(
+    herdrIntegration,
+    join(agentDir, "extensions", "herdr-agent-state.ts"),
+  );
+  await mkdir(sessionDir, { recursive: true });
+  const storeRoot = join(
+    agentDir,
+    "pi-herdsman",
+    "memory",
+    memoryStoreKey(realProject),
+  );
+
+  const startedAt = Date.now();
+  const consumed = new Map();
+  // The cost gate needs the arm-run's running total: a continued session file
+  // already carries its earlier segments, so its cost replaces, not adds to,
+  // the totals of the segment files the other arms own.
+  const sessionCosts = new Map();
+  const segments = [];
+  const entries = [];
+  const errors = [];
+  let stderr = "";
+  let aborted = false;
+  budget.startRun();
+  for (const [index, steps] of plan.segments.entries()) {
+    let result = { errors: [], stderr: "", killed: undefined };
+    try {
+      result = await memoryRpcRun({
+        project,
+        agentDir,
+        sessionDir,
+        extension,
+        extensions,
+        model,
+        steps,
+        continueSession: arm === "native-continue" && index > 0,
+        onTurn: async () => {
+          const sessionFile = await newestSessionFile(sessionDir);
+          if (sessionFile)
+            sessionCosts.set(
+              sessionFile,
+              memorySessionCost(
+                memoryJsonl(await readFile(sessionFile, "utf8")),
+              ),
+            );
+          budget.observe(
+            [...sessionCosts.values()].reduce((total, cost) => total + cost, 0),
+          );
+        },
+      });
+    } catch (error) {
+      if (!(error instanceof HorizonBudgetExceeded)) throw error;
+      aborted = true;
+    }
+    const segment = await horizonSegmentEvidence({
+      sessionDir,
+      storeRoot,
+      consumed,
+      index,
+      steps,
+      run: result,
+    });
+    segments.push(segment);
+    entries.push(...segment.entries);
+    errors.push(...segment.errors);
+    stderr += result.stderr ?? "";
+    if (aborted) break;
+  }
+
+  budget.settle(segments.reduce((total, s) => total + s.costUsd, 0));
+  const facts = memoryRunFacts(entries);
+  const scored = segments.map((segment, index) =>
+    scoreMemoryProbes(
+      segment.entries,
+      facts,
+      plan.segments[index].filter((step) => step.probe),
+    ),
+  );
+  const probes = scored.flatMap((value) => value.probes);
+  const promptTokens = segments.flatMap((segment) => segment.leadCalls);
+  const builtShares = segments
+    .map((segment) => segment.store?.builtShare)
+    .filter((share) => share !== undefined);
+  const nativeCompactions = segments.reduce(
+    (total, segment) => total + segment.nativeCompactions,
+    0,
+  );
+  const issues = [
+    ...errors.map((error) => `turn: ${error}`),
+    ...segments
+      .filter((segment) => segment.killed === "SIGKILL")
+      .map((segment) => `segment ${segment.index} needed SIGKILL`),
+  ];
+  if (!aborted && segments.length !== plan.segments.length)
+    issues.push(`ran ${segments.length} of ${plan.segments.length} segments`);
+  if (
+    !plan.quick &&
+    arm === "native-continue" &&
+    nativeCompactions < MEMORY_HORIZON_MIN_NATIVE_COMPACTIONS
+  )
+    issues.push(
+      `native compactions ${nativeCompactions} below ${MEMORY_HORIZON_MIN_NATIVE_COMPACTIONS}`,
+    );
+  if (
+    arm === "memory" &&
+    builtShares.some((share) => share < MEMORY_HORIZON_BUILT_NODE_SHARE)
+  )
+    issues.push(
+      `a segment ended below ${MEMORY_HORIZON_BUILT_NODE_SHARE} built nodes`,
+    );
+  return {
+    arm,
+    run,
+    storeRoot,
+    sessionFile: segments.at(-1)?.sessionFile,
+    issues,
+    valid: issues.length === 0 && !aborted,
+    aborted,
+    costUsd: segments.reduce((total, segment) => total + segment.costUsd, 0),
+    nativeCompactions,
+    promptTokens: {
+      calls: promptTokens.length,
+      first: promptTokens[0] ?? 0,
+      last: promptTokens.at(-1) ?? 0,
+      max: promptTokens.length ? Math.max(...promptTokens) : 0,
+    },
+    leadCalls: promptTokens,
+    probes,
+    probeTotal: probes.reduce((total, probe) => total + probe.score, 0),
+    probeMax: probes.length,
+    wallMs: Date.now() - startedAt,
+    errors,
+    stderr: stderr.slice(-4000),
+    segments: segments.map(({ entries: _entries, ...rest }) => rest),
+  };
+}
+
+/** The horizon report's Markdown: one summary table, then one per segment. */
+export function memoryHorizonMarkdown(report) {
+  const rows = [
+    "| arm | run | valid | turns | cost USD | native compactions | built nodes | view bytes | probes | Lead prompt tokens first/last/max |",
+    "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+  ];
+  for (const arm of report.arms)
+    for (const result of report.results[arm] ?? []) {
+      const last = result.segments.at(-1);
+      rows.push(
+        `| ${arm} | ${result.run} | ${result.valid ? "yes" : "no"} | ${result.segments.reduce((total, segment) => total + segment.turns, 0)} | ${result.costUsd.toFixed(4)} | ${result.nativeCompactions} | ${last?.store ? last.store.builtShare.toFixed(3) : "n/a"} | ${last?.store?.viewBytes ?? "n/a"} | ${result.probeTotal}/${result.probeMax} | ${result.promptTokens.first}/${result.promptTokens.last}/${result.promptTokens.max} |`,
+      );
+    }
+  rows.push("");
+  rows.push(
+    "| arm | run | segment | turns | cost USD | native compactions | built nodes | view bytes |",
+  );
+  rows.push("| --- | --- | --- | --- | --- | --- | --- | --- |");
+  for (const arm of report.arms)
+    for (const result of report.results[arm] ?? [])
+      for (const segment of result.segments)
+        rows.push(
+          `| ${arm} | ${result.run} | ${segment.index} | ${segment.turns} | ${segment.costUsd.toFixed(4)} | ${segment.nativeCompactions} | ${segment.store ? segment.store.builtShare.toFixed(3) : "n/a"} | ${segment.store?.viewBytes ?? "n/a"} |`,
+        );
+  rows.push("");
+  for (const arm of report.arms)
+    for (const result of report.results[arm] ?? [])
+      if (result.issues.length)
+        rows.push(`- ${arm} run ${result.run}: ${result.issues.join("; ")}`);
+  rows.push("");
+  rows.push(
+    `spent $${report.spentUsd.toFixed(2)} of the $${report.maxCostUsd.toFixed(2)} cap${report.incomplete ? " (incomplete)" : ""}`,
+  );
+  return rows.join("\n");
+}
+
+/**
+ * The horizon arms and segments, the cost gate and the report skeleton. The
+ * probes, the scoring and the win rule arrive in phase 15.
+ */
+async function runMemoryHorizonScenario(args) {
+  const plan = horizonPlan(args);
+  const model = args.model ?? MEMORY_LEAD_MODEL;
+  const extensions = memorySmokeExtensions();
+  if (!args.yes) return { estimate: memoryHorizonEstimate(plan) };
+
+  const realAgentDir = join(homedir(), ".pi", "agent");
+  const herdrIntegration = await requireHerdrWorkspace(realAgentDir);
+  const root = await mkdtemp(
+    join(tmpdir(), "pi-herdsman-memory-horizon-smoke-"),
+  );
+  memoryLiveRoots.add(root);
+  installMemorySignalHandlers();
+  const extension = join(repoRoot, "extension", "index.ts");
+  const budget = horizonBudget(plan.maxCost);
+  const results = {};
+  try {
+    outer: for (let run = 1; run <= plan.runs; run++)
+      for (const arm of plan.arms) {
+        const result = await runHorizonArm({
+          arm,
+          run,
+          plan,
+          root,
+          extension,
+          extensions,
+          model,
+          realAgentDir,
+          herdrIntegration,
+          budget,
+        });
+        (results[arm] ??= []).push(result);
+        if (result.aborted) break outer;
+      }
+
+    const finished = Object.values(results).flat();
+    const passed = finished.every((result) => result.valid);
+    const report = {
+      scenario: "memory-horizon",
+      model,
+      compactorModel: MEMORY_COMPACTOR_MODEL,
+      agentModel: MEMORY_AGENT_MODEL,
+      extensions,
+      quick: plan.quick,
+      arms: plan.arms,
+      runs: plan.runs,
+      runsReduced: plan.reduced,
+      segmentsPerRun: plan.segments.length,
+      turnsPerSegment: plan.segments.map((steps) => steps.length),
+      turnsPerRun: plan.turns,
+      nativeThresholdTokens: MEMORY_HORIZON_NATIVE_THRESHOLD,
+      maxCostUsd: plan.maxCost,
+      estimatedUsd: plan.estimateUsd,
+      spentUsd: budget.spent,
+      incomplete: finished.some((result) => result.aborted),
+      passed,
+      assumptions: horizonAssumptions(plan),
+      notes: [
+        "A segment is one Pi process, so the memory arm gets a new session file in the same project store, while native-continue keeps one session and compacts natively.",
+        plan.quick
+          ? "--quick: two four-turn segments and three probes; the native compaction check is skipped, so this run does not judge the A/B."
+          : `native-continue must compact at least ${MEMORY_HORIZON_MIN_NATIVE_COMPACTIONS} times.`,
+        `The memory arm must end every segment with at least ${MEMORY_HORIZON_BUILT_NODE_SHARE} of its view nodes built (the phase 11 drain).`,
+        "Probe scores are phase 15's; this run scores only the --quick probe set.",
+      ],
+      results: Object.fromEntries(
+        Object.entries(results).map(([arm, runs]) => [
+          arm,
+          runs.map(({ stderr: _stderr, ...rest }) => rest),
+        ]),
+      ),
+      stepErrors: Object.fromEntries(
+        Object.entries(results).map(([arm, runs]) => [
+          arm,
+          runs.map((result) => result.errors),
+        ]),
+      ),
+      stderr: Object.fromEntries(
+        Object.entries(results).map(([arm, runs]) => [
+          arm,
+          runs.map((result) => result.stderr),
+        ]),
+      ),
+    };
+    report.markdown = memoryHorizonMarkdown(report);
+    const reportPath = join(
+      tmpdir(),
+      "pi-herdsman-memory-horizon-smoke-report.json",
+    );
+    await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+    // The continued arm copies one session file per segment, so keep each
+    // distinct file once: the copy happens at the end of the run, not at the
+    // segment end.
+    const seen = new Set();
+    const keepRuns = [];
+    for (const result of finished)
+      for (const segment of result.segments) {
+        if (!segment.sessionFile || seen.has(segment.sessionFile)) continue;
+        seen.add(segment.sessionFile);
+        keepRuns.push({
+          arm: `${result.arm}-run${result.run}-seg${segment.index}`,
+          storeRoot: result.storeRoot,
+          sessionFile: segment.sessionFile,
+        });
+      }
+    const keepPath = args.keep
+      ? await keepMemoryArtifacts(
+          args.keep,
+          "memory-horizon",
+          keepRuns,
+          reportPath,
+        )
+      : undefined;
+    return { report, reportPath, keepPath };
+  } finally {
+    memoryLiveRoots.delete(root);
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
 async function main() {
   const args = parseSmokeArgs(process.argv.slice(2));
-  if (args.scenario === "memory-cache" || args.scenario === "memory-quality") {
+  if (
+    args.scenario === "memory-cache" ||
+    args.scenario === "memory-quality" ||
+    args.scenario === "memory-horizon"
+  ) {
     const result =
       args.scenario === "memory-cache"
         ? await runMemoryCacheScenario(args)
-        : await runMemoryScenario(args);
+        : args.scenario === "memory-quality"
+          ? await runMemoryScenario(args)
+          : await runMemoryHorizonScenario(args);
     if (result.estimate) {
       console.log(result.estimate);
       return;

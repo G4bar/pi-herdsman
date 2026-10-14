@@ -38,6 +38,7 @@ npm run smoke -- chief-tree
 npm run smoke -- manager-recovery
 npm run smoke -- memory-cache --yes
 npm run smoke -- memory-quality --yes
+npm run smoke -- memory-horizon --yes
 ```
 
 `npm run smoke` runs the default `core` scenario. The harness creates a
@@ -60,7 +61,8 @@ propagation), `continuation` (persisted Pi-session continuation across managed
 generations), `chief-tree` (current Chief/session_tree behavior), `memory-cache`
 (the Anthropic view-mark cache measurement in an ordinary Lead session),
 `memory-quality` (project memory against native Pi compaction in an ordinary
-Lead session), and `manager-recovery`
+Lead session), `memory-horizon` (project memory against a continuing native Pi
+session over five segments), and `manager-recovery`
 (Manager delegation, review messaging, `stop_lead`, missing
 worktree reconstruction with exact Pi-session continuity, retained project
 messages across Manager turnover, and Herdr-driven project retirement).
@@ -99,15 +101,18 @@ Herdsman, copy normal Pi settings or extensions, or run as part of
 `npm run validate`. Run selected scenarios according to the change being
 verified; `npm run smoke` defaults to `core`.
 
-The `memory-cache` and `memory-quality` scenarios do not create their own
-nested Herdr session: the harness cannot drive a multi-turn ordinary Lead
-session, so they drive Pi in RPC mode with the Lead environment (an isolated
+The `memory-cache`, `memory-quality` and `memory-horizon` scenarios do not
+create their own nested Herdr session: the harness cannot drive a multi-turn
+ordinary Lead session, so they drive Pi in RPC mode with the Lead
+environment (an isolated
 `PI_CODING_AGENT_DIR`, `HERDR_ENV=1`, and no managed-agent identity) and load
 this worktree's `extension/index.ts` directly, so no build is needed. Delegation
 steps use the invoking Herdr workspace, so the real Pi agent directory must
 contain Herdr's `herdr-agent-state.ts` integration; the scenario copies it into
-the temporary agent directory. Both make real model calls and print a cost
-estimate; both refuse to start without `--yes`.
+the temporary agent directory. `memory-horizon` delegates real agents, so it is
+the one scenario that refuses to start, with a clear message, when that
+integration is missing. All three make real model calls and print a cost
+estimate; all three refuse to start without `--yes`.
 
 `memory-cache` measures the Anthropic-only view prefix mark by running the same
 fixture twice, once with the mark and once with
@@ -142,6 +147,50 @@ tracks context size rather than a broken prefix. The report also carries the
 recall probe scores, tokens, estimated cost, cache ratios, gate blocks and the
 unprompted zoom-before-act rate, plus a Markdown table for the PR.
 
+`memory-horizon` is the long-horizon A/B. UniiChat's claims show over days, not
+in 32 turns, so the script is five segments of about sixteen turns each (80
+turns). A segment is one `pi --mode rpc` process: that is what `/new` and a
+restart do. The fixture gives the Lead a cheap `scripts/emit.mjs <topic> <n>`
+that prints about 7 KB of log lines, so most turns cost context without a large
+file read, and it deliberately holds none of the facts the probes ask about:
+the early decisions, the error line and the user's own phrase are planted in the
+user's turns only. Three delegations (two scouts and a reviewer) run in the first
+three segments.
+
+- `memory`: the throwaway project is listed in `memoryProjects`, so every
+  segment is a new session file in the same project store.
+- `native-continue`: not listed, and every segment after the first passes
+  `--continue`, so one session file grows across the whole run and native
+  compaction handles it. This is the fair baseline, and the one the design has
+  to beat: it is the strongest continuity a Pi user gets by restarting with
+  `--continue`.
+- `native-fresh` (opt-in with `--with-fresh`): not listed, a new session per
+  segment. It is the floor for continuity and never enters a win rule.
+
+Flags: `--runs <n>` (default 2, and automatically 1 when the estimate exceeds
+the cap), `--arms <a,b>` (default `memory,native-continue`), `--max-cost <usd>`
+(default 3.00), `--quick`, `--yes` and `--keep <dir>`. The scenario prints an
+estimate built from per-turn cost constants recorded in
+`plans/unii-memory/results/` (the phase 10 baseline Lead cost per turn and the
+phase 12 `thinking: low` compactor cost per message), and starts nothing without
+`--yes`. `--max-cost` is a hard stop, not advice: the harness checks the
+cumulative cost between turns and reports the run as `incomplete` when it is
+exceeded. `--quick` runs two four-turn segments plus three probes instead of the
+full script, for harness debugging; it skips the compaction-count check and says
+so in the report.
+
+A run is valid only when no segment had a turn error or a stalled turn, no
+segment process needed SIGKILL, the `native-continue` arm recorded at least
+eight native compactions (the fixture sets `compaction.reserveTokens` for a
+threshold near 24k tokens), and every `memory` segment ended with at least 95%
+of its view nodes built, which is what the shutdown drain exists to keep. The
+report carries, per arm and run: validity and the issues behind it, cost per
+segment, Lead prompt tokens per call by turn index (to show the view stays
+bounded), native compactions per segment, and the memory store's built-node
+share and view bytes at each segment end. The probes, their scoring and the win
+rule arrive with the harness's next change; the JSON and Markdown report
+skeleton already carries the slots they fill.
+
 By default a run deletes its temporary root, taking the project store, the Lead
 session JSONL and per-node usage with it. Pass `--keep <dir>` to copy, per arm,
 the project memory store (`tree/`, `main/`, `view.json`), the Lead session JSONL
@@ -161,8 +210,9 @@ PI_HERDSMAN_SMOKE_EXTENSIONS="$HOME/.pi/agent/git/github.com/paoloanzn/pi-black/
 ```
 
 Each report is also written to
-`<tmp>/pi-herdsman-memory-cache-smoke-report.json` or
-`<tmp>/pi-herdsman-memory-quality-smoke-report.json`.
+`<tmp>/pi-herdsman-memory-cache-smoke-report.json`,
+`<tmp>/pi-herdsman-memory-quality-smoke-report.json` or
+`<tmp>/pi-herdsman-memory-horizon-smoke-report.json`.
 
 ## Runtime preflight
 
