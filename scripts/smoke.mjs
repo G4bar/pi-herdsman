@@ -61,6 +61,15 @@ export function parseScenario(args) {
   return scenario;
 }
 
+/** True when `path` resolves to or inside `directory`. */
+function insideDirectory(directory, path) {
+  const relativePath = relative(directory, path);
+  return (
+    relativePath === "" ||
+    (!relativePath.startsWith("..") && !isAbsolute(relativePath))
+  );
+}
+
 export function parseSmokeArgs(args) {
   const { values, positionals } = parseArgs({
     args,
@@ -107,12 +116,11 @@ export function parseSmokeArgs(args) {
       throw new Error(
         "--keep is only valid for memory-cache and memory-quality",
       );
-    const keepRelative = relative(repoRoot, resolve(values.keep));
-    if (
-      keepRelative === "" ||
-      (!keepRelative.startsWith("..") && !isAbsolute(keepRelative))
-    )
+    const keep = resolve(values.keep);
+    if (insideDirectory(repoRoot, keep))
       throw new Error("--keep must point outside the repository");
+    if (insideDirectory(join(homedir(), ".pi", "agent"), keep))
+      throw new Error("--keep must point outside the pi agent directory");
   }
   if (
     memoryScenario &&
@@ -1929,6 +1937,15 @@ export function initialPromptForScenario(scenario, ctx) {
   }
 }
 
+export function memoryScenarioOptions(ctx) {
+  return {
+    model: ctx.model,
+    yes: ctx.yes,
+    keep: ctx.keep,
+    allowAnthropic: ctx.allowAnthropic,
+  };
+}
+
 export async function runScenario(ctx, scenario) {
   markStage(ctx, scenario);
   switch (scenario) {
@@ -1941,9 +1958,9 @@ export async function runScenario(ctx, scenario) {
     case "manager-recovery":
       return runManagerRecoverySmoke(ctx);
     case "memory-cache":
-      return runMemoryCacheScenario({ model: ctx.model });
+      return runMemoryCacheScenario(memoryScenarioOptions(ctx));
     case "memory-quality":
-      return runMemoryScenario({ model: ctx.model });
+      return runMemoryScenario(memoryScenarioOptions(ctx));
     default:
       throw new Error(`unknown smoke scenario: ${scenario}`);
   }
@@ -4196,11 +4213,12 @@ function memoryStoreKey(project) {
  * Copies one store part into a `--keep` directory. A part the run never wrote
  * (for example an empty project has no `tree/`) is not an error.
  */
-async function copyIfExists(from, to) {
+export async function copyIfExists(from, to) {
   try {
     await cp(from, to, { recursive: true });
-  } catch {
-    // Missing store part.
+  } catch (error) {
+    if (error?.code === "ENOENT" || error?.code === "ENOTDIR") return;
+    throw error;
   }
 }
 
@@ -4220,6 +4238,48 @@ async function keepMemoryArtifacts(keep, scenario, runs, reportPath) {
     await copyFile(reportPath, join(directory, "report.json"));
   }
   return target;
+}
+
+/** Live memory child processes and temp roots, for signal cleanup. */
+const memoryLiveChildren = new Set();
+const memoryLiveRoots = new Set();
+let memorySignalHandlersInstalled = false;
+
+/**
+ * Kills live memory children and removes their temp roots, so an interrupt
+ * does not orphan a metered `pi` child or leak fixture/session/store files.
+ */
+export async function cleanupMemoryResources({ children, roots }) {
+  for (const child of children) {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // A child that already exited is fine.
+    }
+  }
+  await Promise.all(
+    roots.map((root) => rm(root, { recursive: true, force: true })),
+  );
+  return roots.length;
+}
+
+/** Registers the one-time SIGINT/SIGTERM guards for a memory run. */
+export function installMemorySignalHandlers() {
+  if (memorySignalHandlersInstalled) return;
+  memorySignalHandlersInstalled = true;
+  for (const [signal, code] of [
+    ["SIGINT", 130],
+    ["SIGTERM", 143],
+  ])
+    process.once(signal, () => {
+      const children = [...memoryLiveChildren];
+      const roots = [...memoryLiveRoots];
+      memoryLiveChildren.clear();
+      memoryLiveRoots.clear();
+      void cleanupMemoryResources({ children, roots }).finally(() =>
+        process.exit(code),
+      );
+    });
 }
 
 /** The environment an ordinary Lead runs with: no managed-agent identity. */
@@ -4506,6 +4566,8 @@ async function memoryRpcRun({
       stdio: ["pipe", "pipe", "pipe"],
     },
   );
+  memoryLiveChildren.add(child);
+  child.once("exit", () => memoryLiveChildren.delete(child));
   let stdoutBuffer = "";
   let stderr = "";
   let nextId = 0;
@@ -4583,6 +4645,7 @@ async function memoryRpcRun({
   const errors = [];
   try {
     for (const [index, step] of steps.entries()) {
+      // Best-effort attribution: a tardy settle from a timed-out step can resolve the next wait.
       const expected = settleCount + (step.settles ?? 1);
       const response = await send({ type: "prompt", message: step.prompt });
       if (!response.success)
@@ -5038,6 +5101,8 @@ async function runMemoryCacheScenario(args) {
   if (!args.yes) return { estimate: memoryCacheEstimate() };
 
   const root = await mkdtemp(join(tmpdir(), "pi-herdsman-memory-cache-smoke-"));
+  memoryLiveRoots.add(root);
+  installMemorySignalHandlers();
   const extension = join(repoRoot, "extension", "index.ts");
   const realAgentDir = join(homedir(), ".pi", "agent");
   // The arms run in a random order, so a warmed shared prefix cannot favor one.
@@ -5140,6 +5205,7 @@ async function runMemoryCacheScenario(args) {
       : undefined;
     return { report, reportPath, keepPath };
   } finally {
+    memoryLiveRoots.delete(root);
     await rm(root, { recursive: true, force: true });
   }
 }
@@ -5152,6 +5218,8 @@ async function runMemoryScenario(args) {
   if (!args.yes) return { estimate: memoryEstimate() };
 
   const root = await mkdtemp(join(tmpdir(), "pi-herdsman-memory-smoke-"));
+  memoryLiveRoots.add(root);
+  installMemorySignalHandlers();
   const extension = join(repoRoot, "extension", "index.ts");
   const realAgentDir = join(homedir(), ".pi", "agent");
   const arms =
@@ -5281,6 +5349,7 @@ async function runMemoryScenario(args) {
       : undefined;
     return { report, reportPath, keepPath };
   } finally {
+    memoryLiveRoots.delete(root);
     await rm(root, { recursive: true, force: true });
   }
 }
@@ -5332,6 +5401,9 @@ async function main() {
     sessionName: undefined,
     paths,
     model,
+    yes: args.yes,
+    keep: args.keep,
+    allowAnthropic: args.allowAnthropic,
     managerReadyTimeoutMs:
       args.managerReadyTimeoutMs ?? DEFAULT_MANAGER_READY_TIMEOUT_MS,
     managerRecoveryDiagnostics: args.managerRecoveryDiagnostics,

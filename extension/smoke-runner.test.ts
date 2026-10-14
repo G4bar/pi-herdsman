@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -43,6 +50,10 @@ import {
   waitForEvidence,
   parseHerdrOutput,
   parseSmokeArgs,
+  cleanupMemoryResources,
+  copyIfExists,
+  installMemorySignalHandlers,
+  memoryScenarioOptions,
   formatSmokeFailure,
   herdrErrorCode,
   managerDiagnosticLines,
@@ -536,6 +547,69 @@ test("memory smoke gates anthropic models and keeps artifacts outside the repo",
     () => parseSmokeArgs(["memory-cache", "--keep", join(repoRoot, ".keep")]),
     /--keep must point outside the repository/,
   );
+  assert.throws(
+    () =>
+      parseSmokeArgs([
+        "memory-cache",
+        "--keep",
+        join(homedir(), ".pi", "agent", "keep"),
+      ]),
+    /--keep must point outside the pi agent directory/,
+  );
+});
+
+test("runScenario forwards memory scenario options", () => {
+  assert.deepEqual(
+    memoryScenarioOptions({
+      model: "provider/model",
+      yes: true,
+      keep: "/tmp/keep",
+      allowAnthropic: true,
+    }),
+    {
+      model: "provider/model",
+      yes: true,
+      keep: "/tmp/keep",
+      allowAnthropic: true,
+    },
+  );
+});
+
+test("memory scenarios install one-time interrupt guards", () => {
+  const before = process.listenerCount("SIGTERM");
+  installMemorySignalHandlers();
+  assert.equal(process.listenerCount("SIGTERM"), before + 1);
+  installMemorySignalHandlers();
+  assert.equal(process.listenerCount("SIGTERM"), before + 1);
+});
+
+test("memory signal cleanup kills children and removes temp roots", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-herdsman-signal-"));
+  await writeFile(join(root, "session.jsonl"), "{}\n");
+  const killed = [];
+  const count = await cleanupMemoryResources({
+    children: [{ kill: (signal) => killed.push(signal) }],
+    roots: [root],
+  });
+  assert.deepEqual(killed, ["SIGKILL"]);
+  assert.equal(count, 1);
+  await assert.rejects(stat(root), /ENOENT/);
+});
+
+test("copyIfExists swallows missing parts but rethrows real failures", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-herdsman-copy-"));
+  const source = join(root, "tree");
+  await mkdir(source, { recursive: true });
+  await writeFile(join(source, "day.jsonl"), "{}\n");
+  const copied = join(root, "copy");
+  await copyIfExists(source, copied);
+  assert.equal(await readFile(join(copied, "day.jsonl"), "utf8"), "{}\n");
+  await copyIfExists(join(root, "absent"), join(root, "absent-copy"));
+  await assert.rejects(
+    copyIfExists(source, source),
+    (error) => error.code === "ERR_FS_CP_EINVAL",
+  );
+  await rm(root, { recursive: true, force: true });
 });
 
 test("manager-recovery timeout is bounded and scoped to its ready handshake", () => {
