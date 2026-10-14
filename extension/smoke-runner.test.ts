@@ -658,7 +658,7 @@ test("the gate report separates blocked, verbatim and zoom calls", () => {
   assert.equal(report.blocks, 2);
   assert.equal(report.inView, 5);
   assert.equal(report.blockedShare, 0.2);
-  assert.equal(report.verbatimBeforeAct, 4);
+  assert.equal(report.passedInView, 4);
   assert.equal(report.zoomSatisfied, 2);
   assert.equal(report.zoomShare, 0.4);
   // Every block is followed by a passing call to the same tool.
@@ -905,7 +905,7 @@ test("the memory report splits the Lead and compactor cost per arm", async () =>
   assert.equal(report.compactor.meanAttemptsPerCall, 2);
   assert.equal(report.cost, report.lead.cost + report.compactor.cost);
   assert.equal(report.gate.blockedShare, 1 / 3);
-  assert.equal(report.gate.verbatimBeforeAct, 2);
+  assert.equal(report.gate.passedInView, 2);
   assert.equal(report.gate.zoomShare, 1 / 3);
   assert.equal(report.gate.blockRecovered, true);
   assert.equal(report.store, undefined);

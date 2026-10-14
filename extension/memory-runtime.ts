@@ -148,7 +148,12 @@ type TurnCorpus = {
   lower: string;
   /** True when a `zoom` result is already earlier in this turn. */
   zoomed: boolean;
-  /** The part of the turn a value can have come from, in gate order. */
+  /**
+   * The part of the turn a value can have come from, in gate order. Together
+   * they cover `text`, so a value is in the corpus exactly when some part
+   * holds it.
+   */
+  system: string;
   zoom: string;
   user: string;
   tool: string;
@@ -158,7 +163,7 @@ type TurnCorpus = {
 type GateClass = "uuid" | "ref" | "path";
 
 /** Where the gate found a value verbatim, or that it did not. */
-type GateSource = "zoom" | "user" | "tool" | "none";
+type GateSource = "system" | "zoom" | "user" | "tool" | "none";
 
 /** One identifier an action relies on. */
 type GateCheck = { value: string; class: GateClass };
@@ -940,12 +945,14 @@ function turnCorpus(
   const zoom = zoomEntries.join("\n");
   const user = userEntries.join("\n");
   const tool = toolEntries.join("\n");
-  const text = `${systemPromptOf(ctx)}\n${zoom}\n${user}\n${tool}`;
+  const system = systemPromptOf(ctx);
+  const text = `${system}\n${zoom}\n${user}\n${tool}`;
   const corpus: TurnCorpus = {
     key,
     text,
     lower: text.toLowerCase(),
     zoomed,
+    system,
     zoom,
     user,
     tool,
@@ -969,6 +976,9 @@ function corpusSource(
   if (holds(corpus.zoom)) return "zoom";
   if (holds(corpus.user)) return "user";
   if (holds(corpus.tool)) return "tool";
+  // The system prompt is part of `corpus.text`, so `none` has to mean "no part
+  // holds it" for `source === "none"` to match `!inCorpus`.
+  if (holds(corpus.system)) return "system";
   return "none";
 }
 

@@ -1660,6 +1660,8 @@ const GATE_UUID = "11111111-1111-4111-8111-111111111111";
 /** A UUID with hex letters, so its case is observable. */
 const LETTER_UUID = "abcdefab-1234-4abc-8def-abcdefabcdef";
 const OTHER_UUID = "22222222-2222-4222-8222-222222222222";
+/** A UUID only the system prompt holds, so `system` is its only source. */
+const PROMPT_UUID = "33333333-3333-4333-8333-333333333333";
 
 function chained(texts: string[]): SessionEntry[] {
   const entries: SessionEntry[] = [];
@@ -2015,7 +2017,10 @@ test("a gate entry records each identifier and the zoomBefore state", async () =
 });
 
 test("a gate entry names the part of the turn that showed each identifier", async () => {
-  const { session, harness } = await gateSession(["opening"]);
+  const { session, harness } = await gateSession(
+    ["opening"],
+    `system prompt mentions ${PROMPT_UUID}`,
+  );
   pushEntry(
     session,
     gateToolResult(`zoomed ${GATE_UUID}`, "zoom", lastId(session)),
@@ -2042,11 +2047,20 @@ test("a gate entry names the part of the turn that showed each identifier", asyn
     task: "use result:nowhere#1",
   });
   assert.equal(blocked.block, true);
+  // The system prompt is part of the corpus, so a value only it holds passes
+  // and reports `system` rather than the `none` of a value the turn never saw.
+  assert.equal(
+    await harness.toolCall(session, "continue_agent", {
+      session: PROMPT_UUID,
+      task: "go",
+    }),
+    undefined,
+  );
   assert.deepEqual(
     gateEntries(harness).map((entry) =>
       entry.identifiers.map((identifier: any) => identifier.source),
     ),
-    [["zoom"], ["tool"], ["user"], ["none"]],
+    [["zoom"], ["tool"], ["user"], ["none"], ["system"]],
   );
   await harness.shutdown(session, "quit");
 });

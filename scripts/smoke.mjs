@@ -4934,6 +4934,9 @@ function leadCost(usages, measured) {
     cacheRead: tokens.cacheRead,
     cost: usages.reduce((total, usage) => total + (usage.cost?.total ?? 0), 0),
     // The measured set is what `turnRatio` reads, so the two sit together.
+    // `input` already excludes the cache-served tokens an Anthropic-style
+    // provider reports in `cacheRead`; a provider that folds them in would
+    // silently inflate this headline.
     uncachedInputPerCall: measured.length
       ? measuredTokens.input / measured.length
       : 0,
@@ -5006,8 +5009,9 @@ export function memoryGateReport(entries) {
     blocks: entries.filter((entry) => entry.blocked === true).length,
     inView: inView.length,
     blockedShare: inView.length ? blocked.length / inView.length : 0,
-    // The in-view calls that ran because the value was already verbatim.
-    verbatimBeforeAct: inView.length - blocked.length,
+    // The in-view calls that ran because their value was already verbatim in
+    // the turn; `zoomSatisfied` is a subset of these, not a separate group.
+    passedInView: inView.length - blocked.length,
     zoomSatisfied: zoomSatisfied.length,
     zoomShare: inView.length ? zoomSatisfied.length / inView.length : 0,
     blockRecovered,
@@ -5015,6 +5019,8 @@ export function memoryGateReport(entries) {
 }
 
 function estimatedCost(tokens) {
+  // `reasoning` is a subset of `output`, so it is priced inside it and never
+  // added again: a provider that reports them apart would undercount here.
   const price = MEMORY_MODEL_PRICE;
   return (
     (tokens.input * price.input +
@@ -5309,7 +5315,7 @@ export function memoryMarkdown(memory, native) {
   }
   rows.push("");
   rows.push(
-    `memory arm gate: ${memory.gate.blocks} blocked of ${memory.gate.entries} gated calls; ${memory.gate.inView} in-view calls: blockedShare ${memory.gate.blockedShare.toFixed(3)}, verbatimBeforeAct ${memory.gate.verbatimBeforeAct}, zoomShare ${memory.gate.zoomShare.toFixed(3)} (${memory.gate.zoomSatisfied} by zoom), blockRecovered ${memory.gate.blockRecovered}`,
+    `memory arm gate: ${memory.gate.blocks} blocked of ${memory.gate.entries} gated calls; ${memory.gate.inView} in-view calls: blockedShare ${memory.gate.blockedShare.toFixed(3)}, passedInView ${memory.gate.passedInView}, zoomShare ${memory.gate.zoomShare.toFixed(3)} (${memory.gate.zoomSatisfied} by zoom), blockRecovered ${memory.gate.blockRecovered}`,
   );
   rows.push("");
   rows.push(memoryStoreLine(memory.store));
