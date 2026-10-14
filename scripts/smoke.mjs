@@ -4174,7 +4174,12 @@ const MEMORY_NATIVE_THRESHOLD = 60_000;
 const MEMORY_RESERVE_TOKENS = MEMORY_CONTEXT_WINDOW - MEMORY_NATIVE_THRESHOLD;
 const MEMORY_TURN_TIMEOUT_MS = 240_000;
 const MEMORY_RESULT_TIMEOUT_MS = 180_000;
-const MEMORY_SHUTDOWN_TIMEOUT_MS = 60_000;
+/**
+ * How long a shutdown may take before the harness SIGTERMs it. It has to clear
+ * the extension's 20 s shutdown drain for in-flight compaction calls plus the
+ * kill grace below, or the drain is killed mid-flight and its node is lost.
+ */
+const MEMORY_SHUTDOWN_TIMEOUT_MS = 90_000;
 const MEMORY_KILL_GRACE_MS = 10_000;
 /** The native arm must compact at least this often for the A/B to mean anything. */
 const MEMORY_MIN_NATIVE_COMPACTIONS = 2;

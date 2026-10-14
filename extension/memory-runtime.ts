@@ -44,6 +44,7 @@ import {
   type ViewLine,
 } from "./memory.ts";
 import {
+  SHUTDOWN_DRAIN_MS,
   start as startMemoryCompactor,
   type MemoryCompactor,
   type MemoryCompactorFailure,
@@ -588,7 +589,7 @@ export function registerMemoryRuntime(
     if (event.reason === "threshold") return { cancel: true };
     return;
   });
-  pi.on("session_shutdown", (_event, ctx: ExtensionContext) => {
+  pi.on("session_shutdown", async (_event, ctx: ExtensionContext) => {
     // A session replacement tears this runtime down and re-runs the extension
     // factory, and quit or reload starts over from nothing: in every case the
     // next `session_start` is a new registration that claims the project lock
@@ -599,6 +600,24 @@ export function registerMemoryRuntime(
     if (memory && ctx) {
       memory.ctx = ctx;
       flush(memory);
+    }
+    if (memory) {
+      // Pi awaits this handler, so a build that is still running finishes and
+      // is appended before the store closes: quitting right after a turn is
+      // the normal way to end a session, and its last builds are exactly the
+      // ones a bare `stop()` would throw away and redo on the next start.
+      try {
+        await memory.compactor.drain(SHUTDOWN_DRAIN_MS, () => {
+          if (ctx?.hasUI)
+            notify(
+              ctx,
+              `finishing in-flight summaries (up to ${SHUTDOWN_DRAIN_MS / 1000} s)`,
+              "info",
+            );
+        });
+      } catch {
+        // A drain that fails still has to release the lock below.
+      }
     }
     deactivate();
     if (memory) options.onActiveChange?.();

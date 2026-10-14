@@ -949,3 +949,106 @@ test("whenSettled returns early when every remaining node has failed", () =>
     assert.equal(store.nodeText([0, 0]), undefined);
     compactor.stop();
   }));
+
+// --- shutdown drain ---------------------------------------------------------
+
+test("a drain appends a build that finishes inside its window", () =>
+  withProject(async (project, store) => {
+    addMessage(store, longText());
+    const registry = new FakeRegistry([makeModel("test", "lead")]);
+    registry.responder = () => {};
+    const compactor = start(store, fakeContext(registry, undefined, project));
+    await waitFor(() => registry.calls.length === 1);
+
+    let waited = 0;
+    const drained = compactor.drain(5_000, () => {
+      waited += 1;
+    });
+    assert.equal(waited, 1);
+    registry.calls[0]!.respond("built");
+    await drained;
+
+    assert.equal(store.nodeText([0, 0]), "built");
+    compactor.stop();
+  }));
+
+test("a drain launches nothing new, not even a merge that just became ready", () =>
+  withProject(async (project, store) => {
+    addMessage(store, "a".repeat(600));
+    addMessage(store, "b".repeat(600));
+    const registry = new FakeRegistry([makeModel("test", "lead")]);
+    registry.responder = () => {};
+    const compactor = start(store, fakeContext(registry, undefined, project));
+    await waitFor(() => registry.calls.length === 2);
+
+    const drained = compactor.drain(5_000);
+    // Both leaves settle during the drain; the merge they make ready waits.
+    registry.calls[0]!.respond("a".repeat(300));
+    registry.calls[1]!.respond("b".repeat(300));
+    await drained;
+    await tick();
+    await tick();
+
+    assert.equal(registry.calls.length, 2);
+    assert.equal(store.nodeText([1, 0]), undefined);
+    compactor.stop();
+  }));
+
+test("a call that outlives the drain is aborted and nothing partial lands", () =>
+  withProject(async (project, store) => {
+    addMessage(store, longText());
+    const registry = new FakeRegistry([makeModel("test", "lead")]);
+    registry.responder = () => {};
+    const compactor = start(store, fakeContext(registry, undefined, project));
+    await waitFor(() => registry.calls.length === 1);
+
+    await compactor.drain(0);
+    assert.equal(registry.calls[0]!.aborted, true);
+    assert.equal(store.nodeText([0, 0]), undefined);
+
+    // The aborted stream still ends; its late result must not be appended.
+    registry.calls[0]!.respond("too late");
+    await tick();
+    await tick();
+    assert.equal(store.nodeText([0, 0]), undefined);
+  }));
+
+test("a second drain joins the first instead of starting another wait", () =>
+  withProject(async (project, store) => {
+    addMessage(store, longText());
+    const registry = new FakeRegistry([makeModel("test", "lead")]);
+    registry.responder = () => {};
+    const compactor = start(store, fakeContext(registry, undefined, project));
+    await waitFor(() => registry.calls.length === 1);
+
+    const first = compactor.drain(5_000);
+    let second = 0;
+    assert.equal(
+      compactor.drain(5_000, () => {
+        second += 1;
+      }),
+      first,
+    );
+    registry.calls[0]!.respond("built");
+    await first;
+
+    assert.equal(second, 0);
+    assert.equal(store.nodeText([0, 0]), "built");
+    compactor.stop();
+  }));
+
+test("a drain with nothing in flight returns without waiting", () =>
+  withProject(async (project, store) => {
+    const registry = new FakeRegistry([makeModel("test", "lead")]);
+    const compactor = start(store, fakeContext(registry, undefined, project));
+
+    let waited = 0;
+    await compactor.drain(5_000, () => {
+      waited += 1;
+    });
+
+    assert.equal(waited, 0);
+    assert.equal(registry.calls.length, 0);
+    assert.equal(store.nodeText([0, 0]), undefined);
+    compactor.stop();
+  }));

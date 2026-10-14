@@ -49,6 +49,11 @@ export const MAX_LENGTH_RETRIES = 5;
 export const FAILURES_BEFORE_REPORT = 3;
 /** A node past the report threshold is retried only every 8th `onMessage`. */
 export const FAILED_RETRY_INTERVAL = 8;
+/**
+ * How long shutdown waits for the calls already in flight, before `stop()`
+ * aborts the rest and their results are dropped. Not configurable.
+ */
+export const SHUTDOWN_DRAIN_MS = 20_000;
 
 export type MemoryCompactorUsage = {
   line: ViewLine;
@@ -94,6 +99,14 @@ export type MemoryCompactor = {
    * or once every remaining one has failed.
    */
   whenSettled(upToIndex: number, signal?: AbortSignal): Promise<void>;
+  /**
+   * Launches nothing new and waits up to `timeoutMs` for the calls already in
+   * flight. A build that finishes is appended normally; the rest are aborted
+   * by a `stop()` at the end of the wait. `onWait` fires once, before the wait,
+   * and only when there was something to wait for. Idempotent, and safe to
+   * call before `stop()`.
+   */
+  drain(timeoutMs?: number, onWait?: () => void): Promise<void>;
   /** Aborts every call in flight. Nothing partial is appended. */
   stop(): void;
 };
@@ -163,6 +176,12 @@ class CompactorRunner implements MemoryCompactor {
   private retry: MemoryJob[] = [];
   private slots = 0;
   private stopped = false;
+  /**
+   * Shutdown has begun: `stop()` is next, so no further job is launched, not
+   * even a merge a finishing build just made ready. One wave only.
+   */
+  private draining = false;
+  private drainWait: Promise<void> | undefined;
   private pumping = false;
   private repump = false;
   private onMessages = 0;
@@ -188,7 +207,7 @@ class CompactorRunner implements MemoryCompactor {
   }
 
   onMessage(): void {
-    if (this.stopped) return;
+    if (this.stopped || this.draining) return;
     this.onMessages += 1;
     // A node that keeps failing is retried only every FAILED_RETRY_INTERVAL
     // messages, so an outage cannot spend every message on one broken node.
@@ -223,6 +242,44 @@ class CompactorRunner implements MemoryCompactor {
     }
   }
 
+  drain(
+    timeoutMs: number = SHUTDOWN_DRAIN_MS,
+    onWait?: () => void,
+  ): Promise<void> {
+    this.drainWait ??= this.awaitInFlight(timeoutMs, onWait);
+    return this.drainWait;
+  }
+
+  private async awaitInFlight(
+    timeoutMs: number,
+    onWait?: () => void,
+  ): Promise<void> {
+    // Set before the first `await`, so a launch already past its gate call
+    // sees it in the same tick.
+    this.draining = true;
+    if (this.slots === 0) return;
+    onWait?.();
+    const deadline = Date.now() + timeoutMs;
+    while (!this.stopped && this.slots > 0) {
+      const left = deadline - Date.now();
+      if (left <= 0) {
+        // The leftover calls outlived the bound: abort them as on any quit.
+        this.stop();
+        return;
+      }
+      await new Promise<void>((resolve) => {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const wake = () => {
+          this.waiters.delete(wake);
+          if (timer) clearTimeout(timer);
+          resolve();
+        };
+        timer = setTimeout(wake, left);
+        this.waiters.add(wake);
+      });
+    }
+  }
+
   stop(): void {
     if (this.stopped) return;
     this.stopped = true;
@@ -236,13 +293,13 @@ class CompactorRunner implements MemoryCompactor {
   // --- scheduling -----------------------------------------------------------
 
   pump(): void {
-    if (this.stopped) return;
+    if (this.stopped || this.draining) return;
     if (this.pumping) {
       this.repump = true;
       return;
     }
     this.pumping = true;
-    void this.drain().finally(() => {
+    void this.schedule().finally(() => {
       this.pumping = false;
       if (this.repump) {
         this.repump = false;
@@ -251,8 +308,12 @@ class CompactorRunner implements MemoryCompactor {
     });
   }
 
-  private async drain(): Promise<void> {
-    while (!this.stopped && this.slots < MAX_CONCURRENT_COMPACTIONS) {
+  private async schedule(): Promise<void> {
+    while (
+      !this.stopped &&
+      !this.draining &&
+      this.slots < MAX_CONCURRENT_COMPACTIONS
+    ) {
       const job = this.store.nextJob();
       if (!job) return;
       if (job.kind === "message" && !this.leafAllowed(job.id)) {
@@ -260,7 +321,7 @@ class CompactorRunner implements MemoryCompactor {
         return;
       }
       await this.gate();
-      if (this.stopped) {
+      if (this.stopped || this.draining) {
         this.store.requeueJob(job);
         return;
       }
@@ -357,6 +418,8 @@ class CompactorRunner implements MemoryCompactor {
       );
       return;
     }
+    // Only `stop()` drops a finished build: a drain lets it through the
+    // normal append, which writes the node line before `view.json`.
     if (this.stopped || !built) return;
     const text = this.markLossy(inputs, built.text);
     this.store.appendNode(line, text);

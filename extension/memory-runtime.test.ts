@@ -129,6 +129,22 @@ class FakeCompactor implements MemoryCompactor {
     this.messages += 1;
   }
 
+  /** How often the runtime drained this compactor. */
+  drained = 0;
+  /** When true, the drain reports that it has something to wait for. */
+  drainWaits = false;
+  /** When set, the drain rejects with it instead of resolving. */
+  drainError: Error | undefined;
+  /** When set, the drain stays pending until the test resolves it. */
+  drainGate: Promise<void> | undefined;
+
+  drain(_timeoutMs?: number, onWait?: () => void): Promise<void> {
+    this.drained += 1;
+    if (this.drainError) return Promise.reject(this.drainError);
+    if (this.drainWaits) onWait?.();
+    return this.drainGate ?? Promise.resolve();
+  }
+
   async whenSettled(upToIndex: number, signal?: AbortSignal): Promise<void> {
     this.settled.push(upToIndex);
     this.signals.push(signal);
@@ -156,6 +172,8 @@ class TestSession {
   entries: SessionEntry[];
   branch: SessionEntry[];
   signal: AbortSignal | undefined;
+  /** Whether the context claims a UI, which gates the user-visible notices. */
+  hasUI = false;
   /** The final system prompt the gate may count as seen. */
   systemPrompt = "";
   /** How often the gate read the prompt, so a corpus cache hit is visible. */
@@ -176,6 +194,7 @@ class TestSession {
   context(): ExtensionContext {
     const context = fakeContext(this.entries, this.branch);
     context.cwd = this.cwd;
+    context.hasUI = this.hasUI;
     context.ui = {
       ...context.ui,
       notify: (...args: unknown[]) => {
@@ -606,6 +625,76 @@ test("ownership follows the project and is released on shutdown", async () => {
   assert.equal(harness.compactors[1].stopped, true);
   const reopened = new MemoryStore(project);
   reopened.close();
+});
+
+test("shutdown waits for the drain before it releases the lock", async () => {
+  const project = projectDir();
+  withProjects([project]);
+  const session = new TestSession({ cwd: project, file: "/sessions/a.jsonl" });
+  const harness = new Harness();
+  await harness.sessionStart(session);
+  const compactor = harness.compactors[0]!;
+
+  let release: () => void = () => undefined;
+  compactor.drainGate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const shutdown = harness.shutdown(session, "quit");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  // The drain is still running, so the lock is still this session's.
+  assert.equal(compactor.drained, 1);
+  assert.equal(compactor.stopped, false);
+  assert.throws(() => new MemoryStore(project), ProcessLockOccupiedError);
+
+  release();
+  await shutdown;
+  assert.equal(compactor.stopped, true);
+  const reopened = new MemoryStore(project);
+  reopened.close();
+});
+
+test("a drain that rejects still releases the lock", async () => {
+  const project = projectDir();
+  withProjects([project]);
+  const session = new TestSession({ cwd: project, file: "/sessions/a.jsonl" });
+  const harness = new Harness();
+  await harness.sessionStart(session);
+  const compactor = harness.compactors[0]!;
+  compactor.drainError = new Error("drain failed");
+
+  await harness.shutdown(session, "quit");
+
+  assert.equal(compactor.drained, 1);
+  assert.equal(compactor.stopped, true);
+  const reopened = new MemoryStore(project);
+  reopened.close();
+});
+
+test("a drain that waits notifies once, and only with a UI", async () => {
+  for (const hasUI of [false, true]) {
+    const project = projectDir();
+    withProjects([project]);
+    const session = new TestSession({
+      cwd: project,
+      file: "/sessions/a.jsonl",
+    });
+    session.hasUI = hasUI;
+    const harness = new Harness();
+    await harness.sessionStart(session);
+    harness.compactors[0]!.drainWaits = true;
+
+    await harness.shutdown(session, "quit");
+
+    assert.equal(session.notices.length, hasUI ? 1 : 0, `hasUI=${hasUI}`);
+    if (hasUI) {
+      assert.equal(session.notices[0]!.type, "info");
+      assert.match(
+        session.notices[0]!.message,
+        /^finishing in-flight summaries/,
+      );
+    }
+  }
 });
 
 test("a replacement runtime re-acquires the released lock", async () => {

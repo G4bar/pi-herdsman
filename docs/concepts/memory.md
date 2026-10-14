@@ -62,6 +62,10 @@ definition layers, so a project or the user can give it a cheaper model. See
 
 Compaction costs about two model calls per logged message.
 
+Quitting, reloading, or replacing a session waits up to 20 seconds for the
+summaries still in flight, so the work already paid for is written instead of
+repeated; anything unfinished after that is rebuilt on the next start.
+
 Threshold compaction is cancelled in the owning session, because the view
 already replaces the history Pi would summarize. Overflow recovery and a manual
 `/compact` stay native, so Pi can still reduce context to make a request
