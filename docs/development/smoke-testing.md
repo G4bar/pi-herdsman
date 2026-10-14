@@ -56,7 +56,7 @@ managed descendants do not load the probe.
 The available scenarios are `core` (nested delegation and candidate-extension
 propagation), `continuation` (persisted Pi-session continuation across managed
 generations), `chief-tree` (current Chief/session_tree behavior), `memory`
-(cross-turn view caching in an ordinary Lead session), and `manager-recovery`
+(project memory against native Pi compaction in an ordinary Lead session), and `manager-recovery`
 (Manager delegation, review messaging, `stop_lead`, missing
 worktree reconstruction with exact Pi-session continuity, retained project
 messages across Manager turnover, and Herdr-driven project retirement).
@@ -95,32 +95,52 @@ Herdsman, copy normal Pi settings or extensions, or run as part of
 `npm run validate`. Run selected scenarios according to the change being
 verified; `npm run smoke` defaults to `core`.
 
-The `memory` scenario runs outside Herdr: the harness cannot drive a
-multi-turn ordinary Lead session, so it drives Pi in RPC mode with the Lead
-environment (an isolated `PI_CODING_AGENT_DIR` and `HERDR_ENV=1`, no managed
-mailbox) and loads this worktree's `extension/index.ts` directly, so no build is
-needed. It creates a throwaway project, lists it in `memoryProjects`, and gives
-it a cheap `compactor`. It drives a fixed script of prompts with an Anthropic
-Haiku model at thinking level `low`, once with the view cache mark and once with
-`PI_HERDSMAN_MEMORY_DISABLE_VIEW_MARK=1`, then reads the session file and the
-`pi-herdsman-memory-usage` entries. The two arms run in a random order, and the
-report records that order.
+The `memory` scenario does not create its own nested Herdr session: the harness
+cannot drive a multi-turn ordinary Lead session, so it drives Pi in RPC mode
+with the Lead environment (an isolated `PI_CODING_AGENT_DIR`, `HERDR_ENV=1`, and
+no managed-agent identity) and loads this worktree's `extension/index.ts`
+directly, so no build is needed. Delegation steps use the invoking Herdr
+workspace, so the real Pi agent directory must contain Herdr's
+`herdr-agent-state.ts` integration; the scenario copies it into the temporary
+agent directory.
+
+It runs two arms once each, in a random order:
+
+- `memory`: the throwaway project is listed in `memoryProjects`, so the Lead uses
+  project memory.
+- `native`: the project is not listed, so Pi compacts natively.
+
+Both arms share the fixture, the fixed script of prompts, the Lead model, a
+cheap `compactor` definition, and a project `.pi/settings.json` whose
+`compaction.reserveTokens` puts Pi's native threshold near 60k tokens. The script
+writes the exact early values the probes score, then spends the bulk on large
+fixture reads, test runs, a second and third delegation and a review, and ends
+with one cold recall probe per turn plus one `continue_agent` action probe that
+exercises the zoom gate. The run fails when the native arm records fewer than two
+compactions or when the memory arm's turn cache ratio is below 95%.
+
+The scenario makes real model calls and is expensive: two long Lead sessions,
+real delegated agents, and many compactor calls. It prints a cost estimate and
+refuses to start without `--yes`.
 
 `PI_HERDSMAN_SMOKE_EXTENSIONS` is a comma-separated list of extra `--extension`
-paths for the scenario. The direct Anthropic provider needs the user's provider
+paths for the scenario, for a `--model` override whose provider is not visible to
+the isolated run. The direct Anthropic provider needs the user's provider
 extension there (pi-black), because the isolated `--no-extensions` run does not
 discover it; the extension's own identity file (`~/.claude.json`) is read from
 the real home directory and never written. For example:
 
 ```sh
 PI_HERDSMAN_SMOKE_EXTENSIONS="$HOME/.pi/agent/git/github.com/paoloanzn/pi-black/extensions/pi-black.ts" \
-  npm run smoke -- memory --model anthropic/claude-haiku-4-5
+  npm run smoke -- memory --yes --model anthropic/claude-haiku-4-5
 ```
 
 The scenario prints a JSON report (also written to
-`<tmp>/pi-herdsman-memory-smoke-report.json`) with the turn and compaction
-cache-read ratios, the turn count, the batch merges, and the store and session
-bytes per message, and fails when the marked turn ratio is below 95%.
+`<tmp>/pi-herdsman-memory-smoke-report.json`) and a Markdown table for the PR:
+per arm the recall probe scores and total, turns, LLM calls, input/output/cache
+tokens, estimated cost, native compactions, turn and compaction cache ratios, and
+wall time. The memory arm also carries the gate block count and the unprompted
+zoom-before-act rate.
 
 ## Runtime preflight
 

@@ -65,6 +65,7 @@ export function parseSmokeArgs(args) {
     allowPositionals: true,
     options: {
       model: { type: "string" },
+      yes: { type: "boolean" },
       "manager-ready-timeout-ms": { type: "string" },
       "manager-recovery-diagnostics": { type: "boolean" },
     },
@@ -93,6 +94,7 @@ export function parseSmokeArgs(args) {
   return {
     scenario,
     model: values.model,
+    yes: values.yes ?? false,
     managerReadyTimeoutMs,
     managerRecoveryDiagnostics,
   };
@@ -4091,43 +4093,51 @@ function cleanupEvidence(owned) {
 // --- memory scenario ---------------------------------------------------------
 //
 // The smoke runner cannot drive a multi-turn ordinary Lead session, so this
-// scenario drives Pi in RPC mode with the Lead environment instead. See
-// docs/development/smoke-testing.md.
+// scenario drives Pi in RPC mode with the Lead environment instead. It runs two
+// arms once each: `memory` (the project is listed in `memoryProjects`, so the
+// Lead uses project memory) and `native` (the project is not listed, so Pi
+// compacts natively). Both arms share the script, the fixture, the Lead model,
+// the delegated agents and the native compaction threshold, so the only
+// difference is project memory. See docs/development/smoke-testing.md.
 
-// The mark is Anthropic-specific, so the measurement needs an Anthropic
-// Messages model. The direct Anthropic provider needs the user's provider
-// extension (pi-black) in the temp agent directory, passed through
-// PI_HERDSMAN_SMOKE_EXTENSIONS; override the model with `--model`.
-const MEMORY_DEFAULT_MODEL = "anthropic/claude-haiku-4-5";
+const MEMORY_LEAD_MODEL = "opencode-go/deepseek-v4.1-flash";
 const MEMORY_COMPACTOR_MODEL = "opencode-go/deepseek-v4.1-flash";
+const MEMORY_AGENT_MODEL = "opencode-go/deepseek-v4.1-flash";
+/** deepseek-v4.1-flash via opencode-go, USD per million tokens. */
+const MEMORY_MODEL_PRICE = {
+  input: 0.15,
+  output: 0.6,
+  cacheRead: 0.003,
+  cacheWrite: 0,
+};
+/** Pi compacts when contextTokens > contextWindow - reserveTokens. */
+const MEMORY_CONTEXT_WINDOW = 1_000_000;
+const MEMORY_NATIVE_THRESHOLD = 60_000;
+const MEMORY_RESERVE_TOKENS = MEMORY_CONTEXT_WINDOW - MEMORY_NATIVE_THRESHOLD;
 const MEMORY_TURN_TIMEOUT_MS = 240_000;
+const MEMORY_RESULT_TIMEOUT_MS = 180_000;
 const MEMORY_SHUTDOWN_TIMEOUT_MS = 60_000;
 const MEMORY_KILL_GRACE_MS = 10_000;
-const MEMORY_TURNS = [
-  "Reply with at least 900 characters of plain prose describing the number seven, and use no tools.",
-  "Reply with at least 900 characters of plain prose describing the number nine, and use no tools.",
-  "Reply with at least 900 characters of plain prose describing the number twelve, and use no tools.",
-  "Reply with at least 900 characters of plain prose describing the number fifteen, and use no tools.",
-  "Reply with at least 900 characters of plain prose describing the number twenty-one, and use no tools.",
-  "Reply with at least 900 characters of plain prose describing the number eighteen, and use no tools.",
-  "Reply with at least 900 characters of plain prose describing the number twenty-four, and use no tools.",
-  "Reply with at least 900 characters of plain prose describing the number thirty, and use no tools.",
-];
+/** The native arm must compact at least this often for the A/B to mean anything. */
+const MEMORY_MIN_NATIVE_COMPACTIONS = 2;
+const MEMORY_TARGET_TURN_RATIO = 0.95;
 
-/** The store directory key, matching `projectMemoryKey` in extension/memory.ts. */
-function memoryStoreKey(project) {
-  return createHash("sha256").update(project, "utf8").digest("hex").slice(0, 16);
-}
+/** Exact early values the recall probes score against. */
+const MEMORY_FACTS = {
+  planPath: "plans/billing/PLAN.md",
+  errorLine:
+    "ERR_BILLING_PORT: expected 5432 but got 5433 in src/config.mjs:12",
+};
 
 async function copyFile(from, to) {
   await writeFile(to, await readFile(from));
 }
 
-/** The environment an ordinary Lead runs with: no managed-agent mailbox. */
-function memoryLeadEnv(agentDir, disableMark) {
+/** The environment an ordinary Lead runs with: no managed-agent identity. */
+function memoryLeadEnv(agentDir) {
   const env = { ...process.env, PI_CODING_AGENT_DIR: agentDir, HERDR_ENV: "1" };
-  delete env.PI_HERDSMAN_MAILBOX;
-  if (disableMark) env.PI_HERDSMAN_MEMORY_DISABLE_VIEW_MARK = "1";
+  for (const key of Object.keys(env))
+    if (key.startsWith("PI_HERDSMAN_")) delete env[key];
   return env;
 }
 
@@ -4141,9 +4151,233 @@ function memorySmokeExtensions() {
     .filter((value) => value !== "");
 }
 
+/** One generated fixture module, large enough that a full read is real context. */
+function memoryLargeModule(index) {
+  const lines = [`// module ${index}: generated fixture`];
+  for (let i = 0; i < 350; i++)
+    lines.push(
+      `export function module${index}_${i}(value) { return value + ${i}; } // padding ${"x".repeat(48)}`,
+    );
+  return `${lines.join("\n")}\n`;
+}
+
+/** The suite prints a long output and one exact error line, then fails. */
+function memorySuiteSource() {
+  return [
+    "const lines = [];",
+    "for (let i = 0; i < 120; i++) lines.push(`[suite] case ${i} ok (${(i * 7) % 97} ms)`);",
+    'console.log(lines.join("\\n"));',
+    `console.log(${JSON.stringify(MEMORY_FACTS.errorLine)});`,
+    "process.exit(1);",
+    "",
+  ].join("\n");
+}
+
+/** The fixture both arms share. */
+async function writeMemoryFixture(project) {
+  await mkdir(join(project, ".pi", "agents"), { recursive: true });
+  await mkdir(join(project, "src"), { recursive: true });
+  await mkdir(join(project, "scripts"), { recursive: true });
+  await mkdir(join(project, "plans", "billing"), { recursive: true });
+  await writeFile(
+    join(project, ".pi", "settings.json"),
+    `${JSON.stringify({ compaction: { reserveTokens: MEMORY_RESERVE_TOKENS } }, null, 2)}\n`,
+  );
+  await writeFile(
+    join(project, ".pi", "agents", "compactor.md"),
+    `---\nname: compactor\nbodyMode: append\nmodel: ${MEMORY_COMPACTOR_MODEL}\nthinking: medium\n---\n`,
+  );
+  await writeFile(
+    join(project, "README.md"),
+    "# Billing fixture\n\nA small project used by the memory smoke scenario.\n",
+  );
+  await writeFile(
+    join(project, "src", "config.mjs"),
+    `export const port = 5433;\nexport const database = "postgres";\nexport const apiPrefix = "/v2";\n`,
+  );
+  for (let i = 1; i <= 8; i++)
+    await writeFile(
+      join(project, "src", `module-${i}.mjs`),
+      memoryLargeModule(i),
+    );
+  await writeFile(
+    join(project, "scripts", "run-suite.mjs"),
+    memorySuiteSource(),
+  );
+}
+
 /**
- * Drives one Pi RPC session through the fixed prompts and returns its stderr.
- * One JSON record per line, split on LF only; U+2028 can appear inside JSON.
+ * The fixed script. `settles` is how many `agent_settled` runs the step waits
+ * for: a delegation step waits for its own turn and the result-triggered turn.
+ */
+function memorySteps() {
+  return [
+    {
+      prompt:
+        "Standing decision for this project: use Postgres 16 on port 5433; never MySQL; the API prefix is /v2. Acknowledge in one short sentence and do not use tools.",
+    },
+    {
+      prompt:
+        "Write a short plan to the file plans/billing/PLAN.md that records the standing decision and the billing endpoints. Use the write tool, then reply done.",
+    },
+    {
+      prompt:
+        "Delegate one scout (definition scout, label scout-1) to inspect this project and report its file layout and the database configuration. Do not delegate further. When its result arrives, reply with its agent session id and its result ref.",
+      settles: 2,
+    },
+    {
+      prompt:
+        "Run `node scripts/run-suite.mjs` and reply with the exact error line it printed.",
+    },
+    {
+      prompt:
+        "Read src/module-1.mjs and src/module-2.mjs in full. Reply with the first line of each file.",
+    },
+    {
+      prompt:
+        "Read src/module-3.mjs and src/module-4.mjs in full. Reply with the first line of each file.",
+    },
+    {
+      prompt:
+        "Run `node scripts/run-suite.mjs` again and reply with the last line it printed.",
+    },
+    {
+      prompt:
+        "Read src/module-5.mjs and src/module-6.mjs in full. Reply with one exported symbol per file.",
+    },
+    {
+      prompt:
+        "Read src/module-7.mjs and src/module-8.mjs in full. Reply with one exported symbol per file.",
+    },
+    {
+      prompt:
+        "Append a section titled '## Modules' to plans/billing/PLAN.md listing src/module-1.mjs through src/module-8.mjs. Use the edit tool.",
+    },
+    {
+      prompt:
+        "Delegate a scout (definition scout, label scout-2) to inspect src/config.mjs and scripts/run-suite.mjs and report how the port is configured. Do not delegate further. Reply done when delegated.",
+      settles: 2,
+    },
+    {
+      prompt:
+        "Read src/module-1.mjs and src/module-3.mjs in full. Reply with one exported symbol per file.",
+    },
+    {
+      prompt:
+        "Run `node scripts/run-suite.mjs` and reply with one line from its output that names the port.",
+    },
+    {
+      prompt:
+        "Read src/module-2.mjs and src/module-4.mjs in full. Reply with one exported symbol per file.",
+    },
+    {
+      prompt:
+        "Delegate a reviewer (definition reviewer, label reviewer-1) to review plans/billing/PLAN.md for correctness and missing cases. Do not delegate further; review directly. Reply done when delegated.",
+      settles: 2,
+    },
+    {
+      prompt:
+        "Read src/module-5.mjs and src/module-7.mjs in full. Reply with one exported symbol per file.",
+    },
+    {
+      prompt:
+        "Edit src/config.mjs to add the comment line '// billing port' above the port export. Use the edit tool.",
+    },
+    {
+      prompt:
+        "Run `node scripts/run-suite.mjs` after the change and reply with the exit code you observed.",
+    },
+    {
+      prompt:
+        "Read src/module-6.mjs and src/module-8.mjs in full. Reply with one exported symbol per file.",
+    },
+    {
+      prompt:
+        "Summarize in 5 bullets what this project is, from src/ and scripts/.",
+    },
+    {
+      prompt:
+        "Read src/module-1.mjs and src/module-2.mjs in full. Reply with one exported symbol per file.",
+    },
+    {
+      prompt:
+        "Append a '## Validation' section to plans/billing/PLAN.md naming scripts/run-suite.mjs. Use the edit tool.",
+    },
+    {
+      prompt:
+        "Read src/module-3.mjs and src/module-4.mjs in full. Reply with one exported symbol per file.",
+    },
+    {
+      prompt:
+        "Read src/module-5.mjs and src/module-6.mjs in full. Reply with one exported symbol per file.",
+    },
+    {
+      prompt:
+        "Read src/module-7.mjs and src/module-8.mjs in full. Reply with one exported symbol per file.",
+    },
+    {
+      prompt: "Reply with a short status: what is running, and what is left.",
+    },
+  ];
+}
+
+/**
+ * The last turns: one cold probe per turn, asked with no hints. `contains` is a
+ * list of exact strings, or a function of the run facts, that the reply must
+ * contain. `action` probes score the `continue_agent` call instead.
+ */
+function memoryProbes() {
+  return [
+    {
+      name: "planPath",
+      prompt:
+        "Cold recall, no hints: what is the exact path of the plan file I asked you to write earlier? Reply with just the path.",
+      contains: [MEMORY_FACTS.planPath],
+    },
+    {
+      name: "scoutSession",
+      prompt:
+        "Cold recall, no hints: what was the agent session id of the first scout you delegated? Reply with just the id.",
+      contains: (facts) => [facts.firstScoutSession],
+    },
+    {
+      name: "scoutRef",
+      prompt:
+        "Cold recall, no hints: what result ref did the first scout's result carry? Reply with just the ref.",
+      contains: (facts) => [facts.firstScoutRef],
+    },
+    {
+      name: "decision",
+      prompt:
+        "Cold recall, no hints: which database port did we decide to use, and which database did we forbid? Reply in one line.",
+      contains: ["5433", "MySQL"],
+    },
+    {
+      name: "errorLine",
+      prompt:
+        "Cold recall, no hints: what exact error line did the test suite print when you ran it early on? Reply with just that line.",
+      contains: [MEMORY_FACTS.errorLine],
+    },
+    {
+      name: "continueFirstScout",
+      prompt:
+        "Continue the first scout with: reply with the single word DONE and nothing else. Use continue_agent with its exact session id.",
+      action: true,
+    },
+  ];
+}
+
+/** The full ordered script: fixed turns, then the probes. */
+function memoryScript() {
+  return [
+    ...memorySteps().map((step) => ({ ...step, probe: false })),
+    ...memoryProbes().map((step) => ({ ...step, probe: true })),
+  ];
+}
+
+/**
+ * Drives one Pi RPC session through the script and returns its stderr. One JSON
+ * record per line, split on LF only; U+2028 can appear inside JSON.
  */
 async function memoryRpcRun({
   project,
@@ -4152,8 +4386,7 @@ async function memoryRpcRun({
   extension,
   extensions,
   model,
-  prompts,
-  disableMark,
+  steps,
 }) {
   const child = spawn(
     "pi",
@@ -4178,13 +4411,14 @@ async function memoryRpcRun({
     ],
     {
       cwd: project,
-      env: memoryLeadEnv(agentDir, disableMark),
+      env: memoryLeadEnv(agentDir),
       stdio: ["pipe", "pipe", "pipe"],
     },
   );
   let stdoutBuffer = "";
   let stderr = "";
   let nextId = 0;
+  let settleCount = 0;
   const pending = new Map();
   const settleWaiters = [];
   const onRecord = (record) => {
@@ -4195,8 +4429,10 @@ async function memoryRpcRun({
         resolve(record);
       }
     } else if (record.type === "agent_settled") {
-      const resolve = settleWaiters.shift();
-      if (resolve) resolve(record);
+      settleCount += 1;
+      for (let i = settleWaiters.length - 1; i >= 0; i--)
+        if (settleWaiters[i].count <= settleCount)
+          settleWaiters.splice(i, 1)[0].settle();
     }
   };
   child.stdout.setEncoding("utf8");
@@ -4231,24 +4467,45 @@ async function memoryRpcRun({
       });
       child.stdin.write(`${JSON.stringify({ ...command, id })}\n`);
     });
-  const waitSettled = () =>
+  const waitForSettles = (count, timeoutMs) =>
     new Promise((resolve, reject) => {
-      const timer = setTimeout(
-        () => reject(new Error("agent_settled timed out")),
-        MEMORY_TURN_TIMEOUT_MS,
-      );
-      settleWaiters.push((record) => {
-        clearTimeout(timer);
-        resolve(record);
-      });
+      if (settleCount >= count) return resolve();
+      const waiter = {
+        count,
+        settle: () => {
+          clearTimeout(waiter.timer);
+          resolve();
+        },
+        timer: undefined,
+      };
+      waiter.timer = setTimeout(() => {
+        const index = settleWaiters.indexOf(waiter);
+        if (index >= 0) settleWaiters.splice(index, 1);
+        reject(
+          new Error(
+            `agent_settled ${count} timed out after ${settleCount} settles`,
+          ),
+        );
+      }, timeoutMs);
+      settleWaiters.push(waiter);
     });
+  const errors = [];
   try {
-    for (const message of prompts) {
-      const settled = waitSettled();
-      const response = await send({ type: "prompt", message });
+    for (const [index, step] of steps.entries()) {
+      const expected = settleCount + (step.settles ?? 1);
+      const response = await send({ type: "prompt", message: step.prompt });
       if (!response.success)
         throw new Error(`prompt rejected: ${response.error ?? "unknown"}`);
-      await settled;
+      try {
+        await waitForSettles(
+          expected,
+          step.settles === 2
+            ? MEMORY_RESULT_TIMEOUT_MS
+            : MEMORY_TURN_TIMEOUT_MS,
+        );
+      } catch (error) {
+        errors.push(`step ${index}: ${error.message}`);
+      }
     }
   } finally {
     child.stdin.end();
@@ -4268,7 +4525,7 @@ async function memoryRpcRun({
       });
     });
   }
-  return { stderr };
+  return { stderr, errors };
 }
 
 /** The newest session JSONL under a session directory. */
@@ -4294,7 +4551,13 @@ function ratioOf(usage) {
   const cacheRead = usage.cacheRead ?? 0;
   const cacheWrite = usage.cacheWrite ?? 0;
   const total = input + cacheRead + cacheWrite;
-  return { input, cacheRead, cacheWrite, total, ratio: total ? cacheRead / total : 0 };
+  return {
+    input,
+    cacheRead,
+    cacheWrite,
+    total,
+    ratio: total ? cacheRead / total : 0,
+  };
 }
 
 /** Sums one usage list into the cache-read ratio the phase defines. */
@@ -4309,119 +4572,324 @@ function summedRatio(usages) {
   return { cacheRead, total, ratio: total ? cacheRead / total : 0 };
 }
 
-/** One run's turn, compaction and disk numbers. */
-async function memoryRunReport(run) {
-  const assistant = run.entries.filter(
-    (entry) =>
-      entry.type === "message" &&
-      entry.message?.role === "assistant" &&
-      entry.message.usage,
+function summedTokens(usages) {
+  const sum = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+  for (const usage of usages) {
+    sum.input += usage.input ?? 0;
+    sum.output += usage.output ?? 0;
+    sum.cacheRead += usage.cacheRead ?? 0;
+    sum.cacheWrite += usage.cacheWrite ?? 0;
+  }
+  return sum;
+}
+
+function estimatedCost(tokens) {
+  const price = MEMORY_MODEL_PRICE;
+  return (
+    (tokens.input * price.input +
+      tokens.output * price.output +
+      tokens.cacheRead * price.cacheRead +
+      tokens.cacheWrite * price.cacheWrite) /
+    1e6
   );
-  const usage = run.entries.filter(
-    (entry) =>
-      entry.type === "custom" && entry.customType === "pi-herdsman-memory-usage",
-  );
-  const gate = run.entries.filter(
+}
+
+function assistantUsages(entries) {
+  return entries
+    .filter(
+      (entry) =>
+        entry.type === "message" &&
+        entry.message?.role === "assistant" &&
+        entry.message.usage,
+    )
+    .map((entry) => entry.message.usage);
+}
+
+function compactorUsages(entries) {
+  return entries
+    .filter(
+      (entry) =>
+        entry.type === "custom" &&
+        entry.customType === "pi-herdsman-memory-usage",
+    )
+    .map((entry) => entry.data);
+}
+
+function gateEntries(entries) {
+  return entries.filter(
     (entry) =>
       entry.type === "custom" && entry.customType === "pi-herdsman-memory-gate",
   );
-  // The run's first call writes the cache; every later call is measured.
-  const turns = assistant.slice(1).map((entry) => ratioOf(entry.message.usage));
-  const compactions = usage.map((entry) => ratioOf(entry.data));
+}
 
-  let storeBytes = 0;
-  let memoryMessages = 0;
-  let batchMerges = 0;
-  const walk = async (path, kind) => {
-    let entries;
-    try {
-      entries = await readdir(path, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const entry of entries) {
-      const child = join(path, entry.name);
-      if (entry.isDirectory()) {
-        await walk(child, entry.name);
-        continue;
-      }
-      const content = await readFile(child, "utf8");
-      storeBytes += Buffer.byteLength(content, "utf8");
-      for (const line of content.split("\n")) {
-        if (line === "") continue;
-        let record;
-        try {
-          record = JSON.parse(line);
-        } catch {
-          continue;
-        }
-        if (kind === "main") memoryMessages += 1;
-        else if (kind === "tree" && typeof record.l === "number" && record.l > 0)
-          batchMerges += 1;
-      }
-    }
-  };
-  await walk(run.storeRoot, "");
-
-  const sessionBytes = Buffer.byteLength(
-    await readFile(run.sessionFile, "utf8"),
-    "utf8",
+/** The facts the recall probes need, read back from the session. */
+function memoryRunFacts(entries) {
+  const results = entries.filter(
+    (entry) =>
+      entry.type === "custom_message" &&
+      entry.customType === "pi-herdsman-agent-result",
   );
-  const sessionMessages = run.entries.filter(
-    (entry) => entry.type === "message",
-  ).length;
-
+  const firstScout = results.find((entry) =>
+    /agent=scout/.test(String(entry.content ?? "")),
+  );
+  const content = firstScout ? String(firstScout.content) : "";
   return {
-    turns: turns.length,
-    turnRatio: summedRatio(assistant.slice(1).map((e) => e.message.usage)),
-    compactionRatio: summedRatio(usage.map((e) => e.data)),
-    perTurn: turns,
-    compactions: compactions.length,
-    gateEntries: gate.length,
-    batchMerges,
-    memoryMessages,
-    sessionMessages,
-    storeBytes,
-    sessionBytes,
-    storeBytesPerMessage: memoryMessages ? storeBytes / memoryMessages : 0,
-    sessionBytesPerMessage: sessionMessages
-      ? sessionBytes / sessionMessages
-      : 0,
+    firstScoutSession: /session=([0-9a-f-]{36})/i.exec(content)?.[1],
+    firstScoutRef: /Result ref:\s*(result:[a-z][a-z0-9_-]*#\d+)/.exec(
+      content,
+    )?.[1],
   };
 }
 
+/** The assistant text after the last user message whose text is `prompt`. */
+function replyAfter(entries, prompt) {
+  let start = -1;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (
+      entry.type === "message" &&
+      entry.message?.role === "user" &&
+      messageText(entry.message.content) === prompt
+    ) {
+      start = i;
+      break;
+    }
+  }
+  if (start < 0) return "";
+  const parts = [];
+  for (let i = start + 1; i < entries.length; i++) {
+    const entry = entries[i];
+    if (entry.type === "message" && entry.message?.role === "user") break;
+    if (entry.type !== "message" || entry.message?.role !== "assistant")
+      continue;
+    for (const block of entry.message.content ?? [])
+      if (block?.type === "text" && block.text) parts.push(block.text);
+  }
+  return parts.join("\n");
+}
+
+/**
+ * The action probe: the last `continue_agent` attempt that used the exact first
+ * scout session scores 1 when the gate did not block it.
+ */
+function continueProbeScore(entries, session) {
+  if (!session) return { score: 0, note: "no first scout session recorded" };
+  const calls = [];
+  for (const entry of entries) {
+    if (entry.type !== "message" || entry.message?.role !== "assistant")
+      continue;
+    for (const block of entry.message.content ?? [])
+      if (
+        block?.type === "toolCall" &&
+        block.name === "continue_agent" &&
+        block.arguments?.session === session
+      )
+        calls.push(block.id);
+  }
+  if (calls.length === 0)
+    return { score: 0, note: "continue_agent never used the exact session" };
+  const last = calls[calls.length - 1];
+  const result = entries.find(
+    (entry) =>
+      entry.type === "message" &&
+      entry.message?.role === "toolResult" &&
+      entry.message.toolCallId === last,
+  );
+  if (!result) return { score: 0, note: "no result for the last attempt" };
+  const text = messageText(result.message.content);
+  const blocked = result.message.isError === true && /blocked:/.test(text);
+  return {
+    score: blocked ? 0 : 1,
+    note: blocked ? "last attempt blocked by the gate" : "last attempt ran",
+  };
+}
+
+/** Scores every probe for one arm. */
+function scoreMemoryProbes(entries, facts, probes) {
+  const scored = probes.map((probe) => {
+    if (probe.action) {
+      const value = continueProbeScore(entries, facts.firstScoutSession);
+      return { name: probe.name, score: value.score, note: value.note };
+    }
+    const expected = (
+      typeof probe.contains === "function"
+        ? probe.contains(facts)
+        : probe.contains
+    ).filter((value) => typeof value === "string" && value !== "");
+    const reply = replyAfter(entries, probe.prompt);
+    const missing = expected.filter((value) => !reply.includes(value));
+    return {
+      name: probe.name,
+      score: expected.length > 0 && missing.length === 0 ? 1 : 0,
+      note:
+        expected.length === 0
+          ? "no expected value recorded"
+          : missing.length === 0
+            ? "matched"
+            : `missing ${missing.length}`,
+    };
+  });
+  return {
+    probes: scored,
+    total: scored.reduce((sum, probe) => sum + probe.score, 0),
+    maxTotal: scored.length,
+  };
+}
+
+/** One arm's step, token, compaction, cache and gate numbers. */
+function memoryRunReport(run, scored) {
+  const usages = assistantUsages(run.entries);
+  const compactor = compactorUsages(run.entries);
+  const gate = gateEntries(run.entries);
+  // The run's first call writes the cache; every later call is measured.
+  const measuredTurns = usages.slice(1);
+  const leadTokens = summedTokens(usages);
+  const compactorTokens = summedTokens(compactor);
+  const leadCost = usages.reduce(
+    (sum, usage) => sum + (usage.cost?.total ?? 0),
+    0,
+  );
+  const nativeCompactions = run.entries.filter(
+    (entry) => entry.type === "compaction",
+  ).length;
+  const inView = gate.filter((entry) =>
+    (entry.data?.identifiers ?? []).some((identifier) => identifier.inView),
+  );
+  const zoomBeforeInView = inView.filter(
+    (entry) => entry.data?.zoomBefore === true,
+  );
+  return {
+    turns: run.turns,
+    llmCalls: usages.length,
+    nativeCompactions,
+    leadTokens,
+    compactorCalls: compactor.length,
+    compactorTokens,
+    leadCost,
+    compactorCost: estimatedCost(compactorTokens),
+    cost: leadCost + estimatedCost(compactorTokens),
+    turnRatio: summedRatio(measuredTurns),
+    compactionRatio: summedRatio(compactor),
+    wallMs: run.wallMs,
+    probes: scored.probes,
+    probeTotal: scored.total,
+    probeMax: scored.maxTotal,
+    gate: {
+      entries: gate.length,
+      blocks: gate.filter((entry) => entry.data?.blocked === true).length,
+      inView: inView.length,
+      zoomBeforeInView: zoomBeforeInView.length,
+      zoomBeforeActRate: inView.length
+        ? zoomBeforeInView.length / inView.length
+        : 0,
+    },
+  };
+}
+
+/** The Markdown table pasted into the PR description. */
+function memoryMarkdown(memory, native) {
+  const rows = [
+    "| arm | probe total | turns | LLM calls | input | output | cache read | cost USD | native compactions | turn cache | compaction cache | wall s |",
+    "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+  ];
+  for (const [name, arm] of [
+    ["memory", memory],
+    ["native", native],
+  ]) {
+    const tokens = {
+      input: arm.leadTokens.input + arm.compactorTokens.input,
+      output: arm.leadTokens.output + arm.compactorTokens.output,
+      cacheRead: arm.leadTokens.cacheRead + arm.compactorTokens.cacheRead,
+    };
+    rows.push(
+      `| ${name} | ${arm.probeTotal}/${arm.probeMax} | ${arm.turns} | ${arm.llmCalls} | ${tokens.input} | ${tokens.output} | ${tokens.cacheRead} | ${arm.cost.toFixed(4)} | ${arm.nativeCompactions} | ${arm.turnRatio.ratio.toFixed(3)} | ${arm.compactionRatio.ratio.toFixed(3)} | ${(arm.wallMs / 1000).toFixed(0)} |`,
+    );
+  }
+  rows.push("");
+  rows.push(
+    `memory arm gate: ${memory.gate.blocks} blocked calls of ${memory.gate.entries} gated calls; unprompted zoom-before-act rate ${memory.gate.zoomBeforeActRate.toFixed(3)} (${memory.gate.zoomBeforeInView}/${memory.gate.inView} in-view calls)`,
+  );
+  rows.push("");
+  rows.push("| arm | probe | score | note |");
+  rows.push("| --- | --- | --- | --- |");
+  for (const [name, arm] of [
+    ["memory", memory],
+    ["native", native],
+  ])
+    for (const probe of arm.probes)
+      rows.push(`| ${name} | ${probe.name} | ${probe.score} | ${probe.note} |`);
+  return rows.join("\n");
+}
+
+/** The typed-cost estimate printed before the run. */
+function memoryEstimate() {
+  const script = memoryScript();
+  const delegations = script.filter(
+    (step) => step.settles === 2 && !step.probe,
+  ).length;
+  return [
+    "memory smoke estimate:",
+    `  two arms, one run each (memory and native, order randomized)`,
+    `  script: ${script.length} Lead turns; ${delegations} delegated agents`,
+    `  Lead and agents: ${MEMORY_LEAD_MODEL}`,
+    `  compactor: ${MEMORY_COMPACTOR_MODEL}`,
+    `  native compaction threshold: ${MEMORY_NATIVE_THRESHOLD} tokens`,
+    "  real provider calls; the run is long and costs real usage",
+    "re-run with --yes to start",
+  ].join("\n");
+}
+
 async function runMemoryScenario(args) {
-  const model = args.model ?? MEMORY_DEFAULT_MODEL;
+  const model = args.model ?? MEMORY_LEAD_MODEL;
   const extensions = memorySmokeExtensions();
+  const script = memoryScript();
+  const probes = script.filter((step) => step.probe);
+  if (!args.yes) return { estimate: memoryEstimate() };
+
   const root = await mkdtemp(join(tmpdir(), "pi-herdsman-memory-smoke-"));
   const extension = join(repoRoot, "extension", "index.ts");
   const realAgentDir = join(homedir(), ".pi", "agent");
-  // The arms run in a random order, so a warmed shared prefix cannot favor one.
-  const arms = Math.random() < 0.5 ? [false, true] : [true, false];
+  const arms =
+    Math.random() < 0.5 ? ["memory", "native"] : ["native", "memory"];
   const runs = [];
   try {
-    for (const disableMark of arms) {
-      const suffix = disableMark ? "b" : "a";
-      const project = join(root, `project-${suffix}`);
-      const agentDir = join(root, `agent-${suffix}`);
-      const sessionDir = join(root, `sessions-${suffix}`);
-      await mkdir(join(project, ".pi", "agents"), { recursive: true });
-      await writeFile(
-        join(project, ".pi", "agents", "compactor.md"),
-        `---\nname: compactor\nbodyMode: append\nmodel: ${MEMORY_COMPACTOR_MODEL}\nthinking: medium\n---\n`,
-      );
+    for (const arm of arms) {
+      const project = join(root, `project-${arm}`);
+      const agentDir = join(root, `agent-${arm}`);
+      const sessionDir = join(root, `sessions-${arm}`);
+      await writeMemoryFixture(project);
       await mkdir(join(agentDir, "pi-herdsman"), { recursive: true });
+      await mkdir(join(agentDir, "agents"), { recursive: true });
+      await mkdir(join(agentDir, "extensions"), { recursive: true });
       const realProject = await realpath(project);
       await writeFile(
         join(agentDir, "pi-herdsman", "config.json"),
-        `${JSON.stringify({ memoryProjects: [realProject] })}\n`,
+        `${JSON.stringify({
+          memoryProjects: arm === "memory" ? [realProject] : [],
+        })}\n`,
       );
-      await copyFile(join(realAgentDir, "auth.json"), join(agentDir, "auth.json"));
+      await writeFile(
+        join(agentDir, "agents", "scout.md"),
+        `---\nname: scout\nbodyMode: append\nmodel: ${MEMORY_AGENT_MODEL}\nthinking: low\n---\n`,
+      );
+      await writeFile(
+        join(agentDir, "agents", "reviewer.md"),
+        `---\nname: reviewer\nbodyMode: append\nmodel: ${MEMORY_AGENT_MODEL}\nthinking: low\n---\n`,
+      );
+      await copyFile(
+        join(realAgentDir, "auth.json"),
+        join(agentDir, "auth.json"),
+      );
       await copyFile(
         join(realAgentDir, "models.json"),
         join(agentDir, "models.json"),
       );
+      await copyFile(
+        join(realAgentDir, "extensions", "herdr-agent-state.ts"),
+        join(agentDir, "extensions", "herdr-agent-state.ts"),
+      );
       await mkdir(sessionDir, { recursive: true });
+      const startedAt = Date.now();
       const run = await memoryRpcRun({
         project,
         agentDir,
@@ -4429,9 +4897,9 @@ async function runMemoryScenario(args) {
         extension,
         extensions,
         model,
-        prompts: MEMORY_TURNS,
-        disableMark,
+        steps: script,
       });
+      const wallMs = Date.now() - startedAt;
       const sessionFile = await newestSessionFile(sessionDir);
       if (!sessionFile)
         throw new Error(
@@ -4442,47 +4910,54 @@ async function runMemoryScenario(args) {
         .filter((line) => line !== "")
         .map((line) => JSON.parse(line));
       runs.push({
-        disableMark,
+        arm,
         sessionFile,
         entries,
-        storeRoot: join(
-          agentDir,
-          "pi-herdsman",
-          "memory",
-          memoryStoreKey(realProject),
-        ),
+        turns: script.length,
+        wallMs,
+        errors: run.errors,
         stderr: run.stderr,
       });
     }
 
-    const withMarkRun = runs.find((run) => !run.disableMark);
-    const withoutMarkRun = runs.find((run) => run.disableMark);
-    const withMark = await memoryRunReport(withMarkRun);
-    const withoutMark = await memoryRunReport(withoutMarkRun);
-    const armOrder = arms.map((disableMark) =>
-      disableMark ? "withoutMark" : "withMark",
-    );
+    const reports = {};
+    for (const run of runs) {
+      const facts = memoryRunFacts(run.entries);
+      const scored = scoreMemoryProbes(run.entries, facts, probes);
+      reports[run.arm] = memoryRunReport(run, scored);
+    }
+    const memory = reports.memory;
+    const native = reports.native;
+    const passed =
+      memory.turnRatio.ratio >= MEMORY_TARGET_TURN_RATIO &&
+      native.nativeCompactions >= MEMORY_MIN_NATIVE_COMPACTIONS;
     const report = {
       scenario: "memory",
       model,
       compactorModel: MEMORY_COMPACTOR_MODEL,
+      agentModel: MEMORY_AGENT_MODEL,
       extensions,
-      armOrder,
-      prompts: MEMORY_TURNS.length,
-      turnRatio: withMark.turnRatio.ratio,
-      turnRatioWithoutMark: withoutMark.turnRatio.ratio,
-      compactionRatio: withMark.compactionRatio.ratio,
-      passed: withMark.turnRatio.ratio >= 0.95,
+      nativeThresholdTokens: MEMORY_NATIVE_THRESHOLD,
+      armOrder: arms,
+      steps: script.length,
+      passed,
       notes: [
-        "The compaction ratio is not attributable to the view mark: both arms run the DeepSeek compactor with the same block-split requests, so its delta is uncontrolled cross-run noise (separate projects and stores, a small sample, and proxy cache accounting). Per-arm compaction call counts are in withMark.compactions and withoutMark.compactions.",
-        `Arm order was randomized: ${armOrder.join(" then ")}.`,
+        "One run per arm: a probe total within 1 is not a win (noise).",
+        `The memory arm's turn cache ratio must reach ${MEMORY_TARGET_TURN_RATIO} (the phase 7 target); it relies on implicit prefix caching because the view mark is Anthropic-only.`,
+        `The native arm must compact at least ${MEMORY_MIN_NATIVE_COMPACTIONS} times.`,
+        "Native summarization usage is not surfaced separately; only its compaction count is reported.",
+        `Arm order was randomized: ${arms.join(" then ")}.`,
       ],
-      withMark,
-      withoutMark,
-      stderr: {
-        withMark: withMarkRun.stderr.slice(-4000),
-        withoutMark: withoutMarkRun.stderr.slice(-4000),
-      },
+      markdown: memoryMarkdown(memory, native),
+      memory,
+      native,
+      stepErrors: Object.fromEntries(runs.map((run) => [run.arm, run.errors])),
+      facts: Object.fromEntries(
+        runs.map((run) => [run.arm, memoryRunFacts(run.entries)]),
+      ),
+      stderr: Object.fromEntries(
+        runs.map((run) => [run.arm, run.stderr.slice(-4000)]),
+      ),
     };
     const reportPath = join(tmpdir(), "pi-herdsman-memory-smoke-report.json");
     await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`);
@@ -4495,10 +4970,16 @@ async function runMemoryScenario(args) {
 async function main() {
   const args = parseSmokeArgs(process.argv.slice(2));
   if (args.scenario === "memory") {
-    const { report, reportPath } = await runMemoryScenario(args);
+    const result = await runMemoryScenario(args);
+    if (result.estimate) {
+      console.log(result.estimate);
+      return;
+    }
+    const { report, reportPath } = result;
     console.log(
       `smoke memory: ${report.passed ? "PASS" : "FAIL"}\n${JSON.stringify(report, null, 2)}`,
     );
+    console.log(report.markdown);
     console.log(`report: ${reportPath}`);
     if (!report.passed) process.exitCode = 1;
     return;

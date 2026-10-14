@@ -431,6 +431,14 @@ test("smoke CLI parses scenarios and one-off model overrides", async () => {
   assert.deepEqual(parseSmokeArgs([]), {
     scenario: "core",
     model: undefined,
+    yes: false,
+    managerReadyTimeoutMs: undefined,
+    managerRecoveryDiagnostics: false,
+  });
+  assert.deepEqual(parseSmokeArgs(["memory", "--yes"]), {
+    scenario: "memory",
+    model: undefined,
+    yes: true,
     managerReadyTimeoutMs: undefined,
     managerRecoveryDiagnostics: false,
   });
@@ -446,6 +454,7 @@ test("smoke CLI parses scenarios and one-off model overrides", async () => {
     {
       scenario: "chief-tree",
       model: "provider/model:high",
+      yes: false,
       managerReadyTimeoutMs: undefined,
       managerRecoveryDiagnostics: false,
     },
@@ -455,6 +464,7 @@ test("smoke CLI parses scenarios and one-off model overrides", async () => {
     {
       scenario: "continuation",
       model: "provider/model:xhigh",
+      yes: false,
       managerReadyTimeoutMs: undefined,
       managerRecoveryDiagnostics: false,
     },
@@ -476,6 +486,7 @@ test("manager-recovery timeout is bounded and scoped to its ready handshake", ()
     {
       scenario: "manager-recovery",
       model: undefined,
+      yes: false,
       managerReadyTimeoutMs: 45_000,
       managerRecoveryDiagnostics: true,
     },
