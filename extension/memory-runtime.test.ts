@@ -1046,6 +1046,48 @@ test("a node built during the grace is in the frozen view", async () => {
   await harness.shutdown(session, "quit");
 });
 
+test("a batch whose parent is unbuilt waits out the grace with placeholders", async () => {
+  const project = projectDir();
+  withProjects([project]);
+  // 500-byte leaves are call-free, so they fill the chat past its bound, while
+  // the merge of any two of them needs a call the hanging compactor never
+  // makes: the open batch has nothing to finish it.
+  const entries: SessionEntry[] = [];
+  for (let index = 0; index < 255; index += 1)
+    entries.push(userEntry("m".repeat(500)));
+  // Over the leaf limit, so its line is a placeholder until its call lands.
+  entries.push(userEntry("x".repeat(600)));
+  const session = new TestSession({
+    cwd: project,
+    file: "/sessions/batch.jsonl",
+    entries,
+  });
+  session.branch = entries;
+  const harness = new Harness({ hang: true, settleGraceMs: 20 });
+  await harness.sessionStart(session);
+
+  // The turn waits for the batch, and the grace is what ends the wait.
+  await harness.beforeAgentStart(session);
+  const compactor = harness.compactors[0];
+  assert.equal(compactor.settled.length, 1);
+  // The batch's parents were queued and never built, so the chat is still all
+  // leaves: over its bound, and frozen as it stands.
+  assert.notEqual(compactor.store.nextJob(), undefined);
+  assert.equal(
+    compactor.store.view.chat.every((line) => line[0] === 0),
+    true,
+  );
+
+  const injected = await harness.context(session, []);
+  assert.ok(injected);
+  const view = injected.messages[0].content
+    .map((block: any) => block.text)
+    .join("\n");
+  assert.match(view, /0\+1\|note: user: mmm/);
+  assert.match(view, /255\+1\|\(not summarized yet: zoom it\)/);
+  await harness.shutdown(session, "quit");
+});
+
 test("the last message of a turn is logged at turn_end and at shutdown", async () => {
   const project = projectDir();
   withProjects([project]);

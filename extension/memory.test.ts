@@ -21,6 +21,7 @@ import {
   ECHO_CHARS,
   HERDSMAN_WORK_TYPES,
   LEAF_BYTES,
+  MERGE_PREFETCH_RATIO,
   MemoryStore,
   PAGE_CHARS,
   UNBUILT_LINE,
@@ -1195,15 +1196,13 @@ test("the store queues the work its messages unblock", () => {
       assert.equal(store.nextJob(), undefined);
       assert.equal(store.renderChat().includes("one compact line"), true);
 
-      // Two call-free leaves whose join is too long queue their merge.
+      // Two call-free leaves whose join is too long: the merge needs a call.
       const wide = "b".repeat(LEAF_BYTES - 100);
       store.appendEntry(userEntry(wide), SESSION);
       const last = userEntry(wide);
       store.appendEntry(last, SESSION);
       assert.equal(store.needsCall([1, 1]), true);
       assert.equal(store.canBuildWithoutCall([0, 2]), true);
-      assert.deepEqual(store.nextJob(), { kind: "merge", line: [1, 1] });
-      store.appendNode([1, 1], "their merged line");
       assert.deepEqual(store.messageSource(3), {
         session: SESSION,
         entry: last.id,
@@ -1213,6 +1212,107 @@ test("the store queues the work its messages unblock", () => {
       store.close();
     }
   });
+});
+
+test("a view with room queues no merge job", () => {
+  withProject((project) => {
+    const store = new MemoryStore(project);
+    try {
+      // 400-byte leaves are call-free, but their join is over the limit, so the
+      // merge needs a call. Nothing queues it while both views have room.
+      for (let i = 0; i < 20; i += 1)
+        store.appendEntry(userEntry("c".repeat(400)), SESSION);
+      assert.equal(store.needsCall([1, 0]), true);
+      assert.equal(store.nextJob(), undefined);
+      assert.equal(compactionBytes(store) < COMPACTION_BYTES * 0.9, true);
+
+      // A merge a call already built is not queued again either.
+      store.appendNode([1, 0], "merged early");
+      assert.equal(store.nextJob(), undefined);
+    } finally {
+      store.close();
+    }
+  });
+});
+
+test("a jump into a view's margin queues the merge-down's own pairs", () => {
+  withProject((project) => {
+    const store = new MemoryStore(project);
+    try {
+      // A backfill of 60 half-kilobyte leaves in one turn: the jump crosses the
+      // view's bound and its prefetch margin with no further event, so the
+      // merges it needs are queued before the next message lands.
+      const body = "c".repeat(500);
+      for (let i = 0; i < 60; i += 1)
+        store.appendEntry(userEntry(body), SESSION);
+      assert.equal(
+        compactionBytes(store) >= COMPACTION_BYTES * MERGE_PREFETCH_RATIO,
+        true,
+      );
+
+      // The queue is the merge-down's own order: the oldest pair first, and
+      // every merge is ready by the time it comes up, so a batch that needs
+      // them never waits for a call that has not run yet.
+      const jobs = [];
+      const started = compactionBytes(store);
+      for (;;) {
+        const job = store.nextJob();
+        if (!job) break;
+        assert.equal(job.kind, "merge");
+        if (jobs.length === 0) assert.deepEqual(job.line, [1, 0]);
+        assert.notEqual(store.nodeInputs(job.line), undefined);
+        store.appendNode(job.line, "merged " + "z".repeat(500));
+        jobs.push(job.line);
+      }
+      assert.equal(jobs.length > 1, true);
+      // The view merges only once it passes its bound, and by then the parents
+      // it needs are built: it falls well back from where it was.
+      assert.equal(compactionBytes(store) < COMPACTION_BYTES, true);
+      for (let i = 0; i < 5; i += 1)
+        store.appendEntry(userEntry("d".repeat(500)), SESSION);
+      const after = compactionBytes(store);
+      assert.equal(after < started, true);
+      assert.equal(after <= COMPACTION_BYTES, true);
+    } finally {
+      store.close();
+    }
+  });
+});
+
+test("a reload derives the same merge queue from its state", () => {
+  const project = mkdtempSync(join(tmpdir(), "pi-herdsman-memory-queue-"));
+  try {
+    const store = new MemoryStore(project);
+    try {
+      store.appendEntry(userEntry("before"), SESSION);
+      assert.equal(store.nextJob(), undefined);
+      for (let i = 0; i < 60; i += 1)
+        store.appendEntry(userEntry("c".repeat(500)), SESSION);
+    } finally {
+      store.close();
+    }
+
+    const queued = (): unknown[] => {
+      const reopened = new MemoryStore(project);
+      try {
+        const jobs = [];
+        for (;;) {
+          const job = reopened.nextJob();
+          if (!job) break;
+          jobs.push(job);
+        }
+        return jobs;
+      } finally {
+        reopened.close();
+      }
+    };
+
+    const first = queued();
+    assert.equal(first.length > 1, true);
+    assert.deepEqual(queued(), first);
+  } finally {
+    rmSync(project, { recursive: true, force: true });
+  }
 });
 
 /** Answers every ready compaction like the compactor, so the tree fills. */

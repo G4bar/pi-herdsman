@@ -144,7 +144,10 @@ missing value cannot look like a value that was never there.
 512-byte lines, a 128 KB to 64 KB view, a 32 KB to 16 KB compaction view, 8
 concurrent calls, and 5 retries. These are calibrated by the design's own
 measurements and are defined once with the rest of the memory core in
-`extension/memory.ts`, instead of being configurable knobs.
+`extension/memory.ts`, instead of being configurable knobs. One constant is
+Herdsman's own rather than the design's: a view queues the merges it will need
+once it is within 90% of its bound, so the tree grows where a view asks for it
+instead of eagerly as the design's queue does.
 
 ## Rationale
 

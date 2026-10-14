@@ -93,6 +93,12 @@ export const CHAT_BYTES = 128_000;
 export const CHAT_TARGET_BYTES = 64_000;
 export const COMPACTION_BYTES = 32_000;
 export const COMPACTION_TARGET_BYTES = 16_000;
+/**
+ * A view queues the merges it will need once it is this close to its own
+ * bound. The margin is what makes the calls background work: a merge queued at
+ * the bound would stall the batch that needs it until a wave of calls ran.
+ */
+export const MERGE_PREFETCH_RATIO = 0.9;
 /** The view is sent as blocks of this many lines, for the cache marks. */
 export const VIEW_BLOCK_LINES = 4;
 export const VIEW_OPEN = "<chat>";
@@ -795,6 +801,7 @@ export class MemoryStore {
     this.pushLeaf(i);
     this.seedLeaf(i);
     this.syncCompaction();
+    this.prefetchMerges();
     this.saveView();
     return record;
   }
@@ -825,8 +832,8 @@ export class MemoryStore {
     this.chatSize = this.bytes(this.chat);
     if (this.chatSize > CHAT_BYTES) this.batching = true;
     if (this.batching) this.mergeChatBatch();
-    this.refreshJobs(line);
     this.syncCompaction();
+    this.prefetchMerges();
     this.saveView();
   }
 
@@ -1017,10 +1024,7 @@ export class MemoryStore {
 
     this.syncCompaction();
     for (let i = 0; i < this.records.length; i += 1) this.seedLeaf(i);
-    for (const key of [...this.nodes.keys()]) {
-      const [l, i] = key.split(":");
-      this.refreshJobs([Number(l), Number(i)]);
-    }
+    this.prefetchMerges();
     this.saveView();
   }
 
@@ -1328,13 +1332,9 @@ export class MemoryStore {
 
   // --- work queues ----------------------------------------------------------
 
-  /** Queues the work a message unblocks: its leaf, or its call-free ancestors. */
+  /** Queues the work a message unblocks: its leaf. A merge waits for a view. */
   private seedLeaf(id: number): void {
-    if (this.needsCall([0, id])) {
-      this.enqueue({ kind: "message", id });
-      return;
-    }
-    this.refreshJobs([0, id]);
+    if (this.needsCall([0, id])) this.enqueue({ kind: "message", id });
   }
 
   private enqueue(job: MemoryJob): void {
@@ -1345,21 +1345,51 @@ export class MemoryStore {
   }
 
   /**
-   * Queues the mergeable ancestors a freshly built node unblocks. Call-free
-   * ancestors are carried through; the first node that needs a call is queued.
+   * Queues the merges the views need soon. A view only merges once it passes
+   * its own bound, so a merge is queued while that view is still
+   * `MERGE_PREFETCH_RATIO` of the bound away: the calls then run as background
+   * work. Nothing is queued while both views have room, so the tree grows only
+   * where a view asks for it.
    */
-  private refreshJobs(line: ViewLine): void {
-    let current: ViewLine = [line[0] + 1, Math.floor(line[1] / 2)];
-    for (;;) {
-      if (!this.withinLog(current)) return;
-      if (this.canBuildWithoutCall(current)) {
-        current = [current[0] + 1, Math.floor(current[1] / 2)];
-        continue;
-      }
-      if (this.inputsReady(current))
-        this.enqueue({ kind: "merge", line: current });
-      return;
+  private prefetchMerges(): void {
+    if (this.chatSize >= CHAT_BYTES * MERGE_PREFETCH_RATIO)
+      this.queueMergeWork(this.chat, CHAT_TARGET_BYTES);
+    if (this.compactionSize >= COMPACTION_BYTES * MERGE_PREFETCH_RATIO)
+      this.queueMergeWork(this.compaction, COMPACTION_TARGET_BYTES);
+  }
+
+  /**
+   * The merges one merge-down of `lines` to `target` needs, in the order
+   * `mostDuePair` picks them. A pair whose parent is call-free merges on the
+   * spot; a pair whose parent needs a call is queued, and the lines above it
+   * wait for that call.
+   */
+  private queueMergeWork(lines: readonly ViewLine[], target: number): void {
+    const here = [...lines];
+    let bytes = this.bytes(here);
+    while (bytes > target) {
+      const index = mostDuePair(here, this.records.length, (parent) =>
+        this.mergeReady(parent),
+      );
+      if (index === undefined) return;
+      const [l, i] = here[index];
+      const parent: ViewLine = [l + 1, i / 2];
+      const call = this.needsCall(parent);
+      if (call) this.enqueue({ kind: "merge", line: parent });
+      // A merge a call builds lands as a line of at most `LEAF_BYTES`, the
+      // model's own bound, so the view above it is not measured as unbuilt.
+      bytes +=
+        this.lineBytes(parent) +
+        (call ? LEAF_BYTES - UNBUILT_BYTES : 0) -
+        this.lineBytes(here[index]) -
+        this.lineBytes(here[index + 1]);
+      here.splice(index, 2, parent);
     }
+  }
+
+  /** True when a pair's parent can merge now: it is built, or its inputs are. */
+  private mergeReady(parent: ViewLine): boolean {
+    return this.canBuildWithoutCall(parent) || this.inputsReady(parent);
   }
 
   /** True when a node's inputs exist, without reading them. */

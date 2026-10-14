@@ -199,6 +199,13 @@ class CompactorRunner implements MemoryCompactor {
   private readonly waiters = new Set<() => void>();
   /** Jobs that failed and wait for the next `onMessage`. */
   private retry: MemoryJob[] = [];
+  /**
+   * Nodes with a build in flight. The store re-derives its merge queue from
+   * the view on every append, so it can hand out a node again while it is
+   * already building; that second copy is dropped, because the build in flight
+   * is the one that lands or requeues the node.
+   */
+  private readonly building = new Set<string>();
   private slots = 0;
   private stopped = false;
   /**
@@ -345,6 +352,7 @@ class CompactorRunner implements MemoryCompactor {
         this.store.requeueJob(job);
         return;
       }
+      if (this.building.has(jobKey(job))) continue;
       await this.gate();
       if (this.stopped || this.draining) {
         this.store.requeueJob(job);
@@ -401,6 +409,7 @@ class CompactorRunner implements MemoryCompactor {
 
   private launch(job: MemoryJob): void {
     this.slots += 1;
+    this.building.add(jobKey(job));
     void this.run(job)
       .catch(() => {
         // A store or hook failure never fails a model call; the run requeues
@@ -408,6 +417,7 @@ class CompactorRunner implements MemoryCompactor {
       })
       .finally(() => {
         this.slots -= 1;
+        this.building.delete(jobKey(job));
         this.releaseWarm();
         this.notify();
         this.pump();

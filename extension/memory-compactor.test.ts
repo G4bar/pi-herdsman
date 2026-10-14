@@ -234,6 +234,16 @@ function longText(prefix = ""): string {
   return `${prefix}${"x".repeat(600)}`;
 }
 
+/**
+ * Call-free leaves that bring the compaction view near its own bound: a
+ * 200-byte message is under the leaf limit, and so is the join of two of them.
+ * Only a pair that holds a long line then needs a call.
+ */
+function fillCompactionView(store: MemoryStore, count = 160): void {
+  for (let index = 0; index < count; index += 1)
+    addMessage(store, "f".repeat(200));
+}
+
 async function withProject<T>(
   run: (project: string, store: MemoryStore) => Promise<T>,
 ): Promise<T> {
@@ -468,6 +478,14 @@ test("the usage callback labels a merge node", () =>
   withProject(async (project, store) => {
     addMessage(store, longText());
     addMessage(store, longText());
+    // A merge is queued once the view is near its bound, so the two halves are
+    // built by hand and the view filled after them.
+    while (store.nextJob()) {
+      // The leaves are built directly below.
+    }
+    store.appendNode([0, 0], "a".repeat(300));
+    store.appendNode([0, 1], "b".repeat(300));
+    fillCompactionView(store);
     const usages: MemoryCompactorUsage[] = [];
     const registry = new FakeRegistry([makeModel("test", "lead")]);
     registry.responder = (call) => call.respond("y".repeat(300));
@@ -534,6 +552,7 @@ test("a child marker propagates to its merge", () =>
     }
     store.appendNode([0, 0], `${"a".repeat(300)} ${LOSSY_MARKER}`);
     store.appendNode([0, 1], "b".repeat(300));
+    fillCompactionView(store);
 
     const registry = new FakeRegistry([makeModel("test", "lead")]);
     registry.responder = (call) => call.respond("merged");
@@ -541,8 +560,10 @@ test("a child marker propagates to its merge", () =>
     await waitFor(() => store.nodeText([1, 0]) !== undefined);
     compactor.stop();
 
-    assert.equal(registry.calls.length, 1);
-    assert.match(taskText(registry.calls[0]!), /^Compaction: merge lines /);
+    assert.match(
+      taskText(registry.calls[0]!),
+      /^Compaction: merge lines 0\+1 and 1\+1, /,
+    );
     assert.ok(
       taskText(registry.calls[0]!).includes(
         `${"a".repeat(300)} ${LOSSY_MARKER}`,
@@ -651,6 +672,9 @@ test("a merge starts only once both halves are built", () =>
   withProject(async (project, store) => {
     addMessage(store, "a".repeat(600));
     addMessage(store, "b".repeat(600));
+    // The view is near its bound, so the merge of the two long halves is the
+    // one merge that needs a call; it waits for both of them.
+    fillCompactionView(store);
     const registry = new FakeRegistry([makeModel("test", "lead")]);
     registry.responder = () => {};
     const compactor = start(store, fakeContext(registry, undefined, project));
@@ -669,11 +693,89 @@ test("a merge starts only once both halves are built", () =>
     assert.equal(registry.calls.length, 2);
 
     registry.calls[1]!.respond("b".repeat(300));
-    await waitFor(() => registry.calls.length === 3);
-    assert.match(taskText(registry.calls[2]!), /^Compaction: merge lines /);
-    registry.calls[2]!.respond("merged");
+    // Both halves are built, so the merge is queued and starts.
+    const isMergeOfThePair = (call: FakeCall) =>
+      taskText(call).startsWith("Compaction: merge lines 0+1 and 1+1,");
+    await waitFor(() => registry.calls.some(isMergeOfThePair));
+    const merge = registry.calls.find(isMergeOfThePair)!;
+    assert.ok(taskText(merge).includes("a".repeat(300)));
+    assert.ok(taskText(merge).includes("b".repeat(300)));
+    merge.respond("merged");
     await compactor.whenSettled(1);
     compactor.stop();
+  }));
+
+test("a prefetched merge builds the same prompt as before", () =>
+  withProject(async (project, store) => {
+    addMessage(store, "a".repeat(600));
+    addMessage(store, "b".repeat(600));
+    while (store.nextJob()) {
+      // The leaves are built directly below.
+    }
+    const first = "a".repeat(300);
+    const second = "b".repeat(300);
+    store.appendNode([0, 0], first);
+    store.appendNode([0, 1], second);
+    fillCompactionView(store);
+
+    const registry = new FakeRegistry([makeModel("test", "lead")]);
+    const ctx = fakeContext(registry, makeModel("test", "lead"), project);
+    registry.responder = () => {};
+    const compactor = start(store, ctx);
+    await waitFor(() =>
+      registry.calls.some((call) =>
+        taskText(call).startsWith("Compaction: merge lines 0+1 and 1+1,"),
+      ),
+    );
+    const call = registry.calls.find((entry) =>
+      taskText(entry).startsWith("Compaction: merge lines 0+1 and 1+1,"),
+    )!;
+    compactor.stop();
+
+    assert.equal(taskText(call), mergeTask({ line: [1, 0], first, second }));
+    assert.equal(
+      call.context.systemPrompt,
+      `${MEMORY_VIEW_DESCRIPTION}\n\n${resolveCompactorDefinition(ctx).body}`,
+    );
+    assert.equal(call.context.tools, undefined);
+  }));
+
+test("a merge queued again while it builds is not built twice", () =>
+  withProject(async (project, store) => {
+    addMessage(store, "a".repeat(600));
+    addMessage(store, "b".repeat(600));
+    while (store.nextJob()) {
+      // The leaves are built directly below.
+    }
+    store.appendNode([0, 0], "a".repeat(300));
+    store.appendNode([0, 1], "b".repeat(300));
+    fillCompactionView(store);
+
+    const registry = new FakeRegistry([makeModel("test", "lead")]);
+    // That merge stays in flight; every other call answers, so its node is
+    // still unbuilt when the store queues it again.
+    const isMergeOfThePair = (call: FakeCall) =>
+      taskText(call).startsWith("Compaction: merge lines 0+1 and 1+1,");
+    registry.responder = (call) => {
+      if (!isMergeOfThePair(call)) call.respond("filler merge");
+    };
+    const compactor = start(store, fakeContext(registry, undefined, project));
+    await waitFor(() => registry.calls.some(isMergeOfThePair));
+    const merge = taskText(registry.calls.find(isMergeOfThePair)!);
+
+    // A later append re-derives the merge queue and hands the same node out
+    // again while its build is still in flight; it must not start twice.
+    store.requeueJob({ kind: "merge", line: [1, 0] });
+    for (let round = 0; round < 5; round += 1) {
+      compactor.onMessage();
+      await tick();
+    }
+    compactor.stop();
+
+    assert.equal(
+      registry.calls.filter((call) => taskText(call) === merge).length,
+      1,
+    );
   }));
 
 // --- failure ----------------------------------------------------------------
