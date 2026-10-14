@@ -18,6 +18,7 @@ import {
   MAX_CONCURRENT_COMPACTIONS,
   MAX_LENGTH_RETRIES,
   type MemoryCompactorCallbacks,
+  type MemoryCompactorUsage,
   start,
 } from "./memory-compactor.ts";
 import {
@@ -126,10 +127,12 @@ class FakeCall {
     wake?.();
   }
 
-  respond(text: string): void {
+  respond(text: string, usage: Partial<AssistantMessage["usage"]> = {}): void {
     this.push({
       type: "done",
-      message: assistant(text),
+      message: assistant(text, {
+        usage: { ...assistant("").usage, ...usage },
+      }),
     } as AssistantMessageEvent);
     this.ended = true;
   }
@@ -410,6 +413,74 @@ test("a failed retry keeps the shortest line already held", () =>
     compactor.stop();
     assert.equal(registry.calls.length, 2);
     assert.equal(store.nodeText([0, 0]), "a".repeat(700));
+  }));
+
+// --- usage ------------------------------------------------------------------
+
+test("the usage callback labels the node and sums attempts and reasoning", () =>
+  withProject(async (project, store) => {
+    addMessage(store, longText());
+    const usages: MemoryCompactorUsage[] = [];
+    let index = 0;
+    const registry = new FakeRegistry([makeModel("test", "lead")]);
+    registry.responder = (call) => {
+      if (index++ === 0)
+        call.respond("a".repeat(700), { reasoning: 5, output: 9 });
+      else call.respond("ok", { reasoning: 4, output: 7 });
+    };
+    const compactor = start(store, fakeContext(registry, undefined, project), {
+      onUsage: (usage) => usages.push(usage),
+    });
+    await compactor.whenSettled(0);
+    compactor.stop();
+
+    assert.deepEqual(usages, [
+      {
+        line: [0, 0],
+        kind: "leaf",
+        input: 2,
+        output: 16,
+        reasoning: 9,
+        cacheRead: 6,
+        cacheWrite: 8,
+        attempts: 2,
+        retries: 1,
+      },
+    ]);
+  }));
+
+test("a provider without a reasoning report leaves the total null", () =>
+  withProject(async (project, store) => {
+    addMessage(store, longText());
+    const usages: MemoryCompactorUsage[] = [];
+    const registry = new FakeRegistry([makeModel("test", "lead")]);
+    registry.responder = (call) => call.respond("ok");
+    const compactor = start(store, fakeContext(registry, undefined, project), {
+      onUsage: (usage) => usages.push(usage),
+    });
+    await compactor.whenSettled(0);
+    compactor.stop();
+
+    assert.equal(usages[0]!.reasoning, null);
+  }));
+
+test("the usage callback labels a merge node", () =>
+  withProject(async (project, store) => {
+    addMessage(store, longText());
+    addMessage(store, longText());
+    const usages: MemoryCompactorUsage[] = [];
+    const registry = new FakeRegistry([makeModel("test", "lead")]);
+    registry.responder = (call) => call.respond("y".repeat(300));
+    const compactor = start(store, fakeContext(registry, undefined, project), {
+      onUsage: (usage) => usages.push(usage),
+    });
+    await waitFor(() => usages.some((usage) => usage.kind === "merge"));
+    compactor.stop();
+
+    const merge = usages.find((usage) => usage.kind === "merge")!;
+    assert.deepEqual(merge.line, [1, 0]);
+    assert.equal(merge.attempts, 1);
+    assert.equal(merge.retries, 0);
   }));
 
 // --- lossy marker -----------------------------------------------------------

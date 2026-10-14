@@ -21,6 +21,13 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs, promisify } from "node:util";
 import { setTimeout as sleep } from "node:timers/promises";
+import {
+  IMAGE_BODY,
+  LEAF_BYTES,
+  extractIdentifiers,
+  renderView,
+} from "../extension/memory.ts";
+import { LOSSY_MARKER } from "../extension/memory-prompts.ts";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -4222,6 +4229,176 @@ export async function copyIfExists(from, to) {
   }
 }
 
+/** One JSONL log as records; a torn last line is not a record. */
+function memoryJsonl(text) {
+  const records = [];
+  for (const line of text.split("\n")) {
+    if (line === "") continue;
+    try {
+      records.push(JSON.parse(line));
+    } catch {
+      // A torn or unreadable line never becomes a record.
+    }
+  }
+  return records;
+}
+
+/** Every record of one store part, in file order. */
+async function memoryLogRecords(root, part) {
+  let names;
+  try {
+    names = (await readdir(join(root, part))).filter((name) =>
+      name.endsWith(".jsonl"),
+    );
+  } catch {
+    return [];
+  }
+  names.sort();
+  const records = [];
+  for (const name of names)
+    records.push(
+      ...memoryJsonl(await readFile(join(root, part, name), "utf8")),
+    );
+  return records;
+}
+
+/** The identifier classes whose retention a node build is scored on. */
+const MEMORY_RETENTION_CLASSES = new Set(["uuid", "ref", "path", "number"]);
+
+/**
+ * Read-only stats over one project store, read after its session shut down.
+ * The store is append-only JSONL, so this reads the logs instead of opening the
+ * store, which would take its lock and rewrite its view. `undefined` means the
+ * arm never had a store, as in the native arm.
+ */
+export async function memoryStoreStats(root) {
+  try {
+    await stat(root);
+  } catch {
+    return undefined;
+  }
+  const messages = await memoryLogRecords(root, "main");
+  const built = await memoryLogRecords(root, "tree");
+  let view = { chat: [], compaction: [] };
+  try {
+    const parsed = JSON.parse(await readFile(join(root, "view.json"), "utf8"));
+    if (Array.isArray(parsed?.chat)) view = parsed;
+  } catch {
+    // An empty store writes no view; an unreadable one has no view to read.
+  }
+
+  const key = (line) => `${line[0]}:${line[1]}`;
+  const bodies = new Map(messages.map((message) => [message.i, message]));
+  const nodeText = new Map(
+    built.map((node) => [key([node.l, node.i]), node.text]),
+  );
+  const derived = new Map();
+  // The same rule the store applies: a short leaf, or a merge of two short
+  // children, has its text without a compaction call.
+  const textOf = (line) => {
+    const id = key(line);
+    if (nodeText.has(id)) return nodeText.get(id);
+    if (derived.has(id)) return derived.get(id);
+    const [l, i] = line;
+    let text;
+    if (l === 0) {
+      const record = bodies.get(i);
+      if (record) {
+        const body = record.text || (record.src?.images ? IMAGE_BODY : "");
+        const leaf = `${record.kind}: ${body}`;
+        if (Buffer.byteLength(leaf, "utf8") <= LEAF_BYTES) text = leaf;
+      }
+    } else {
+      const first = textOf([l - 1, i * 2]);
+      const second = textOf([l - 1, i * 2 + 1]);
+      if (first !== undefined && second !== undefined) {
+        const joined = `${first}\n${second}`;
+        if (Buffer.byteLength(joined, "utf8") <= LEAF_BYTES) text = joined;
+      }
+    }
+    derived.set(id, text);
+    return text;
+  };
+
+  const chat = view.chat;
+  const sizes = built.map((node) =>
+    typeof node.size === "number"
+      ? node.size
+      : Buffer.byteLength(node.text ?? "", "utf8"),
+  );
+  const sum = sizes.reduce((total, size) => total + size, 0);
+  const share = (kept, total) => (total ? kept / total : 0);
+  const messagesByKind = {};
+  for (const message of messages)
+    messagesByKind[message.kind] = (messagesByKind[message.kind] ?? 0) + 1;
+
+  // For every node a call built: the share of its input identifiers that
+  // survived verbatim. A leaf's input is its message text; a merge's is its two
+  // child lines.
+  const identifiers = { total: 0, kept: 0, byKind: {} };
+  for (const node of built) {
+    const output = typeof node.text === "string" ? node.text : "";
+    const input =
+      node.l === 0
+        ? (bodies.get(node.i)?.text ?? "")
+        : [
+            textOf([node.l - 1, node.i * 2]),
+            textOf([node.l - 1, node.i * 2 + 1]),
+          ]
+            .filter((text) => text !== undefined)
+            .join("\n");
+    for (const identifier of extractIdentifiers(input)) {
+      if (!MEMORY_RETENTION_CLASSES.has(identifier.kind)) continue;
+      // A UUID is stored lowercase, so its comparison ignores case.
+      const verbatim =
+        identifier.kind === "uuid"
+          ? output.toLowerCase().includes(identifier.value)
+          : output.includes(identifier.value);
+      identifiers.total += 1;
+      const counter = (identifiers.byKind[identifier.kind] ??= {
+        total: 0,
+        kept: 0,
+      });
+      counter.total += 1;
+      if (verbatim) {
+        identifiers.kept += 1;
+        counter.kept += 1;
+      }
+    }
+  }
+  for (const counter of Object.values(identifiers.byKind))
+    counter.share = share(counter.kept, counter.total);
+  identifiers.share = share(identifiers.kept, identifiers.total);
+
+  return {
+    messages: messages.length,
+    messagesByKind,
+    // The view's own nodes: a call builds exactly one node, so every other view
+    // node was assembled without one; `unbuilt` still waits for a call.
+    viewNodes: chat.length,
+    viewCalls: chat.filter((line) => nodeText.has(key(line))).length,
+    nodesWithoutCall: chat.filter(
+      (line) => !nodeText.has(key(line)) && textOf(line) !== undefined,
+    ).length,
+    unbuilt: chat.filter((line) => textOf(line) === undefined).length,
+    calls: built.length,
+    viewBytes: Buffer.byteLength(
+      renderView(chat, (line) => textOf(line)),
+      "utf8",
+    ),
+    overLeafShare: share(
+      sizes.filter((size) => size > LEAF_BYTES).length,
+      sizes.length,
+    ),
+    meanNodeBytes: sizes.length ? sum / sizes.length : 0,
+    lossyShare: share(
+      built.filter((node) => (node.text ?? "").endsWith(LOSSY_MARKER)).length,
+      built.length,
+    ),
+    identifiers,
+  };
+}
+
 /**
  * Copies the evidence a `--keep` directory preserves before the temp root is
  * deleted: the project memory store, the Lead session JSONL and the report.
@@ -4727,14 +4904,114 @@ function summedRatio(usages) {
 }
 
 function summedTokens(usages) {
-  const sum = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+  const sum = {
+    input: 0,
+    output: 0,
+    reasoning: null,
+    cacheRead: 0,
+    cacheWrite: 0,
+  };
   for (const usage of usages) {
     sum.input += usage.input ?? 0;
     sum.output += usage.output ?? 0;
+    // A provider that reports no reasoning leaves the total null, never zero.
+    if (typeof usage.reasoning === "number")
+      sum.reasoning = (sum.reasoning ?? 0) + usage.reasoning;
     sum.cacheRead += usage.cacheRead ?? 0;
     sum.cacheWrite += usage.cacheWrite ?? 0;
   }
   return sum;
+}
+
+/** The Lead's share of one arm: tokens, USD and uncached input per call. */
+function leadCost(usages, measured) {
+  const tokens = summedTokens(usages);
+  const measuredTokens = summedTokens(measured);
+  return {
+    calls: usages.length,
+    input: tokens.input,
+    output: tokens.output,
+    cacheRead: tokens.cacheRead,
+    cost: usages.reduce((total, usage) => total + (usage.cost?.total ?? 0), 0),
+    // The measured set is what `turnRatio` reads, so the two sit together.
+    uncachedInputPerCall: measured.length
+      ? measuredTokens.input / measured.length
+      : 0,
+  };
+}
+
+/**
+ * The compactor's share of one arm. An entry an older run wrote without
+ * `kind`, `reasoning` or `attempts` still counts, as a leaf with no reported
+ * reasoning and one attempt per `retries`.
+ */
+function compactorCost(usages) {
+  const tokens = summedTokens(usages);
+  const reasoningCalls = usages.filter(
+    (usage) => typeof usage.reasoning === "number",
+  ).length;
+  const attempts = usages.reduce(
+    (total, usage) => total + (usage.attempts ?? (usage.retries ?? 0) + 1),
+    0,
+  );
+  return {
+    calls: usages.length,
+    leafCalls: usages.filter((usage) => usage.kind !== "merge").length,
+    mergeCalls: usages.filter((usage) => usage.kind === "merge").length,
+    input: tokens.input,
+    output: tokens.output,
+    reasoning: tokens.reasoning,
+    reasoningCalls,
+    cacheRead: tokens.cacheRead,
+    cost: estimatedCost(tokens),
+    meanOutputPerCall: usages.length ? tokens.output / usages.length : 0,
+    meanReasoningPerCall: reasoningCalls
+      ? tokens.reasoning / reasoningCalls
+      : null,
+    reasoningShareOfOutput:
+      tokens.reasoning !== null && tokens.output
+        ? tokens.reasoning / tokens.output
+        : null,
+    meanAttemptsPerCall: usages.length ? attempts / usages.length : 0,
+  };
+}
+
+/**
+ * The gate's correction of the old zoom-before-act rate: a call that a
+ * verbatim `read` or the user's own words let through counted as no zoom. The
+ * denominator is every gated call whose identifier the view held; `source` is
+ * absent in sessions an older run wrote.
+ */
+export function memoryGateReport(entries) {
+  const inView = entries.filter((entry) =>
+    (entry.identifiers ?? []).some((identifier) => identifier.inView),
+  );
+  const blocked = inView.filter((entry) => entry.blocked === true);
+  const zoomSatisfied = inView.filter(
+    (entry) =>
+      entry.blocked !== true &&
+      (entry.identifiers ?? []).some(
+        (identifier) => identifier.inView && identifier.source === "zoom",
+      ),
+  );
+  let blockRecovered = true;
+  entries.forEach((entry, index) => {
+    if (entry.blocked !== true) return;
+    const after = entries.slice(index + 1, index + 3);
+    if (!after.some((later) => later.tool === entry.tool && !later.blocked))
+      blockRecovered = false;
+  });
+  return {
+    entries: entries.length,
+    blocks: entries.filter((entry) => entry.blocked === true).length,
+    inView: inView.length,
+    blockedShare: inView.length ? blocked.length / inView.length : 0,
+    // The in-view calls that ran because the value was already verbatim.
+    verbatimBeforeAct: inView.length - blocked.length,
+    zoomSatisfied: zoomSatisfied.length,
+    zoomShare: inView.length ? zoomSatisfied.length / inView.length : 0,
+    blockRecovered,
+  };
 }
 
 function estimatedCost(tokens) {
@@ -4891,52 +5168,32 @@ function scoreMemoryProbes(entries, facts, probes) {
 }
 
 /** One arm's step, token, compaction, cache and gate numbers. */
-function memoryRunReport(run, scored) {
+export async function memoryRunReport(run, scored) {
   const usages = assistantUsages(run.entries);
   const compactor = compactorUsages(run.entries);
-  const gate = gateEntries(run.entries);
+  const gate = gateEntries(run.entries).map((entry) => entry.data ?? {});
   // The run's first call writes the cache; every later call is measured.
   const measuredTurns = usages.slice(1);
-  const leadTokens = summedTokens(usages);
-  const compactorTokens = summedTokens(compactor);
-  const leadCost = usages.reduce(
-    (sum, usage) => sum + (usage.cost?.total ?? 0),
-    0,
-  );
+  const lead = leadCost(usages, measuredTurns);
+  const compactorCosts = compactorCost(compactor);
   const nativeCompactions = run.entries.filter(
     (entry) => entry.type === "compaction",
   ).length;
-  const inView = gate.filter((entry) =>
-    (entry.data?.identifiers ?? []).some((identifier) => identifier.inView),
-  );
-  const zoomBeforeInView = inView.filter(
-    (entry) => entry.data?.zoomBefore === true,
-  );
   return {
     turns: run.turns,
     llmCalls: usages.length,
     nativeCompactions,
-    leadTokens,
-    compactorCalls: compactor.length,
-    compactorTokens,
-    leadCost,
-    compactorCost: estimatedCost(compactorTokens),
-    cost: leadCost + estimatedCost(compactorTokens),
+    lead,
+    compactor: compactorCosts,
+    cost: lead.cost + compactorCosts.cost,
     turnRatio: summedRatio(measuredTurns),
     compactionRatio: summedRatio(compactor),
     wallMs: run.wallMs,
     probes: scored.probes,
     probeTotal: scored.total,
     probeMax: scored.maxTotal,
-    gate: {
-      entries: gate.length,
-      blocks: gate.filter((entry) => entry.data?.blocked === true).length,
-      inView: inView.length,
-      zoomBeforeInView: zoomBeforeInView.length,
-      zoomBeforeActRate: inView.length
-        ? zoomBeforeInView.length / inView.length
-        : 0,
-    },
+    gate: memoryGateReport(gate),
+    store: await memoryStoreStats(run.storeRoot),
   };
 }
 
@@ -5006,19 +5263,21 @@ async function memoryCacheRunReport(run) {
 }
 
 /** The Markdown table pasted into the PR description. */
-function memoryMarkdown(memory, native) {
+export function memoryMarkdown(memory, native) {
+  const arms = [
+    ["memory", memory],
+    ["native", native],
+  ];
+  const ratio = (value) => (value === null ? "not reported" : value.toFixed(3));
   const rows = [
     "| arm | probe total | turns | LLM calls | input | output | cache read | cost USD | native compactions | turn cache | compaction cache | wall s |",
     "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
   ];
-  for (const [name, arm] of [
-    ["memory", memory],
-    ["native", native],
-  ]) {
+  for (const [name, arm] of arms) {
     const tokens = {
-      input: arm.leadTokens.input + arm.compactorTokens.input,
-      output: arm.leadTokens.output + arm.compactorTokens.output,
-      cacheRead: arm.leadTokens.cacheRead + arm.compactorTokens.cacheRead,
+      input: arm.lead.input + arm.compactor.input,
+      output: arm.lead.output + arm.compactor.output,
+      cacheRead: arm.lead.cacheRead + arm.compactor.cacheRead,
     };
     rows.push(
       `| ${name} | ${arm.probeTotal}/${arm.probeMax} | ${arm.turns} | ${arm.llmCalls} | ${tokens.input} | ${tokens.output} | ${tokens.cacheRead} | ${arm.cost.toFixed(4)} | ${arm.nativeCompactions} | ${arm.turnRatio.ratio.toFixed(3)} | ${arm.compactionRatio.ratio.toFixed(3)} | ${(arm.wallMs / 1000).toFixed(0)} |`,
@@ -5026,18 +5285,54 @@ function memoryMarkdown(memory, native) {
   }
   rows.push("");
   rows.push(
-    `memory arm gate: ${memory.gate.blocks} blocked calls of ${memory.gate.entries} gated calls; unprompted zoom-before-act rate ${memory.gate.zoomBeforeActRate.toFixed(3)} (${memory.gate.zoomBeforeInView}/${memory.gate.inView} in-view calls)`,
+    "| arm | Lead input | Lead output | Lead cache read | Lead USD | compactor input | compactor output | compactor reasoning | compactor cache read | compactor USD | arm USD |",
   );
+  rows.push(
+    "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+  );
+  for (const [name, arm] of arms) {
+    const c = arm.compactor;
+    rows.push(
+      `| ${name} | ${arm.lead.input} | ${arm.lead.output} | ${arm.lead.cacheRead} | ${arm.lead.cost.toFixed(4)} | ${c.input} | ${c.output} | ${c.reasoning ?? "not reported"} | ${c.cacheRead} | ${c.cost.toFixed(4)} | ${arm.cost.toFixed(4)} |`,
+    );
+  }
+  rows.push("");
+  rows.push(
+    "| arm | compactor calls | leaf | merge | mean output/call | mean reasoning/call | reasoning share of output | mean attempts/call | Lead uncached input/call |",
+  );
+  rows.push("| --- | --- | --- | --- | --- | --- | --- | --- | --- |");
+  for (const [name, arm] of arms) {
+    const c = arm.compactor;
+    rows.push(
+      `| ${name} | ${c.calls} | ${c.leafCalls} | ${c.mergeCalls} | ${c.meanOutputPerCall.toFixed(1)} | ${c.meanReasoningPerCall === null ? "not reported" : c.meanReasoningPerCall.toFixed(1)} | ${ratio(c.reasoningShareOfOutput)} | ${c.meanAttemptsPerCall.toFixed(2)} | ${arm.lead.uncachedInputPerCall.toFixed(0)} |`,
+    );
+  }
+  rows.push("");
+  rows.push(
+    `memory arm gate: ${memory.gate.blocks} blocked of ${memory.gate.entries} gated calls; ${memory.gate.inView} in-view calls: blockedShare ${memory.gate.blockedShare.toFixed(3)}, verbatimBeforeAct ${memory.gate.verbatimBeforeAct}, zoomShare ${memory.gate.zoomShare.toFixed(3)} (${memory.gate.zoomSatisfied} by zoom), blockRecovered ${memory.gate.blockRecovered}`,
+  );
+  rows.push("");
+  rows.push(memoryStoreLine(memory.store));
   rows.push("");
   rows.push("| arm | probe | score | note |");
   rows.push("| --- | --- | --- | --- |");
-  for (const [name, arm] of [
-    ["memory", memory],
-    ["native", native],
-  ])
+  for (const [name, arm] of arms)
     for (const probe of arm.probes)
       rows.push(`| ${name} | ${probe.name} | ${probe.score} | ${probe.note} |`);
   return rows.join("\n");
+}
+
+/** One line of store shape and identifier retention, or none without a store. */
+function memoryStoreLine(store) {
+  if (!store) return "memory arm store: none";
+  const kinds = Object.entries(store.messagesByKind)
+    .map(([kind, count]) => `${kind} ${count}`)
+    .join(", ");
+  return [
+    `memory arm store: ${store.messages} messages (${kinds}); ${store.viewNodes} view nodes: ${store.viewCalls} built by a call, ${store.nodesWithoutCall} call-free, ${store.unbuilt} unbuilt; ${store.calls} calls in all;`,
+    `view ${store.viewBytes} bytes; over-leaf share ${store.overLeafShare.toFixed(3)}; mean node ${store.meanNodeBytes.toFixed(0)} bytes; lossy share ${store.lossyShare.toFixed(3)};`,
+    `identifiers kept ${store.identifiers.share.toFixed(3)} (${store.identifiers.kept}/${store.identifiers.total})`,
+  ].join(" ");
 }
 
 /** The typed-cost estimate printed before the run. */
@@ -5303,7 +5598,7 @@ async function runMemoryScenario(args) {
     for (const run of runs) {
       const facts = memoryRunFacts(run.entries);
       const scored = scoreMemoryProbes(run.entries, facts, probes);
-      reports[run.arm] = memoryRunReport(run, scored);
+      reports[run.arm] = await memoryRunReport(run, scored);
     }
     const memory = reports.memory;
     const native = reports.native;

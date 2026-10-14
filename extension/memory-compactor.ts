@@ -52,10 +52,16 @@ export const FAILED_RETRY_INTERVAL = 8;
 
 export type MemoryCompactorUsage = {
   line: ViewLine;
+  /** `leaf` for a message node, `merge` for a node built from two children. */
+  kind: "leaf" | "merge";
   input: number;
   output: number;
+  /** Reasoning tokens, a subset of `output`; null when the provider reports none. */
+  reasoning: number | null;
   cacheRead: number;
   cacheWrite: number;
+  /** One build attempt plus every over-length retry. */
+  attempts: number;
   retries: number;
 };
 
@@ -333,7 +339,13 @@ class CompactorRunner implements MemoryCompactor {
       viewMessage(this.store.renderCompactionBlocks(line)),
       userMessage(this.task(inputs)),
     ];
-    const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+    const usage = {
+      input: 0,
+      output: 0,
+      reasoning: null,
+      cacheRead: 0,
+      cacheWrite: 0,
+    };
     let built: { text: string; retries: number } | undefined;
     try {
       built = await this.build(request, usage);
@@ -354,7 +366,13 @@ class CompactorRunner implements MemoryCompactor {
     // failed model call or requeue the node.
     try {
       this.callbacks.onNodeBuilt?.(line, text);
-      this.callbacks.onUsage?.({ line, ...usage, retries: built.retries });
+      this.callbacks.onUsage?.({
+        line,
+        ...usage,
+        kind: inputs.kind === "message" ? "leaf" : "merge",
+        attempts: built.retries + 1,
+        retries: built.retries,
+      });
     } catch {
       // Swallowed on purpose: the build already happened.
     }
@@ -370,6 +388,7 @@ class CompactorRunner implements MemoryCompactor {
     usage: {
       input: number;
       output: number;
+      reasoning: number | null;
       cacheRead: number;
       cacheWrite: number;
     },
@@ -596,6 +615,7 @@ function addUsage(
   total: {
     input: number;
     output: number;
+    reasoning: number | null;
     cacheRead: number;
     cacheWrite: number;
   },
@@ -603,6 +623,9 @@ function addUsage(
 ): void {
   total.input += usage.input;
   total.output += usage.output;
+  // A provider that reports no reasoning leaves the total null, never zero.
+  if (typeof usage.reasoning === "number")
+    total.reasoning = (total.reasoning ?? 0) + usage.reasoning;
   total.cacheRead += usage.cacheRead;
   total.cacheWrite += usage.cacheWrite;
 }

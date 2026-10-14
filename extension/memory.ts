@@ -100,7 +100,7 @@ export const VIEW_CLOSE = "</chat>";
 export const UNBUILT_LINE = "(not summarized yet: zoom it)";
 const UNBUILT_BYTES = Buffer.byteLength(UNBUILT_LINE, "utf8");
 /** The body of a message that only carried images. Images are not stored. */
-const IMAGE_BODY = "(image)";
+export const IMAGE_BODY = "(image)";
 const IMAGE_BODY_BYTES = Buffer.byteLength(IMAGE_BODY, "utf8");
 /**
  * Herdsman's own custom messages behind these types are a real agent result, an
@@ -519,8 +519,9 @@ export function markViewCache(payload: unknown): ProviderPayload | undefined {
     CACHE_MARK_LIMIT
   )
     return undefined;
-  const mark = blocks.find((block) => block.cache_control !== undefined)
-    ?.cache_control;
+  const mark = blocks.find(
+    (block) => block.cache_control !== undefined,
+  )?.cache_control;
   if (mark === undefined) return undefined;
   const view = messages[viewIndex] as Record<string, unknown>;
   if (!Array.isArray(view.content)) return undefined;

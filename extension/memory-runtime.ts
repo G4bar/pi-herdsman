@@ -148,10 +148,17 @@ type TurnCorpus = {
   lower: string;
   /** True when a `zoom` result is already earlier in this turn. */
   zoomed: boolean;
+  /** The part of the turn a value can have come from, in gate order. */
+  zoom: string;
+  user: string;
+  tool: string;
 };
 
 /** The identifier classes the gate distinguishes. */
 type GateClass = "uuid" | "ref" | "path";
+
+/** Where the gate found a value verbatim, or that it did not. */
+type GateSource = "zoom" | "user" | "tool" | "none";
 
 /** One identifier an action relies on. */
 type GateCheck = { value: string; class: GateClass };
@@ -289,10 +296,13 @@ export function registerMemoryRuntime(
           onUsage: (usage) =>
             pi.appendEntry(USAGE_ENTRY_TYPE, {
               node: usage.line,
+              kind: usage.kind,
               input: usage.input,
               output: usage.output,
+              reasoning: usage.reasoning,
               cacheRead: usage.cacheRead,
               cacheWrite: usage.cacheWrite,
+              attempts: usage.attempts,
               retries: usage.retries,
             }),
         });
@@ -766,6 +776,7 @@ function gateCall(
           : check.class === "uuid"
             ? corpus.lower.includes(check.value)
             : corpus.text.includes(check.value),
+      source: corpusSource(corpus, check, ctx.cwd),
     };
   });
   const blocked = decisions.filter(({ check, inView, inCorpus }) =>
@@ -776,11 +787,12 @@ function gateCall(
   pi.appendEntry(GATE_ENTRY_TYPE, {
     tool: event.toolName,
     toolCallId: event.toolCallId,
-    identifiers: decisions.map(({ check, inView, inCorpus }) => ({
+    identifiers: decisions.map(({ check, inView, inCorpus, source }) => ({
       value: check.value,
       class: check.class,
       inView,
       inCorpus,
+      source,
     })),
     blocked: blocked.length > 0,
     zoomBefore: corpus.zoomed && !memory.gateBlocked,
@@ -899,29 +911,65 @@ function turnCorpus(
     frozen.anchor === null
       ? 0
       : branch.findIndex((entry) => entry.id === frozen.anchor) + 1;
-  let text = systemPromptOf(ctx);
+  const zoomEntries: string[] = [];
+  const userEntries: string[] = [];
+  const toolEntries: string[] = [];
   let zoomed = false;
   for (let index = Math.max(start, 0); index < branch.length; index += 1) {
     const entry = branch[index];
     // The derivation decides which entries count; the text stays raw and
     // unclipped, so a value the model saw past the echo clip still counts.
-    const counts = deriveMessages(entry, memory.session).some(
+    const derived = deriveMessages(entry, memory.session);
+    const counts = derived.some(
       (message) =>
         message.kind === "user" ||
         message.kind === "echo" ||
         message.kind === "work",
     );
-    if (counts) text += `\n${rawEntryText(entry)}`;
-    if (isZoomResult(entry)) zoomed = true;
+    const isZoom = isZoomResult(entry);
+    if (isZoom) zoomed = true;
+    if (!counts) continue;
+    // One entry can hold several kinds; the first that can hold an identifier
+    // decides where the value came from.
+    const raw = rawEntryText(entry);
+    if (isZoom) zoomEntries.push(raw);
+    else if (derived.some((message) => message.kind === "user"))
+      userEntries.push(raw);
+    else toolEntries.push(raw);
   }
+  const zoom = zoomEntries.join("\n");
+  const user = userEntries.join("\n");
+  const tool = toolEntries.join("\n");
+  const text = `${systemPromptOf(ctx)}\n${zoom}\n${user}\n${tool}`;
   const corpus: TurnCorpus = {
     key,
     text,
     lower: text.toLowerCase(),
     zoomed,
+    zoom,
+    user,
+    tool,
   };
   memory.corpus = corpus;
   return corpus;
+}
+
+/** The first part of this turn's corpus that holds the value verbatim. */
+function corpusSource(
+  corpus: TurnCorpus,
+  check: GateCheck,
+  cwd: string,
+): GateSource {
+  const holds = (text: string) =>
+    check.class === "path"
+      ? pathInText(check.value, cwd, text)
+      : check.class === "uuid"
+        ? text.toLowerCase().includes(check.value)
+        : text.includes(check.value);
+  if (holds(corpus.zoom)) return "zoom";
+  if (holds(corpus.user)) return "user";
+  if (holds(corpus.tool)) return "tool";
+  return "none";
 }
 
 /**

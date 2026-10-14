@@ -53,6 +53,10 @@ import {
   cleanupMemoryResources,
   copyIfExists,
   installMemorySignalHandlers,
+  memoryGateReport,
+  memoryStoreStats,
+  memoryRunReport,
+  memoryMarkdown,
   memoryScenarioOptions,
   formatSmokeFailure,
   herdrErrorCode,
@@ -609,6 +613,306 @@ test("copyIfExists swallows missing parts but rethrows real failures", async () 
     copyIfExists(source, source),
     (error) => error.code === "ERR_FS_CP_EINVAL",
   );
+  await rm(root, { recursive: true, force: true });
+});
+
+test("the gate report separates blocked, verbatim and zoom calls", () => {
+  const identifier = (overrides = {}) => ({
+    value: "value",
+    class: "uuid",
+    inView: true,
+    inCorpus: false,
+    source: "none",
+    ...overrides,
+  });
+  const report = memoryGateReport([
+    {
+      tool: "edit",
+      blocked: false,
+      identifiers: [identifier({ source: "zoom" })],
+    },
+    {
+      tool: "edit",
+      blocked: false,
+      identifiers: [identifier({ source: "tool" })],
+    },
+    { tool: "edit", blocked: true, identifiers: [identifier()] },
+    {
+      tool: "edit",
+      blocked: false,
+      identifiers: [identifier({ source: "zoom" })],
+    },
+    // A call the view never held is not in the denominator.
+    {
+      tool: "edit",
+      blocked: true,
+      identifiers: [identifier({ inView: false })],
+    },
+    {
+      tool: "edit",
+      blocked: false,
+      identifiers: [identifier({ source: "user" })],
+    },
+  ]);
+  assert.equal(report.entries, 6);
+  assert.equal(report.blocks, 2);
+  assert.equal(report.inView, 5);
+  assert.equal(report.blockedShare, 0.2);
+  assert.equal(report.verbatimBeforeAct, 4);
+  assert.equal(report.zoomSatisfied, 2);
+  assert.equal(report.zoomShare, 0.4);
+  // Every block is followed by a passing call to the same tool.
+  assert.equal(report.blockRecovered, true);
+});
+
+test("the gate report flags a block no same-tool retry passed in time", () => {
+  const identifier = {
+    value: "value",
+    class: "uuid",
+    inView: true,
+    inCorpus: false,
+    source: "none",
+  };
+  const report = memoryGateReport([
+    { tool: "edit", blocked: true, identifiers: [identifier] },
+    { tool: "write", blocked: false, identifiers: [identifier] },
+    { tool: "write", blocked: false, identifiers: [identifier] },
+    { tool: "edit", blocked: false, identifiers: [identifier] },
+  ]);
+  assert.equal(report.blockRecovered, false);
+});
+
+/** One tiny project store: two messages and the merge node built from them. */
+async function tinyMemoryStore(root) {
+  await mkdir(join(root, "main"), { recursive: true });
+  await mkdir(join(root, "tree"), { recursive: true });
+  const record = (i, text) => ({
+    i,
+    kind: "user",
+    text,
+    size: Buffer.byteLength(`user: ${text}`, "utf8"),
+    date: "2026-01-02T03:04:05.000Z",
+    src: { session: "/sessions/s.jsonl", entry: `e${i}`, part: 0 },
+    hash: `h${i}`,
+  });
+  await writeFile(
+    join(root, "main", "2026-01-02.jsonl"),
+    [
+      record(0, "see docs/notes.md and result:scout#1"),
+      record(1, "y".repeat(600)),
+    ]
+      .map((value) => JSON.stringify(value))
+      .join("\n") + "\n",
+  );
+  const merged = "merged docs/notes.md …[ids]";
+  await writeFile(
+    join(root, "tree", "2026-01-02.jsonl"),
+    `${JSON.stringify({
+      l: 1,
+      i: 0,
+      text: merged,
+      size: Buffer.byteLength(merged, "utf8"),
+    })}\n`,
+  );
+  await writeFile(
+    join(root, "view.json"),
+    `${JSON.stringify({
+      version: 1,
+      T: 2,
+      chat: [[1, 0]],
+      compaction: [[1, 0]],
+    })}\n`,
+  );
+}
+
+test("memory store stats read shape and identifier retention", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-herdsman-store-stats-"));
+  await tinyMemoryStore(root);
+  const stats = await memoryStoreStats(root);
+  assert.equal(stats.messages, 2);
+  assert.deepEqual(stats.messagesByKind, { user: 2 });
+  assert.equal(stats.viewNodes, 1);
+  assert.equal(stats.viewCalls, 1);
+  assert.equal(stats.nodesWithoutCall, 0);
+  assert.equal(stats.unbuilt, 0);
+  assert.equal(stats.calls, 1);
+  assert.equal(
+    stats.viewBytes,
+    Buffer.byteLength(
+      `<chat>\n0+1|merged docs/notes.md …[ids]\n</chat>`,
+      "utf8",
+    ),
+  );
+  assert.equal(stats.overLeafShare, 0);
+  assert.equal(
+    stats.meanNodeBytes,
+    Buffer.byteLength("merged docs/notes.md …[ids]", "utf8"),
+  );
+  assert.equal(stats.lossyShare, 1);
+  // The merge dropped the ref and kept the path.
+  assert.equal(stats.identifiers.total, 2);
+  assert.equal(stats.identifiers.kept, 1);
+  assert.equal(stats.identifiers.share, 0.5);
+  assert.deepEqual(stats.identifiers.byKind, {
+    ref: { total: 1, kept: 0, share: 0 },
+    path: { total: 1, kept: 1, share: 1 },
+  });
+  await rm(root, { recursive: true, force: true });
+});
+
+test("memory store stats accept a call-free leaf and an unbuilt line", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-herdsman-store-stats-"));
+  await tinyMemoryStore(root);
+  await writeFile(
+    join(root, "view.json"),
+    `${JSON.stringify({
+      version: 1,
+      T: 2,
+      chat: [
+        [0, 0],
+        [0, 1],
+      ],
+      compaction: [[0, 0]],
+    })}\n`,
+  );
+  const stats = await memoryStoreStats(root);
+  assert.equal(stats.viewNodes, 2);
+  assert.equal(stats.viewCalls, 0);
+  // A short leaf needs no call; the long one is still waiting for one.
+  assert.equal(stats.nodesWithoutCall, 1);
+  assert.equal(stats.unbuilt, 1);
+  assert.equal(stats.calls, 1);
+  assert.equal(await memoryStoreStats(join(root, "absent")), undefined);
+  await rm(root, { recursive: true, force: true });
+});
+
+test("the memory report splits the Lead and compactor cost per arm", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-herdsman-report-"));
+  const usage = (overrides) => ({
+    type: "custom",
+    customType: "pi-herdsman-memory-usage",
+    data: {
+      node: [0, 0],
+      kind: "leaf",
+      input: 10,
+      output: 100,
+      reasoning: 60,
+      cacheRead: 5,
+      cacheWrite: 0,
+      attempts: 3,
+      retries: 2,
+      ...overrides,
+    },
+  });
+  const gate = (overrides) => ({
+    type: "custom",
+    customType: "pi-herdsman-memory-gate",
+    data: {
+      tool: "edit",
+      blocked: false,
+      identifiers: [
+        {
+          value: "a",
+          class: "uuid",
+          inView: true,
+          inCorpus: true,
+          source: "zoom",
+        },
+      ],
+      ...overrides,
+    },
+  });
+  const assistant = (input, output, cacheRead, cost) => ({
+    type: "message",
+    message: {
+      role: "assistant",
+      usage: {
+        input,
+        output,
+        cacheRead,
+        cacheWrite: 0,
+        cost: { total: cost },
+      },
+    },
+  });
+  const run = {
+    turns: 2,
+    wallMs: 1000,
+    // No store: the arm never activated project memory.
+    storeRoot: join(root, "store"),
+    entries: [
+      assistant(100, 20, 900, 0.5),
+      assistant(200, 30, 800, 0.02),
+      usage(),
+      usage({
+        node: [1, 0],
+        kind: "merge",
+        input: 20,
+        output: 200,
+        // A provider that reports no reasoning leaves the total null, and an
+        // entry an older run wrote has no `attempts` at all.
+        reasoning: undefined,
+        attempts: undefined,
+        retries: 0,
+      }),
+      gate(),
+      gate({
+        blocked: true,
+        identifiers: [
+          {
+            value: "b",
+            class: "uuid",
+            inView: true,
+            inCorpus: false,
+            source: "none",
+          },
+        ],
+      }),
+      gate({
+        identifiers: [
+          {
+            value: "b",
+            class: "uuid",
+            inView: true,
+            inCorpus: true,
+            source: "tool",
+          },
+        ],
+      }),
+    ],
+  };
+  const report = await memoryRunReport(run, {
+    probes: [],
+    total: 0,
+    maxTotal: 0,
+  });
+  assert.equal(report.llmCalls, 2);
+  assert.equal(report.lead.input, 300);
+  assert.equal(report.lead.output, 50);
+  assert.equal(report.lead.cacheRead, 1700);
+  assert.equal(report.lead.cost, 0.52);
+  // The first call writes the cache, so it is not in the measured set.
+  assert.equal(report.lead.uncachedInputPerCall, 200);
+  assert.equal(report.compactor.calls, 2);
+  assert.equal(report.compactor.leafCalls, 1);
+  assert.equal(report.compactor.mergeCalls, 1);
+  assert.equal(report.compactor.output, 300);
+  assert.equal(report.compactor.reasoning, 60);
+  assert.equal(report.compactor.reasoningCalls, 1);
+  assert.equal(report.compactor.meanOutputPerCall, 150);
+  assert.equal(report.compactor.meanReasoningPerCall, 60);
+  assert.equal(report.compactor.reasoningShareOfOutput, 0.2);
+  assert.equal(report.compactor.meanAttemptsPerCall, 2);
+  assert.equal(report.cost, report.lead.cost + report.compactor.cost);
+  assert.equal(report.gate.blockedShare, 1 / 3);
+  assert.equal(report.gate.verbatimBeforeAct, 2);
+  assert.equal(report.gate.zoomShare, 1 / 3);
+  assert.equal(report.gate.blockRecovered, true);
+  assert.equal(report.store, undefined);
+
+  const markdown = memoryMarkdown(report, report);
+  assert.match(markdown, /blockedShare 0\.333/);
+  assert.match(markdown, /memory arm store: none/);
   await rm(root, { recursive: true, force: true });
 });
 

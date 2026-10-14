@@ -1813,10 +1813,7 @@ test("a UUID the user typed this turn passes, whatever its case", async () => {
 
 test("a ref the user typed this turn is allowed", async () => {
   const { session, harness } = await gateSession(["opening"]);
-  pushEntry(
-    session,
-    userEntry("use result:researcher#1", lastId(session)),
-  );
+  pushEntry(session, userEntry("use result:researcher#1", lastId(session)));
   const result = await harness.toolCall(session, "delegate_agent", {
     definition: "researcher",
     task: "do it",
@@ -1900,10 +1897,7 @@ test("a path that appears nowhere is allowed", async () => {
 
 test("the agent, label and definition fields are never checked", async () => {
   const { session, harness } = await gateSession(["opening"]);
-  pushEntry(
-    session,
-    userEntry("use result:researcher#1", lastId(session)),
-  );
+  pushEntry(session, userEntry("use result:researcher#1", lastId(session)));
   // The agent is a UUID that appears nowhere; only the ref inside the message
   // is checked, so the call passes.
   assert.equal(
@@ -2009,8 +2003,51 @@ test("a gate entry records each identifier and the zoomBefore state", async () =
   assert.equal(entries[0].tool, "continue_agent");
   assert.equal(entries[0].toolCallId, "call-1");
   assert.deepEqual(entries[0].identifiers, [
-    { value: GATE_UUID, class: "uuid", inView: false, inCorpus: true },
+    {
+      value: GATE_UUID,
+      class: "uuid",
+      inView: false,
+      inCorpus: true,
+      source: "zoom",
+    },
   ]);
+  await harness.shutdown(session, "quit");
+});
+
+test("a gate entry names the part of the turn that showed each identifier", async () => {
+  const { session, harness } = await gateSession(["opening"]);
+  pushEntry(
+    session,
+    gateToolResult(`zoomed ${GATE_UUID}`, "zoom", lastId(session)),
+  );
+  await harness.toolCall(session, "continue_agent", {
+    session: GATE_UUID,
+    task: "go",
+  });
+  pushEntry(
+    session,
+    gateToolResult(`read ${LETTER_UUID}`, "read", lastId(session)),
+  );
+  await harness.toolCall(session, "continue_agent", {
+    session: LETTER_UUID,
+    task: "go",
+  });
+  pushEntry(session, userEntry(`typed ${OTHER_UUID}`, lastId(session)));
+  await harness.toolCall(session, "continue_agent", {
+    session: OTHER_UUID,
+    task: "go",
+  });
+  const blocked = await harness.toolCall(session, "delegate_agent", {
+    definition: "researcher",
+    task: "use result:nowhere#1",
+  });
+  assert.equal(blocked.block, true);
+  assert.deepEqual(
+    gateEntries(harness).map((entry) =>
+      entry.identifiers.map((identifier: any) => identifier.source),
+    ),
+    [["zoom"], ["tool"], ["user"], ["none"]],
+  );
   await harness.shutdown(session, "quit");
 });
 
@@ -2130,9 +2167,7 @@ function markedPayload(blocks: string[], extraMarks = 0): any {
       },
       {
         role: "user",
-        content: [
-          { type: "text", text: "next", cache_control: CACHE_MARK },
-        ],
+        content: [{ type: "text", text: "next", cache_control: CACHE_MARK }],
       },
     ],
   };
@@ -2181,7 +2216,9 @@ test("the view mark is a no-op on unexpected shapes", () => {
     { messages: "not an array" },
     { messages: [] },
     { messages: [{ role: "user", content: "plain" }] },
-    { messages: [{ role: "user", content: [{ type: "text", text: "<chat>" }] }] },
+    {
+      messages: [{ role: "user", content: [{ type: "text", text: "<chat>" }] }],
+    },
   ])
     assert.equal(markViewCache(payload), undefined);
 });
@@ -2271,11 +2308,14 @@ test("usage entries are appended per compaction", async () => {
   await harness.sessionStart(session);
   harness.compactors[0].options.onUsage?.({
     line: [0, 0],
+    kind: "leaf",
     input: 1,
     output: 2,
+    reasoning: 1,
     cacheRead: 3,
     cacheWrite: 4,
-    retries: 0,
+    attempts: 2,
+    retries: 1,
   });
   assert.deepEqual(
     harness.pi.entries.filter(
@@ -2287,11 +2327,14 @@ test("usage entries are appended per compaction", async () => {
         customType: "pi-herdsman-memory-usage",
         data: {
           node: [0, 0],
+          kind: "leaf",
           input: 1,
           output: 2,
+          reasoning: 1,
           cacheRead: 3,
           cacheWrite: 4,
-          retries: 0,
+          attempts: 2,
+          retries: 1,
         },
       },
     ],
