@@ -60,6 +60,10 @@ import {
   memoryScenarioOptions,
   horizonPlan,
   horizonValidity,
+  horizonScoreTable,
+  horizonScoreSummary,
+  horizonWinRule,
+  scoreMemoryProbes,
   formatSmokeFailure,
   herdrErrorCode,
   managerDiagnosticLines,
@@ -672,16 +676,50 @@ test("memory-horizon plans five segments, its default arms and the cost cap", ()
   assert.deepEqual(dflt.arms, ["memory", "native-continue"]);
   assert.equal(dflt.runs, 2);
   assert.equal(dflt.segments.length, 5);
-  assert.equal(dflt.turns, 80);
+  assert.equal(dflt.turns, 98);
   assert.deepEqual(
     dflt.segments.map((steps) => steps.length),
-    [16, 16, 16, 16, 16],
+    [16, 16, 20, 16, 30],
   );
   assert.equal(dflt.quick, false);
   assert.ok(!dflt.reduced);
   // The third segment carries the mid-run probe set, so it is one of the two
   // segments the compacting baseline has to fill.
   assert.equal(dflt.segments[2].filter((step) => step.settles === 2).length, 1);
+  // The mid-run set asks the four segment 1 facts at the end of segment 3.
+  const mid = dflt.segments[2].filter((step) => step.probe);
+  assert.deepEqual(
+    mid.map((step) => step.name),
+    ["planPath", "errorLine", "engine", "forbiddenDatabase"],
+  );
+  assert.ok(mid.every((step) => step.askSegment === 3 && step.age > 0));
+  // The final set is the whole phase 15 probe battery, asked at the end of the
+  // run, with the corrections' superseded values forbidden.
+  const final = dflt.segments[4].filter((step) => step.probe);
+  assert.equal(final.length, 14);
+  assert.ok(final.every((step) => step.askSegment === 5 && step.age > 0));
+  assert.deepEqual(final.find((step) => step.name === "apiPrefix").mustNot, [
+    "/v2",
+  ]);
+  assert.deepEqual(final.find((step) => step.name === "port").mustNot, [
+    "5433",
+  ]);
+  assert.equal(final.find((step) => step.name === "dbFile").file, "src/db.mjs");
+  assert.equal(
+    final.find((step) => step.name === "continueScoutA").action,
+    true,
+  );
+  // No probe prompt names the value it scores, or it would be a hint.
+  for (const step of [...mid, ...final]) {
+    const must =
+      typeof step.contains === "function" ? [] : (step.contains ?? []);
+    for (const value of must)
+      assert.equal(
+        step.prompt.includes(value),
+        false,
+        `${step.name} names ${value}`,
+      );
+  }
 
   const quick = horizonPlan({ quick: true, maxCost: undefined });
   assert.equal(quick.runs, 1);
@@ -821,6 +859,254 @@ test("memory-horizon validity reports errors, missing stores and thin checks", (
     validity({ segments: [segment()], plannedSegments: 5 })[0],
     /ran 1 of 5 segments/,
   );
+});
+
+test("the horizon probe scorer grades replies, files and the action call", () => {
+  const facts = {
+    firstScoutSession: "11111111-2222-3333-4444-555555555555",
+    firstScoutRef: "result:scout-1#1",
+    reviewerRef: "result:reviewer-1#1",
+  };
+  const user = (prompt: string) => [
+    { type: "message", message: { role: "user", content: prompt } },
+  ];
+  const answer = (prompt: string, reply: string) => [
+    ...user(prompt),
+    {
+      type: "message",
+      message: { role: "assistant", content: [{ type: "text", text: reply }] },
+    },
+  ];
+  const probe = (overrides: Record<string, unknown>) => ({
+    name: "probe",
+    category: "early",
+    factSegment: 1,
+    factTurn: 1,
+    askSegment: 5,
+    age: 80,
+    prompt: "cold recall",
+    ...overrides,
+  });
+  const probes = [
+    probe({ name: "pass", contains: ["plans/billing/HORIZON.md"] }),
+    probe({ name: "fail", prompt: "missing", contains: ["Postgres 16"] }),
+    probe({
+      name: "mustNotHit",
+      prompt: "old",
+      contains: ["/v3"],
+      mustNot: ["/v2"],
+    }),
+    probe({
+      name: "mustNotPattern",
+      prompt: "pattern",
+      contains: ["/v3"],
+      mustNot: [/current[^]{0,40}\/v2/i],
+    }),
+    probe({
+      name: "file",
+      prompt: "db",
+      file: "src/db.mjs",
+      contains: ["Postgres 16", "5434"],
+      mustNot: ["MySQL"],
+    }),
+    probe({
+      name: "fileMissing",
+      prompt: "missing file",
+      file: "src/gone.mjs",
+      contains: ["x"],
+    }),
+    probe({ name: "action", action: true }),
+    probe({ name: "noExpectation", prompt: "empty", contains: [] }),
+    probe({
+      name: "unknownFact",
+      prompt: "unknown",
+      contains: (values: typeof facts) => [values.firstScoutRef],
+    }),
+  ];
+  const entries = [
+    ...answer("cold recall", "the plan is plans/billing/HORIZON.md"),
+    ...answer("missing", "we did not decide an engine"),
+    ...answer("old", "/v3 is current, it was /v2"),
+    ...answer("pattern", "/v3 is current; /v2 was superseded"),
+    ...answer("db", "done"),
+    ...answer("empty", "anything"),
+    ...answer("unknown", facts.firstScoutRef),
+    ...user("action"),
+    {
+      type: "message",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            id: "call-1",
+            name: "continue_agent",
+            arguments: { session: facts.firstScoutSession },
+          },
+        ],
+      },
+    },
+    {
+      type: "message",
+      message: {
+        role: "toolResult",
+        toolCallId: "call-1",
+        isError: true,
+        content: "blocked: zoom the identifier first",
+      },
+    },
+  ];
+  const scored = scoreMemoryProbes(entries, facts, probes, (path: string) =>
+    path === "src/db.mjs"
+      ? "export const db = 'Postgres 16 on 5434';"
+      : undefined,
+  );
+  const byName = Object.fromEntries(
+    scored.probes.map((row: { name: string }) => [row.name, row]),
+  );
+  assert.equal(byName.pass.score, 1);
+  assert.equal(byName.pass.note, "matched");
+  assert.equal(byName.fail.score, 0);
+  assert.equal(byName.fail.note, "missing 1");
+  assert.equal(byName.mustNotHit.score, 0);
+  assert.equal(byName.mustNotHit.note, "forbidden /v2");
+  assert.equal(byName.mustNotPattern.score, 0);
+  assert.match(byName.mustNotPattern.note, /^forbidden \/current/);
+  assert.equal(byName.file.score, 1);
+  assert.equal(byName.fileMissing.score, 0);
+  assert.equal(byName.fileMissing.note, "src/gone.mjs was not written");
+  // The last attempt used the exact session but the gate blocked it.
+  assert.equal(byName.action.score, 0);
+  assert.equal(byName.action.note, "last attempt blocked by the gate");
+  assert.equal(byName.noExpectation.score, 0);
+  assert.equal(byName.noExpectation.note, "no expected value recorded");
+  assert.equal(byName.unknownFact.score, 1);
+  // Every row carries where its fact was stated, where it was asked and its
+  // age, which the report's tables group by.
+  assert.deepEqual(Object.keys(byName.pass), [
+    "name",
+    "category",
+    "factSegment",
+    "askSegment",
+    "age",
+    "score",
+    "note",
+  ]);
+  assert.equal(scored.total, 3);
+  assert.equal(scored.maxTotal, probes.length);
+
+  // An action probe without a recorded session scores 0, so an arm that never
+  // saw scout A cannot win it.
+  const noSession = scoreMemoryProbes(entries, {}, [
+    probe({ name: "action", action: true }),
+  ]);
+  assert.equal(noSession.probes[0].score, 0);
+  assert.equal(noSession.probes[0].note, "no first scout session recorded");
+});
+
+test("the horizon score table groups by category, restart and age", () => {
+  const row = (overrides: Record<string, unknown>) => ({
+    score: 1,
+    category: "early",
+    factSegment: 1,
+    askSegment: 5,
+    age: 80,
+    ...overrides,
+  });
+  const table = horizonScoreTable([
+    row({}),
+    row({ category: "corrections", factSegment: 4, age: 40 }),
+    row({ score: 0, age: 80 }),
+    // Asked in the segment its fact was stated in: not cross-session.
+    row({ score: 0, askSegment: 1 }),
+  ]);
+  assert.equal(table.total, 2);
+  assert.equal(table.maxTotal, 4);
+  assert.deepEqual(table.byCategory, [
+    { category: "corrections", score: 1, max: 1 },
+    { category: "early", score: 1, max: 3 },
+  ]);
+  assert.deepEqual(table.crossSession, { score: 2, max: 3 });
+  assert.deepEqual(table.byAge, [
+    { age: 40, score: 1, max: 1 },
+    { age: 80, score: 1, max: 3 },
+  ]);
+});
+
+test("the horizon win rule needs the margin in every run and in the mean", () => {
+  const totals = (memory: number[], native: number[], fresh?: number[]) => ({
+    memory: memory.map((total, index) => ({ run: index + 1, total })),
+    "native-continue": native.map((total, index) => ({
+      run: index + 1,
+      total,
+    })),
+    ...(fresh
+      ? {
+          "native-fresh": fresh.map((total, index) => ({
+            run: index + 1,
+            total,
+          })),
+        }
+      : {}),
+  });
+  const clear = horizonWinRule(totals([12, 13], [9, 10]));
+  assert.equal(clear.claim, "memory better");
+  assert.deepEqual(clear.deltas, [3, 3]);
+  assert.equal(clear.meanDelta, 3);
+  assert.match(clear.detail, /every paired run and in the mean/);
+  // One run below the margin leaves no claim, whatever the mean says.
+  assert.equal(horizonWinRule(totals([12, 11], [9, 10])).claim, "no claim");
+  // Exactly the margin is enough.
+  assert.equal(
+    horizonWinRule(totals([11, 12], [9, 10])).claim,
+    "memory better",
+  );
+  assert.equal(
+    horizonWinRule(totals([9, 10], [12, 13])).claim,
+    "native better",
+  );
+  assert.equal(horizonWinRule(totals([10, 11], [10, 10])).claim, "no claim");
+  // An unpaired run cannot carry a claim, and native-fresh never enters one.
+  const unpaired = horizonWinRule({
+    memory: [{ run: 1, total: 12 }],
+    "native-continue": [{ run: 2, total: 4 }],
+  });
+  assert.equal(unpaired.claim, "no claim");
+  assert.match(unpaired.detail, /no run has both arms/);
+  const informational = horizonWinRule(totals([12, 13], [9, 10], [0, 0]));
+  assert.equal(informational.claim, "memory better");
+  assert.equal(informational.freshMean, 0);
+  assert.match(informational.detail, /native-fresh \(informational/);
+});
+
+test("the horizon score summary means the runs and holds the win rule", () => {
+  const run = (overrides: Record<string, unknown>) => ({
+    run: 1,
+    valid: true,
+    probeTotal: 10,
+    probeMax: 14,
+    scores: {
+      byCategory: [{ category: "early", score: 5, max: 6 }],
+      crossSession: { score: 4, max: 5 },
+      byAge: [],
+    },
+    ...overrides,
+  });
+  const summary = horizonScoreSummary({
+    memory: [run({}), run({ run: 2, probeTotal: 12 })],
+    "native-continue": [run({ probeTotal: 8 }), run({ run: 2, probeTotal: 9 })],
+  });
+  assert.deepEqual(summary.arms.memory.runs, [
+    { run: 1, valid: true, total: 10, maxTotal: 14 },
+    { run: 2, valid: true, total: 12, maxTotal: 14 },
+  ]);
+  assert.equal(summary.arms.memory.mean.total, 11);
+  assert.deepEqual(summary.arms.memory.mean.byCategory, [
+    { category: "early", mean: 5, max: 6 },
+  ]);
+  assert.equal(summary.arms["native-continue"].mean.total, 8.5);
+  assert.equal(summary.win.claim, "memory better");
+  assert.equal(summary.win.meanDelta, 2.5);
 });
 
 test("runScenario forwards memory scenario options", () => {

@@ -148,9 +148,10 @@ recall probe scores, tokens, estimated cost, cache ratios, gate blocks and the
 unprompted zoom-before-act rate, plus a Markdown table for the PR.
 
 `memory-horizon` is the long-horizon A/B. UniiChat's claims show over days, not
-in 32 turns, so the script is five segments of about sixteen turns each (80
-turns). A segment is one `pi --mode rpc` process: that is what `/new` and a
-restart do. The fixture gives the Lead a cheap `scripts/emit.mjs <topic> <n>`
+in 32 turns, so the script is five segments of about sixteen turns each (98
+turns with both probe sets). A segment is one `pi --mode rpc` process: that is
+what `/new` and a restart do. The fixture gives the Lead a cheap
+`scripts/emit.mjs <topic> <n>`
 that prints about 7 KB of log lines, so most turns cost context without a large
 file read, and it deliberately holds none of the facts the probes ask about:
 the early decisions, the error line and the user's own phrase are planted in the
@@ -190,9 +191,40 @@ of its view nodes built, which is what the shutdown drain exists to keep. The
 report carries, per arm and run: validity and the issues behind it, cost per
 segment, Lead prompt tokens per call by turn index (to show the view stays
 bounded), native compactions per segment, and the memory store's built-node
-share and view bytes at each segment end. The probes, their scoring and the win
-rule arrive with the harness's next change; the JSON and Markdown report
-skeleton already carries the slots they fill.
+share and view bytes at each segment end.
+
+Every probe is one turn asked cold, with no hint and no mention of project
+memory, and is scored automatically: a probe passes only when every `must`
+string is in the answer, a behavior probe only when the file the Lead wrote
+holds the right values, and the action probe only when the last `continue_agent`
+attempt used the exact session id and the gate did not block it. No probe prompt
+names a value it scores, and the two corrections probes ask for the current
+value only, with the superseded one forbidden. Each probe row carries its
+category, the segment where its fact was stated, the segment where it is asked
+and its age in turns. The mid-run set (the four segment 1 facts) is asked at the
+end of segment 3, so native decay is visible; the final set of fourteen is asked
+at the end of segment 5 and covers exact early facts, the user's own words,
+the delegation identifiers, the corrections, the behavior file and the action.
+
+The report scores each arm and run by category, cross-session subtotal (facts
+from an earlier segment asked after a restart), and age in turns, and gives the
+mean and the per-run values across runs. The win rule claims "memory better"
+only when memory beats `native-continue` by at least two probes in every paired
+run and in the mean, and "native better" under the symmetric rule; otherwise it
+reports "no claim". `native-fresh` is informational: it measures what
+continuity is worth and never enters the rule. The report also carries the phase
+10 gate numbers per arm and run (`blockedShare`, `verbatimBeforeAct`,
+`zoomShare`, `blockRecovered`), per-segment cost and compactions, and the store
+numbers at each segment end.
+
+The view's boundedness and the recovery claims are also checked without a model
+by `extension/memory-scale.test.ts`. It feeds thousands of about 2 KB messages
+through a real `MemoryStore` with a fake compactor that returns deterministic
+512-byte lines, and asserts that the chat view stays under its bound after every
+batch, that a batch returns the view to its target, that the tree grows one node
+per message and merge, that a close and a fresh load keep the same view with no
+rebuild, and that any message is still readable by its id through a seek to the
+recorded offset rather than a read of the whole log.
 
 By default a run deletes its temporary root, taking the project store, the Lead
 session JSONL and per-node usage with it. Pass `--keep <dir>` to copy, per arm,

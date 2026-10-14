@@ -5189,14 +5189,20 @@ function memoryRunFacts(entries) {
       entry.type === "custom_message" &&
       entry.customType === "pi-herdsman-agent-result",
   );
-  const firstScout = results.find((entry) =>
-    /agent=scout/.test(String(entry.content ?? "")),
-  );
-  const content = firstScout ? String(firstScout.content) : "";
+  const contentOf = (pattern) => {
+    const entry = results.find((result) =>
+      pattern.test(String(result.content ?? "")),
+    );
+    return entry ? String(entry.content) : "";
+  };
+  const scout = contentOf(/agent=scout/);
   return {
-    firstScoutSession: /session=([0-9a-f-]{36})/i.exec(content)?.[1],
+    firstScoutSession: /session=([0-9a-f-]{36})/i.exec(scout)?.[1],
     firstScoutRef: /Result ref:\s*(result:[a-z][a-z0-9_-]*#\d+)/.exec(
-      content,
+      scout,
+    )?.[1],
+    reviewerRef: /Result ref:\s*(result:[a-z][a-z0-9_-]*#\d+)/.exec(
+      contentOf(/agent=reviewer/),
     )?.[1],
   };
 }
@@ -5264,35 +5270,236 @@ function continueProbeScore(entries, session) {
   };
 }
 
-/** Scores every probe for one arm. */
-function scoreMemoryProbes(entries, facts, probes) {
+/**
+ * A probe's `contains`/`mustNot` list, with its function form resolved against
+ * the run's facts. Empty entries never score, so an unknown fact reads as "no
+ * expected value recorded" instead of a free point.
+ */
+function probeList(value, facts) {
+  const list = typeof value === "function" ? value(facts) : value;
+  return (list ?? []).filter(
+    (entry) => entry !== undefined && entry !== null && entry !== "",
+  );
+}
+
+/** A `mustNot` entry is a substring, or a pattern when it is a RegExp. */
+function patternHit(text, pattern) {
+  return typeof pattern === "string"
+    ? text.includes(pattern)
+    : pattern.test(text);
+}
+
+/** Scores one probe's text: all `must` present, no `mustNot` hit. */
+function scoreProbeText(probe, facts, text) {
+  const must = probeList(probe.contains, facts).filter(
+    (entry) => typeof entry === "string",
+  );
+  const missing = must.filter((entry) => !text.includes(entry));
+  const forbidden = probeList(probe.mustNot, facts).filter((entry) =>
+    patternHit(text, entry),
+  );
+  return {
+    score:
+      must.length > 0 && missing.length === 0 && forbidden.length === 0 ? 1 : 0,
+    note:
+      must.length === 0
+        ? "no expected value recorded"
+        : missing.length > 0
+          ? `missing ${missing.length}`
+          : forbidden.length > 0
+            ? `forbidden ${forbidden.join(", ")}`
+            : "matched",
+  };
+}
+
+/**
+ * Scores every probe for one arm. A probe with `file` is graded on that file's
+ * text instead of the reply, and an `action` probe on the exact tool call, so
+ * the three probe kinds a phase 15 run uses share one scorer.
+ */
+export function scoreMemoryProbes(entries, facts, probes, files) {
   const scored = probes.map((probe) => {
+    const row = {
+      name: probe.name,
+      category: probe.category,
+      factSegment: probe.factSegment,
+      askSegment: probe.askSegment,
+      age: probe.age,
+    };
     if (probe.action) {
       const value = continueProbeScore(entries, facts.firstScoutSession);
-      return { name: probe.name, score: value.score, note: value.note };
+      return { ...row, score: value.score, note: value.note };
     }
-    const expected = (
-      typeof probe.contains === "function"
-        ? probe.contains(facts)
-        : probe.contains
-    ).filter((value) => typeof value === "string" && value !== "");
-    const reply = replyAfter(entries, probe.prompt);
-    const missing = expected.filter((value) => !reply.includes(value));
-    return {
-      name: probe.name,
-      score: expected.length > 0 && missing.length === 0 ? 1 : 0,
-      note:
-        expected.length === 0
-          ? "no expected value recorded"
-          : missing.length === 0
-            ? "matched"
-            : `missing ${missing.length}`,
-    };
+    const text = probe.file
+      ? files?.(probe.file)
+      : replyAfter(entries, probe.prompt);
+    if (text === undefined)
+      return { ...row, score: 0, note: `${probe.file} was not written` };
+    return { ...row, ...scoreProbeText(probe, facts, text) };
   });
   return {
     probes: scored,
     total: scored.reduce((sum, probe) => sum + probe.score, 0),
     maxTotal: scored.length,
+  };
+}
+
+/**
+ * The phase 15 score table of one arm-run: the total, the per-category scores,
+ * the facts from an earlier segment asked after a restart, and the score by
+ * age in turns.
+ */
+export function horizonScoreTable(probes) {
+  const counts = (key, rows) => {
+    const table = new Map();
+    for (const row of rows) {
+      if (row[key] === undefined) continue;
+      const entry = table.get(row[key]) ?? { score: 0, max: 0 };
+      entry.score += row.score;
+      entry.max += 1;
+      table.set(row[key], entry);
+    }
+    return table;
+  };
+  const rows = (key, table) =>
+    [...table.entries()]
+      .sort((left, right) =>
+        typeof left[0] === "number"
+          ? left[0] - right[0]
+          : String(left[0]).localeCompare(String(right[0])),
+      )
+      .map(([name, value]) => ({ [key]: name, ...value }));
+  const categories = rows("category", counts("category", probes));
+  const ages = rows("age", counts("age", probes));
+  const crossSession = probes.filter(
+    (probe) =>
+      probe.factSegment !== undefined &&
+      probe.askSegment !== undefined &&
+      probe.factSegment < probe.askSegment,
+  );
+  return {
+    total: probes.reduce((sum, probe) => sum + probe.score, 0),
+    maxTotal: probes.length,
+    byCategory: categories,
+    crossSession: {
+      score: crossSession.reduce((sum, probe) => sum + probe.score, 0),
+      max: crossSession.length,
+    },
+    byAge: ages,
+  };
+}
+
+/**
+ * The phase 15 win rule: `memory` is better only when it beats
+ * `native-continue` by at least `margin` probes in every paired run and in the
+ * mean; `native-continue` is better under the symmetric rule. Anything else is
+ * no claim. `native-fresh` measures the floor and never enters the rule.
+ */
+export function horizonWinRule(totals, margin = MEMORY_HORIZON_WIN_MARGIN) {
+  const arm = (name) => totals[name] ?? [];
+  const mean = (values) =>
+    values.length
+      ? values.reduce((total, value) => total + value, 0) / values.length
+      : undefined;
+  const runIds = [
+    ...new Set(
+      [...arm("memory"), ...arm("native-continue")].map((row) => row.run),
+    ),
+  ].sort((left, right) => left - right);
+  const pairs = runIds
+    .map((run) => ({
+      run,
+      memory: arm("memory").find((row) => row.run === run)?.total,
+      native: arm("native-continue").find((row) => row.run === run)?.total,
+    }))
+    .filter((pair) => pair.memory !== undefined && pair.native !== undefined);
+  const memoryMean = mean(arm("memory").map((row) => row.total));
+  const nativeMean = mean(arm("native-continue").map((row) => row.total));
+  const freshMean = mean(arm("native-fresh").map((row) => row.total));
+  const deltas = pairs.map((pair) => pair.memory - pair.native);
+  const meanDelta =
+    memoryMean === undefined || nativeMean === undefined
+      ? undefined
+      : memoryMean - nativeMean;
+  const clear = (sign) =>
+    deltas.length > 0 &&
+    deltas.every((delta) => (sign > 0 ? delta >= margin : delta <= -margin)) &&
+    meanDelta !== undefined &&
+    (sign > 0 ? meanDelta >= margin : meanDelta <= -margin);
+  const claim = clear(1)
+    ? "memory better"
+    : clear(-1)
+      ? "native better"
+      : "no claim";
+  return {
+    claim,
+    margin,
+    pairs,
+    deltas,
+    meanDelta,
+    memoryMean,
+    nativeMean,
+    freshMean,
+    detail: [
+      pairs.length === 0
+        ? "no run has both arms"
+        : `memory minus native-continue: ${pairs.map((pair) => `run ${pair.run} ${pair.memory - pair.native >= 0 ? "+" : ""}${pair.memory - pair.native}`).join(", ")}; mean ${meanDelta >= 0 ? "+" : ""}${meanDelta.toFixed(2)}`,
+      `a claim needs at least ${margin} probes in every paired run and in the mean`,
+      freshMean === undefined
+        ? "native-fresh did not run"
+        : `native-fresh (informational, never in the rule) mean ${freshMean.toFixed(2)}`,
+    ].join("; "),
+  };
+}
+
+/**
+ * The across-runs view of one run set: each arm's per-run totals and its mean
+ * score per category, plus the win rule over the probe totals.
+ */
+export function horizonScoreSummary(results) {
+  const arms = {};
+  for (const [name, runs] of Object.entries(results)) {
+    const categories = new Map();
+    for (const run of runs)
+      for (const row of run.scores?.byCategory ?? []) {
+        const entry = categories.get(row.category) ?? {
+          category: row.category,
+          score: 0,
+          max: 0,
+        };
+        entry.score += row.score;
+        entry.max += row.max;
+        categories.set(row.category, entry);
+      }
+    const totals = runs.map((run) => run.probeTotal ?? 0);
+    arms[name] = {
+      runs: runs.map((run) => ({
+        run: run.run,
+        valid: run.valid,
+        total: run.probeTotal ?? 0,
+        maxTotal: run.probeMax ?? 0,
+      })),
+      mean: {
+        total: totals.length
+          ? totals.reduce((total, value) => total + value, 0) / totals.length
+          : 0,
+        maxTotal: runs[0]?.probeMax ?? 0,
+        byCategory: [...categories.values()].map((entry) => ({
+          category: entry.category,
+          mean: runs.length ? entry.score / runs.length : 0,
+          // The mean and the per-run maximum, so the two are comparable.
+          max: runs.length ? entry.max / runs.length : 0,
+        })),
+      },
+    };
+  }
+  return {
+    arms,
+    win: horizonWinRule(
+      Object.fromEntries(
+        Object.entries(arms).map(([name, value]) => [name, value.runs]),
+      ),
+    ),
   };
 }
 
@@ -5793,9 +6000,9 @@ async function runMemoryScenario(args) {
 //   and excluded from any win rule.
 //
 // The arms share the fixture, the script, the Lead model, the delegations and
-// the native threshold, so the only difference is project memory. Phases 15-16
-// add the probe sets, the scoring and the full runs. See
-// docs/development/smoke-testing.md.
+// the native threshold, so the only difference is project memory. The probe
+// sets, the scoring and the win rule live with the script below. Phase 16 runs
+// it full length. See docs/development/smoke-testing.md.
 
 /** Pi compacts when contextTokens > contextWindow - reserveTokens. */
 const MEMORY_HORIZON_NATIVE_THRESHOLD = 24_000;
@@ -5807,6 +6014,8 @@ const MEMORY_HORIZON_MIN_NATIVE_COMPACTIONS = 8;
 const MEMORY_HORIZON_BUILT_NODE_SHARE = 0.95;
 const MEMORY_HORIZON_DEFAULT_RUNS = 2;
 const MEMORY_HORIZON_DEFAULT_MAX_COST = 3;
+/** The phase 15 win rule's margin, in probes, over `native-continue`. */
+const MEMORY_HORIZON_WIN_MARGIN = 2;
 /** `--quick` keeps the first turns of two segments, then three probes. */
 const MEMORY_HORIZON_QUICK_TURNS = 4;
 /**
@@ -5833,10 +6042,12 @@ const HORIZON_FACTS = {
   errorLine:
     "ERR_BILLING_PORT: expected 5432 but got 5433 in src/config.mjs:12",
   phrase: "the billing spike is the only thing that matters this quarter",
-  retryLimit: "7",
+  retryLimit: "7 attempts",
   flagName: "billing_v2_shadow",
   correctedApiPrefix: "/v3",
   correctedPort: "5434",
+  /** The behavior probe's file, written by the Lead itself. */
+  dbFile: "src/db.mjs",
 };
 
 /** Thrown by the cost gate; the run stops and reports `incomplete`. */
@@ -5895,7 +6106,7 @@ function horizonSegment(segment) {
     case 2:
       return [
         {
-          prompt: `Second decision: the billing client retries at most ${HORIZON_FACTS.retryLimit} times, and the feature flag for the new path is ${HORIZON_FACTS.flagName}. Acknowledge in one line and do not use tools.`,
+          prompt: `Second decision: the billing client retries at most ${HORIZON_FACTS.retryLimit}, and the feature flag for the new path is ${HORIZON_FACTS.flagName}. Acknowledge in one line and do not use tools.`,
         },
         {
           prompt: `Append a '## Retries' section to ${HORIZON_FACTS.planPath} naming the retry limit and the flag. Use the edit tool.`,
@@ -5920,6 +6131,7 @@ function horizonSegment(segment) {
           settles: 2,
         },
         ...horizonBulkSteps(13, 2),
+        ...horizonMidProbes(),
       ];
     case 4:
       return [
@@ -5937,46 +6149,266 @@ function horizonSegment(segment) {
           prompt: `Read ${HORIZON_FACTS.planPath} and reply with its section headings, in order.`,
         },
         ...horizonBulkSteps(15, 5),
+        ...horizonFinalProbes(),
       ];
   }
+}
+
+/**
+ * One cold recall probe. `contains` is the `must` list (every entry required,
+ * matched as an exact substring) and `mustNot` the values a correct answer may
+ * not hold (a string substring, or a pattern for a superseded value's shape).
+ * `factSegment`/`factTurn` place the fact the probe scores, so the age in turns
+ * is exact; `action` and `file` pick the two probes that are not reply text.
+ */
+function horizonProbe({
+  name,
+  category,
+  factSegment,
+  factTurn,
+  prompt,
+  contains,
+  mustNot,
+  action,
+  file,
+}) {
+  return {
+    name,
+    category,
+    factSegment,
+    factTurn,
+    prompt,
+    contains,
+    mustNot,
+    action,
+    file,
+    probe: true,
+  };
+}
+
+/**
+ * The exact segment 1 facts, asked cold at the end of two segments: the
+ * mid-run set shows how native decay and the memory view differ, and the same
+ * four open the final set.
+ */
+function horizonEarlyProbes() {
+  return [
+    horizonProbe({
+      name: "planPath",
+      category: "early",
+      factSegment: 1,
+      factTurn: 4,
+      prompt:
+        "Cold recall, no hints: reply with just the path of the plan file I asked you to write.",
+      contains: [HORIZON_FACTS.planPath],
+    }),
+    horizonProbe({
+      name: "errorLine",
+      category: "early",
+      factSegment: 1,
+      factTurn: 3,
+      prompt:
+        "Cold recall, no hints: reply with exactly the error line the billing suite failed with.",
+      contains: [HORIZON_FACTS.errorLine],
+    }),
+    horizonProbe({
+      name: "engine",
+      category: "early",
+      factSegment: 1,
+      factTurn: 1,
+      prompt:
+        "Cold recall, no hints: which database engine and version did we decide to run? Reply in one short line.",
+      contains: [HORIZON_FACTS.engine],
+    }),
+    horizonProbe({
+      name: "forbiddenDatabase",
+      category: "early",
+      factSegment: 1,
+      factTurn: 1,
+      prompt:
+        "Cold recall, no hints: which database did we forbid? Reply with just its name.",
+      contains: [HORIZON_FACTS.forbiddenDatabase],
+    }),
+  ];
+}
+
+/** The mid-run set: the four segment 1 facts, asked at the end of segment 3. */
+function horizonMidProbes() {
+  return horizonEarlyProbes();
+}
+
+/**
+ * The final set, asked at the end of segment 5: fourteen probes over every
+ * property the design claims. No prompt names a fact it scores, and the
+ * corrections ask for the current value only, with the superseded one
+ * `mustNot`.
+ */
+function horizonFinalProbes() {
+  return [
+    ...horizonEarlyProbes(),
+    horizonProbe({
+      name: "retryLimit",
+      category: "early",
+      factSegment: 2,
+      factTurn: 1,
+      prompt:
+        "Cold recall, no hints: how many times at most does the billing client retry? Reply with just that.",
+      contains: [HORIZON_FACTS.retryLimit],
+    }),
+    horizonProbe({
+      name: "flagName",
+      category: "early",
+      factSegment: 2,
+      factTurn: 1,
+      prompt:
+        "Cold recall, no hints: reply with just the exact name of the feature flag for the new billing path.",
+      contains: [HORIZON_FACTS.flagName],
+    }),
+    horizonProbe({
+      name: "userWords",
+      category: "words",
+      factSegment: 1,
+      factTurn: 2,
+      prompt:
+        "Cold recall, no hints: quote, as closely as you can, the one sentence I gave you about what is most important to us right now.",
+      contains: ["billing spike", "only thing that matters", "this quarter"],
+    }),
+    horizonProbe({
+      name: "scoutASession",
+      category: "identifiers",
+      factSegment: 1,
+      factTurn: 5,
+      prompt:
+        "Cold recall, no hints: reply with just the session id of the first scout you delegated.",
+      contains: (facts) => [facts.firstScoutSession],
+    }),
+    horizonProbe({
+      name: "scoutARef",
+      category: "identifiers",
+      factSegment: 1,
+      factTurn: 5,
+      prompt:
+        "Cold recall, no hints: reply with just the result ref that scout's result used.",
+      contains: (facts) => [facts.firstScoutRef],
+    }),
+    horizonProbe({
+      name: "reviewerRef",
+      category: "identifiers",
+      factSegment: 3,
+      factTurn: 3,
+      prompt:
+        "Cold recall, no hints: reply with just the result ref the reviewer's result used.",
+      contains: (facts) => [facts.reviewerRef],
+    }),
+    horizonProbe({
+      name: "apiPrefix",
+      category: "corrections",
+      factSegment: 3,
+      factTurn: 1,
+      prompt:
+        "Cold recall, no hints: reply with only the API prefix the billing API uses now, and nothing else.",
+      contains: [HORIZON_FACTS.correctedApiPrefix],
+      mustNot: [HORIZON_FACTS.apiPrefix],
+    }),
+    horizonProbe({
+      name: "port",
+      category: "corrections",
+      factSegment: 4,
+      factTurn: 1,
+      prompt:
+        "Cold recall, no hints: reply with only the database port the billing service uses now, and nothing else.",
+      contains: [HORIZON_FACTS.correctedPort],
+      mustNot: [HORIZON_FACTS.port],
+    }),
+    horizonProbe({
+      name: "dbFile",
+      category: "behavior",
+      factSegment: 1,
+      factTurn: 1,
+      prompt: `Cold recall, no hints: write ${HORIZON_FACTS.dbFile} so it connects to our database, using the settings we settled on. Use the write tool, then reply done.`,
+      file: HORIZON_FACTS.dbFile,
+      contains: [HORIZON_FACTS.engine, HORIZON_FACTS.correctedPort],
+      mustNot: [HORIZON_FACTS.forbiddenDatabase],
+    }),
+    horizonProbe({
+      name: "continueScoutA",
+      category: "action",
+      factSegment: 1,
+      factTurn: 5,
+      prompt:
+        "Continue the first scout you delegated with: report whether src/format.mjs rounds amounts. Use continue_agent with the exact session you recorded, then reply done.",
+      action: true,
+    }),
+  ];
+}
+
+/**
+ * The turn number of (segment, turn) in the whole run. The probe's age is the
+ * distance between the turn that stated its fact and the turn that asks.
+ */
+function horizonTurnNumber(segments, segment, turn) {
+  let position = 0;
+  for (let index = 0; index < segment - 1; index += 1)
+    position += segments[index].length;
+  return position + turn;
+}
+
+/** Stamps every probe step with where it is asked and how old its fact is. */
+function horizonAnnotateProbes(segments) {
+  segments.forEach((steps, index) =>
+    steps.forEach((step, at) => {
+      if (!step.probe) return;
+      step.askSegment = index + 1;
+      step.age =
+        horizonTurnNumber(segments, index + 1, at + 1) -
+        horizonTurnNumber(segments, step.factSegment, step.factTurn);
+    }),
+  );
+  return segments;
 }
 
 /** Three probes over the segment 1 facts, so `--quick` can score something. */
 function horizonQuickProbes() {
   return [
-    {
+    horizonProbe({
       name: "planPath",
+      category: "early",
+      factSegment: 1,
+      factTurn: 4,
       prompt:
         "Cold recall, no hints: what is the exact path of the plan file I asked you to write? Reply with just the path.",
       contains: [HORIZON_FACTS.planPath],
-    },
-    {
+    }),
+    horizonProbe({
       name: "decision",
+      category: "early",
+      factSegment: 1,
+      factTurn: 1,
       prompt:
         "Cold recall, no hints: which database port did we decide to use, and which database did we forbid? Reply in one line.",
       contains: [HORIZON_FACTS.port, HORIZON_FACTS.forbiddenDatabase],
-    },
-    {
+    }),
+    horizonProbe({
       name: "errorLine",
+      category: "early",
+      factSegment: 1,
+      factTurn: 3,
       prompt:
         "Cold recall, no hints: what exact error line did the billing suite fail with? Reply with just that line.",
       contains: [HORIZON_FACTS.errorLine],
-    },
+    }),
   ];
 }
 
-/** The script: one step list per segment. Phase 15 adds the probe sets. */
+/** The script: one step list per segment, with its probes stamped. */
 function horizonScript({ quick = false } = {}) {
-  if (!quick) return [1, 2, 3, 4, 5].map(horizonSegment);
+  if (!quick) return horizonAnnotateProbes([1, 2, 3, 4, 5].map(horizonSegment));
   const segments = [1, 2].map((segment) =>
     horizonSegment(segment).slice(0, MEMORY_HORIZON_QUICK_TURNS),
   );
   const last = segments[segments.length - 1];
-  segments[segments.length - 1] = [
-    ...last,
-    ...horizonQuickProbes().map((probe) => ({ ...probe, probe: true })),
-  ];
-  return segments;
+  segments[segments.length - 1] = [...last, ...horizonQuickProbes()];
+  return horizonAnnotateProbes(segments);
 }
 
 /** One turn's assumed cost: the Lead's calls plus the memory arm's compactor. */
@@ -6327,11 +6759,21 @@ async function runHorizonArm({
 
   budget.settle(segments.reduce((total, s) => total + s.costUsd, 0));
   const facts = memoryRunFacts(entries);
+  // A behavior probe is graded on the file the Lead wrote, so the file is read
+  // once at the end of the run: no later step writes it again.
+  const probeFiles = new Map();
+  for (const step of plan.segments.flat())
+    if (step.file)
+      probeFiles.set(
+        step.file,
+        await readFile(join(project, step.file), "utf8").catch(() => undefined),
+      );
   const scored = segments.map((segment, index) =>
     scoreMemoryProbes(
       segment.entries,
       facts,
       plan.segments[index].filter((step) => step.probe),
+      (file) => probeFiles.get(file),
     ),
   );
   const probes = scored.flatMap((value) => value.probes);
@@ -6339,6 +6781,9 @@ async function runHorizonArm({
   const nativeCompactions = segments.reduce(
     (total, segment) => total + segment.nativeCompactions,
     0,
+  );
+  const gate = memoryGateReport(
+    gateEntries(entries).map((entry) => entry.data ?? {}),
   );
   const issues = horizonValidity({
     arm,
@@ -6364,11 +6809,17 @@ async function runHorizonArm({
       first: promptTokens[0] ?? 0,
       last: promptTokens.at(-1) ?? 0,
       max: promptTokens.length ? Math.max(...promptTokens) : 0,
+      // The view is bounded, so this list stays bounded however long the run is.
+      byTurn: promptTokens,
     },
     leadCalls: promptTokens,
     probes,
     probeTotal: probes.reduce((total, probe) => total + probe.score, 0),
     probeMax: probes.length,
+    scores: horizonScoreTable(probes),
+    // The phase 10 gate numbers, plus the phase 15 name for the in-view calls
+    // that ran because their value was already verbatim in the turn.
+    gate: { ...gate, verbatimBeforeAct: gate.passedInView },
     wallMs: Date.now() - startedAt,
     errors,
     stderr: stderr.slice(-4000),
@@ -6376,7 +6827,7 @@ async function runHorizonArm({
   };
 }
 
-/** The horizon report's Markdown: one summary table, then one per segment. */
+/** The horizon report's Markdown: the run tables, the scores, the win rule. */
 export function memoryHorizonMarkdown(report) {
   const rows = [
     "| arm | run | valid | turns | cost USD | native compactions | built nodes | view bytes | probes | Lead prompt tokens first/last/max |",
@@ -6401,6 +6852,68 @@ export function memoryHorizonMarkdown(report) {
           `| ${arm} | ${result.run} | ${segment.index} | ${segment.turns} | ${segment.costUsd.toFixed(4)} | ${segment.nativeCompactions} | ${segment.store ? segment.store.builtShare.toFixed(3) : "n/a"} | ${segment.store?.viewBytes ?? "n/a"} |`,
         );
   rows.push("");
+  // The phase 10 gate numbers, per arm-run.
+  rows.push(
+    "| arm | run | gated calls | blocked | blockedShare | verbatimBeforeAct | zoomShare | blockRecovered |",
+  );
+  rows.push("| --- | --- | --- | --- | --- | --- | --- | --- |");
+  for (const arm of report.arms)
+    for (const result of report.results[arm] ?? [])
+      rows.push(
+        `| ${arm} | ${result.run} | ${result.gate.entries} | ${result.gate.blocks} | ${result.gate.blockedShare.toFixed(3)} | ${result.gate.verbatimBeforeAct} | ${result.gate.zoomShare.toFixed(3)} | ${result.gate.blockRecovered} |`,
+      );
+  rows.push("");
+  // The score table: per category, the cross-session subtotal and the age.
+  const categories = [
+    ...new Set(
+      Object.values(report.results)
+        .flat()
+        .flatMap((result) =>
+          result.scores.byCategory.map((row) => row.category),
+        ),
+    ),
+  ];
+  rows.push(
+    `| arm | run | probe total | ${categories.join(" | ")} | cross-session | mean age |`,
+  );
+  rows.push(
+    `| --- | --- | --- | ${categories.map(() => "---").join(" | ")} | --- | --- |`,
+  );
+  for (const arm of report.arms)
+    for (const result of report.results[arm] ?? []) {
+      const score = (category) => {
+        const row = result.scores.byCategory.find(
+          (entry) => entry.category === category,
+        );
+        return row ? `${row.score}/${row.max}` : "0/0";
+      };
+      const passed = result.probes.filter((probe) => probe.score === 1);
+      const meanAge = passed.length
+        ? (
+            passed.reduce((total, probe) => total + (probe.age ?? 0), 0) /
+            passed.length
+          ).toFixed(1)
+        : "n/a";
+      rows.push(
+        `| ${arm} | ${result.run} | ${result.probeTotal}/${result.probeMax} | ${categories.map(score).join(" | ")} | ${result.scores.crossSession.score}/${result.scores.crossSession.max} | ${meanAge} |`,
+      );
+    }
+  rows.push("");
+  rows.push(
+    "| arm | run | probe | category | fact segment | asked segment | age | score | note |",
+  );
+  rows.push("| --- | --- | --- | --- | --- | --- | --- | --- | --- |");
+  for (const arm of report.arms)
+    for (const result of report.results[arm] ?? [])
+      for (const probe of result.probes)
+        rows.push(
+          `| ${arm} | ${result.run} | ${probe.name} | ${probe.category ?? "n/a"} | ${probe.factSegment ?? "n/a"} | ${probe.askSegment ?? "n/a"} | ${probe.age ?? "n/a"} | ${probe.score} | ${probe.note} |`,
+        );
+  rows.push("");
+  rows.push(
+    `win rule: ${report.scores.win.claim} (${report.scores.win.detail})`,
+  );
+  rows.push("");
   for (const arm of report.arms)
     for (const result of report.results[arm] ?? [])
       if (result.issues.length)
@@ -6413,8 +6926,8 @@ export function memoryHorizonMarkdown(report) {
 }
 
 /**
- * The horizon arms and segments, the cost gate and the report skeleton. The
- * probes, the scoring and the win rule arrive in phase 15.
+ * The horizon arms and segments, the cost gate, the scored probe sets and the
+ * report.
  */
 async function runMemoryHorizonScenario(args) {
   const plan = horizonPlan(args);
@@ -6480,8 +6993,12 @@ async function runMemoryHorizonScenario(args) {
           : `native-continue must compact at least ${MEMORY_HORIZON_MIN_NATIVE_COMPACTIONS} times.`,
         `The memory arm must end every segment with at least ${MEMORY_HORIZON_BUILT_NODE_SHARE} of its view nodes built (the phase 11 drain), and with a store to check.`,
         "The cost gate covers Lead plus compactor-surfaced spend only; a delegated agent's usage is not surfaced, so the cap can be passed by the delegations' share.",
-        "Probe scores are phase 15's; this run scores only the --quick probe set.",
+        plan.quick
+          ? "Probe scores: the three --quick probes over the segment 1 facts."
+          : `Probe scores: the mid-run set (${horizonMidProbes().length} segment 1 facts) at the end of segment 3 and the final set (${horizonFinalProbes().length} probes) at the end of segment 5.`,
+        `The win rule needs at least ${MEMORY_HORIZON_WIN_MARGIN} probes of margin over native-continue in every paired run and in the mean; native-fresh is informational and never enters it.`,
       ],
+      scores: horizonScoreSummary(results),
       results: Object.fromEntries(
         Object.entries(results).map(([arm, runs]) => [
           arm,
