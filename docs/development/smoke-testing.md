@@ -36,6 +36,8 @@ npm run smoke -- core
 npm run smoke -- continuation
 npm run smoke -- chief-tree
 npm run smoke -- manager-recovery
+npm run smoke -- memory-cache --yes
+npm run smoke -- memory-quality --yes
 ```
 
 `npm run smoke` runs the default `core` scenario. The harness creates a
@@ -55,8 +57,10 @@ managed descendants do not load the probe.
 
 The available scenarios are `core` (nested delegation and candidate-extension
 propagation), `continuation` (persisted Pi-session continuation across managed
-generations), `chief-tree` (current Chief/session_tree behavior), `memory`
-(project memory against native Pi compaction in an ordinary Lead session), and `manager-recovery`
+generations), `chief-tree` (current Chief/session_tree behavior), `memory-cache`
+(the Anthropic view-mark cache measurement in an ordinary Lead session),
+`memory-quality` (project memory against native Pi compaction in an ordinary
+Lead session), and `manager-recovery`
 (Manager delegation, review messaging, `stop_lead`, missing
 worktree reconstruction with exact Pi-session continuity, retained project
 messages across Manager turnover, and Herdr-driven project retirement).
@@ -95,52 +99,69 @@ Herdsman, copy normal Pi settings or extensions, or run as part of
 `npm run validate`. Run selected scenarios according to the change being
 verified; `npm run smoke` defaults to `core`.
 
-The `memory` scenario does not create its own nested Herdr session: the harness
-cannot drive a multi-turn ordinary Lead session, so it drives Pi in RPC mode
-with the Lead environment (an isolated `PI_CODING_AGENT_DIR`, `HERDR_ENV=1`, and
-no managed-agent identity) and loads this worktree's `extension/index.ts`
-directly, so no build is needed. Delegation steps use the invoking Herdr
-workspace, so the real Pi agent directory must contain Herdr's
-`herdr-agent-state.ts` integration; the scenario copies it into the temporary
-agent directory.
+The `memory-cache` and `memory-quality` scenarios do not create their own
+nested Herdr session: the harness cannot drive a multi-turn ordinary Lead
+session, so they drive Pi in RPC mode with the Lead environment (an isolated
+`PI_CODING_AGENT_DIR`, `HERDR_ENV=1`, and no managed-agent identity) and load
+this worktree's `extension/index.ts` directly, so no build is needed. Delegation
+steps use the invoking Herdr workspace, so the real Pi agent directory must
+contain Herdr's `herdr-agent-state.ts` integration; the scenario copies it into
+the temporary agent directory. Both make real model calls and print a cost
+estimate; both refuse to start without `--yes`.
 
-It runs two arms once each, in a random order:
+`memory-cache` measures the Anthropic-only view prefix mark by running the same
+fixture twice, once with the mark and once with
+`PI_HERDSMAN_MEMORY_DISABLE_VIEW_MARK=1`, in a randomized arm order. Each arm
+runs eight no-tool prose turns. The default Lead model is
+`opencode-go/claude-haiku-5-5`, which fronts the Anthropic Messages API through
+the opencode-go proxy; `--model` overrides it. An `anthropic/*` model is refused
+unless `--allow-anthropic` is passed. The compactor stays
+`opencode-go/deepseek-v4.1-flash`. The scenario passes when the with-mark turn
+cache ratio reaches 0.95; no gap between turns may exceed four minutes. The
+report carries both arm ratios, the informational compaction ratio, the store
+and session bytes per message, the model ids and the arm order.
+
+`memory-quality` is the long orchestration A/B: two arms once each, in a random
+order.
 
 - `memory`: the throwaway project is listed in `memoryProjects`, so the Lead uses
   project memory.
 - `native`: the project is not listed, so Pi compacts natively.
 
-Both arms share the fixture, the fixed script of prompts, the Lead model, a
-cheap `compactor` definition, and a project `.pi/settings.json` whose
-`compaction.reserveTokens` puts Pi's native threshold near 60k tokens. The script
-writes the exact early values the probes score, then spends the bulk on large
-fixture reads, test runs, a second and third delegation and a review, and ends
-with one cold recall probe per turn plus one `continue_agent` action probe that
-exercises the zoom gate. The run fails when the native arm records fewer than two
-compactions or when the memory arm's turn cache ratio is below 95%.
+Both arms share the fixture, the fixed script of prompts, the Lead model
+(`opencode-go/deepseek-v4.1-flash`), a cheap `compactor` definition, and a
+project `.pi/settings.json` whose `compaction.reserveTokens` puts Pi's native
+threshold near 60k tokens. The script writes the exact early values the probes
+score, then spends the bulk on large fixture reads, test runs, a second and
+third delegation and a review, and ends with one cold recall probe per turn plus
+one `continue_agent` action probe that exercises the zoom gate. The scenario
+passes when the native arm records at least two compactions; the memory arm's
+turn cache ratio stays in the report as information, because on DeepSeek it
+tracks context size rather than a broken prefix. The report also carries the
+recall probe scores, tokens, estimated cost, cache ratios, gate blocks and the
+unprompted zoom-before-act rate, plus a Markdown table for the PR.
 
-The scenario makes real model calls and is expensive: two long Lead sessions,
-real delegated agents, and many compactor calls. It prints a cost estimate and
-refuses to start without `--yes`.
+By default a run deletes its temporary root, taking the project store, the Lead
+session JSONL and per-node usage with it. Pass `--keep <dir>` to copy, per arm,
+the project memory store (`tree/`, `main/`, `view.json`), the Lead session JSONL
+and the report JSON into `<dir>/<scenario>-<arm>/` before cleanup and print the
+directory. The path must be outside the repository; the default stays "delete".
 
 `PI_HERDSMAN_SMOKE_EXTENSIONS` is a comma-separated list of extra `--extension`
-paths for the scenario, for a `--model` override whose provider is not visible to
-the isolated run. The direct Anthropic provider needs the user's provider
-extension there (pi-black), because the isolated `--no-extensions` run does not
-discover it; the extension's own identity file (`~/.claude.json`) is read from
-the real home directory and never written. For example:
+paths for either scenario, for a `--model` override whose provider is not
+visible to the isolated run. The direct Anthropic provider needs the user's
+provider extension there (pi-black), because the isolated `--no-extensions` run
+does not discover it; the extension's own identity file (`~/.claude.json`) is
+read from the real home directory and never written. For example:
 
 ```sh
 PI_HERDSMAN_SMOKE_EXTENSIONS="$HOME/.pi/agent/git/github.com/paoloanzn/pi-black/extensions/pi-black.ts" \
-  npm run smoke -- memory --yes --model anthropic/claude-haiku-4-5
+  npm run smoke -- memory-cache --yes --allow-anthropic --model anthropic/claude-haiku-4-5
 ```
 
-The scenario prints a JSON report (also written to
-`<tmp>/pi-herdsman-memory-smoke-report.json`) and a Markdown table for the PR:
-per arm the recall probe scores and total, turns, LLM calls, input/output/cache
-tokens, estimated cost, native compactions, turn and compaction cache ratios, and
-wall time. The memory arm also carries the gate block count and the unprompted
-zoom-before-act rate.
+Each report is also written to
+`<tmp>/pi-herdsman-memory-cache-smoke-report.json` or
+`<tmp>/pi-herdsman-memory-quality-smoke-report.json`.
 
 ## Runtime preflight
 

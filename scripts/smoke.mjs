@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { execFile, spawn, spawnSync } from "node:child_process";
 import {
   access,
+  cp,
   lstat,
   mkdir,
   mkdtemp,
@@ -28,7 +29,8 @@ const scenarioNames = [
   "continuation",
   "chief-tree",
   "manager-recovery",
-  "memory",
+  "memory-cache",
+  "memory-quality",
 ];
 const SMOKE_MODEL_KEY = "pi-herdsman.smoke-model";
 const MAX_SOCKET_PATH_BYTES = 100;
@@ -66,6 +68,8 @@ export function parseSmokeArgs(args) {
     options: {
       model: { type: "string" },
       yes: { type: "boolean" },
+      keep: { type: "string" },
+      "allow-anthropic": { type: "boolean" },
       "manager-ready-timeout-ms": { type: "string" },
       "manager-recovery-diagnostics": { type: "boolean" },
     },
@@ -91,10 +95,37 @@ export function parseSmokeArgs(args) {
     throw new Error(
       "--manager-recovery-diagnostics is only valid for manager-recovery",
     );
+  const memoryScenario =
+    scenario === "memory-cache" || scenario === "memory-quality";
+  const allowAnthropic = values["allow-anthropic"] ?? false;
+  if (allowAnthropic && !memoryScenario)
+    throw new Error(
+      "--allow-anthropic is only valid for memory-cache and memory-quality",
+    );
+  if (values.keep !== undefined) {
+    if (!memoryScenario)
+      throw new Error(
+        "--keep is only valid for memory-cache and memory-quality",
+      );
+    const keepRelative = relative(repoRoot, resolve(values.keep));
+    if (
+      keepRelative === "" ||
+      (!keepRelative.startsWith("..") && !isAbsolute(keepRelative))
+    )
+      throw new Error("--keep must point outside the repository");
+  }
+  if (
+    memoryScenario &&
+    values.model?.startsWith("anthropic/") &&
+    !allowAnthropic
+  )
+    throw new Error("an anthropic/* model needs --allow-anthropic");
   return {
     scenario,
     model: values.model,
     yes: values.yes ?? false,
+    keep: values.keep,
+    allowAnthropic,
     managerReadyTimeoutMs,
     managerRecoveryDiagnostics,
   };
@@ -1890,7 +1921,8 @@ export function initialPromptForScenario(scenario, ctx) {
       return "Reply exactly with PI_HERDSMAN_CHIEF_TREE_STARTUP.";
     case "manager-recovery":
       return undefined;
-    case "memory":
+    case "memory-cache":
+    case "memory-quality":
       return undefined;
     default:
       throw new Error(`unknown smoke scenario: ${scenario}`);
@@ -1908,7 +1940,9 @@ export async function runScenario(ctx, scenario) {
       return runChiefTreeSmoke(ctx);
     case "manager-recovery":
       return runManagerRecoverySmoke(ctx);
-    case "memory":
+    case "memory-cache":
+      return runMemoryCacheScenario({ model: ctx.model });
+    case "memory-quality":
       return runMemoryScenario({ model: ctx.model });
     default:
       throw new Error(`unknown smoke scenario: ${scenario}`);
@@ -4121,6 +4155,23 @@ const MEMORY_KILL_GRACE_MS = 10_000;
 /** The native arm must compact at least this often for the A/B to mean anything. */
 const MEMORY_MIN_NATIVE_COMPACTIONS = 2;
 const MEMORY_TARGET_TURN_RATIO = 0.95;
+/**
+ * The cache scenario measures the Anthropic-only view mark, so its Lead model
+ * must speak the Anthropic Messages API. The opencode-go proxy fronts it; the
+ * mark itself never reaches a non-Anthropic provider.
+ */
+const MEMORY_CACHE_DEFAULT_MODEL = "opencode-go/claude-haiku-5-5";
+/** Eight no-tool prose turns, long enough to read a stable cache prefix. */
+const MEMORY_CACHE_TURNS = [
+  "Reply with at least 900 characters of plain prose describing the number seven, and use no tools.",
+  "Reply with at least 900 characters of plain prose describing the number nine, and use no tools.",
+  "Reply with at least 900 characters of plain prose describing the number twelve, and use no tools.",
+  "Reply with at least 900 characters of plain prose describing the number fifteen, and use no tools.",
+  "Reply with at least 900 characters of plain prose describing the number twenty-one, and use no tools.",
+  "Reply with at least 900 characters of plain prose describing the number eighteen, and use no tools.",
+  "Reply with at least 900 characters of plain prose describing the number twenty-four, and use no tools.",
+  "Reply with at least 900 characters of plain prose describing the number thirty, and use no tools.",
+];
 
 /** Exact early values the recall probes score against. */
 const MEMORY_FACTS = {
@@ -4133,11 +4184,50 @@ async function copyFile(from, to) {
   await writeFile(to, await readFile(from));
 }
 
+/** The store directory key, matching `projectMemoryKey` in extension/memory.ts. */
+function memoryStoreKey(project) {
+  return createHash("sha256")
+    .update(project, "utf8")
+    .digest("hex")
+    .slice(0, 16);
+}
+
+/**
+ * Copies one store part into a `--keep` directory. A part the run never wrote
+ * (for example an empty project has no `tree/`) is not an error.
+ */
+async function copyIfExists(from, to) {
+  try {
+    await cp(from, to, { recursive: true });
+  } catch {
+    // Missing store part.
+  }
+}
+
+/**
+ * Copies the evidence a `--keep` directory preserves before the temp root is
+ * deleted: the project memory store, the Lead session JSONL and the report.
+ */
+async function keepMemoryArtifacts(keep, scenario, runs, reportPath) {
+  const target = resolve(keep);
+  await mkdir(target, { recursive: true });
+  for (const run of runs) {
+    const directory = join(target, `${scenario}-${run.arm}`);
+    await mkdir(directory, { recursive: true });
+    for (const part of ["tree", "main", "view.json"])
+      await copyIfExists(join(run.storeRoot, part), join(directory, part));
+    await copyFile(run.sessionFile, join(directory, "session.jsonl"));
+    await copyFile(reportPath, join(directory, "report.json"));
+  }
+  return target;
+}
+
 /** The environment an ordinary Lead runs with: no managed-agent identity. */
-function memoryLeadEnv(agentDir) {
+function memoryLeadEnv(agentDir, disableMark = false) {
   const env = { ...process.env, PI_CODING_AGENT_DIR: agentDir, HERDR_ENV: "1" };
   for (const key of Object.keys(env))
     if (key.startsWith("PI_HERDSMAN_")) delete env[key];
+  if (disableMark) env.PI_HERDSMAN_MEMORY_DISABLE_VIEW_MARK = "1";
   return env;
 }
 
@@ -4387,6 +4477,7 @@ async function memoryRpcRun({
   extensions,
   model,
   steps,
+  disableMark = false,
 }) {
   const child = spawn(
     "pi",
@@ -4411,7 +4502,7 @@ async function memoryRpcRun({
     ],
     {
       cwd: project,
-      env: memoryLeadEnv(agentDir),
+      env: memoryLeadEnv(agentDir, disableMark),
       stdio: ["pipe", "pipe", "pipe"],
     },
   );
@@ -4786,6 +4877,71 @@ function memoryRunReport(run, scored) {
   };
 }
 
+/**
+ * One cache arm's turn, compaction and disk numbers. Store bytes per project
+ * message against session bytes per message is the disk-write evidence for the
+ * memory-source decision.
+ */
+async function memoryCacheRunReport(run) {
+  const usages = assistantUsages(run.entries);
+  const compactor = compactorUsages(run.entries);
+  let storeBytes = 0;
+  let memoryMessages = 0;
+  const walk = async (path, kind) => {
+    let entries;
+    try {
+      entries = await readdir(path, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const child = join(path, entry.name);
+      if (entry.isDirectory()) {
+        await walk(child, entry.name);
+        continue;
+      }
+      const content = await readFile(child, "utf8");
+      storeBytes += Buffer.byteLength(content, "utf8");
+      if (kind !== "main") continue;
+      for (const line of content.split("\n")) {
+        if (line === "") continue;
+        try {
+          JSON.parse(line);
+        } catch {
+          continue;
+        }
+        memoryMessages += 1;
+      }
+    }
+  };
+  await walk(run.storeRoot, "");
+
+  const sessionBytes = Buffer.byteLength(
+    await readFile(run.sessionFile, "utf8"),
+    "utf8",
+  );
+  const sessionMessages = run.entries.filter(
+    (entry) => entry.type === "message",
+  ).length;
+  // The run's first call writes the cache; every later call is measured.
+  const measuredTurns = usages.slice(1);
+
+  return {
+    turns: measuredTurns.length,
+    turnRatio: summedRatio(measuredTurns),
+    compactionRatio: summedRatio(compactor),
+    compactions: compactor.length,
+    memoryMessages,
+    sessionMessages,
+    storeBytes,
+    sessionBytes,
+    storeBytesPerMessage: memoryMessages ? storeBytes / memoryMessages : 0,
+    sessionBytesPerMessage: sessionMessages
+      ? sessionBytes / sessionMessages
+      : 0,
+  };
+}
+
 /** The Markdown table pasted into the PR description. */
 function memoryMarkdown(memory, native) {
   const rows = [
@@ -4837,6 +4993,155 @@ function memoryEstimate() {
     "  real provider calls; the run is long and costs real usage",
     "re-run with --yes to start",
   ].join("\n");
+}
+
+/** The Markdown table for the cache scenario. */
+function memoryCacheMarkdown(report) {
+  const rows = [
+    "| arm | turns | turn cache | compaction cache | compactions | store bytes/msg | session bytes/msg |",
+    "| --- | --- | --- | --- | --- | --- | --- |",
+  ];
+  for (const arm of [report.withMark, report.withoutMark]) {
+    const name = arm === report.withMark ? "withMark" : "withoutMark";
+    rows.push(
+      `| ${name} | ${arm.turns} | ${arm.turnRatio.ratio.toFixed(3)} | ${arm.compactionRatio.ratio.toFixed(3)} | ${arm.compactions} | ${arm.storeBytesPerMessage.toFixed(0)} | ${arm.sessionBytesPerMessage.toFixed(0)} |`,
+    );
+  }
+  rows.push("");
+  rows.push(`with-mark turn cache target: ${MEMORY_TARGET_TURN_RATIO}`);
+  return rows.join("\n");
+}
+
+/** The cost estimate printed for the cache scenario before `--yes`. */
+function memoryCacheEstimate() {
+  return [
+    "memory-cache smoke estimate:",
+    "  two arms, one run each (withMark and withoutMark, order randomized)",
+    `  script: ${MEMORY_CACHE_TURNS.length} no-tool Lead turns`,
+    `  Lead: ${MEMORY_CACHE_DEFAULT_MODEL}`,
+    `  compactor: ${MEMORY_COMPACTOR_MODEL}`,
+    "  real provider calls; the run costs real usage",
+    "re-run with --yes to start",
+  ].join("\n");
+}
+
+/**
+ * Measures the Anthropic-only view mark: the same fixture runs twice, once with
+ * the mark and once with `PI_HERDSMAN_MEMORY_DISABLE_VIEW_MARK=1`. The arms
+ * share the script, fixtures and `memoryRpcRun` process handling with the
+ * quality scenario; the only difference is the mark.
+ */
+async function runMemoryCacheScenario(args) {
+  const model = args.model ?? MEMORY_CACHE_DEFAULT_MODEL;
+  const extensions = memorySmokeExtensions();
+  const steps = MEMORY_CACHE_TURNS.map((prompt) => ({ prompt }));
+  if (!args.yes) return { estimate: memoryCacheEstimate() };
+
+  const root = await mkdtemp(join(tmpdir(), "pi-herdsman-memory-cache-smoke-"));
+  const extension = join(repoRoot, "extension", "index.ts");
+  const realAgentDir = join(homedir(), ".pi", "agent");
+  // The arms run in a random order, so a warmed shared prefix cannot favor one.
+  const arms = Math.random() < 0.5 ? [false, true] : [true, false];
+  const runs = [];
+  try {
+    for (const disableMark of arms) {
+      const arm = disableMark ? "withoutMark" : "withMark";
+      const project = join(root, `project-${arm}`);
+      const agentDir = join(root, `agent-${arm}`);
+      const sessionDir = join(root, `sessions-${arm}`);
+      await writeMemoryFixture(project);
+      await mkdir(join(agentDir, "pi-herdsman"), { recursive: true });
+      const realProject = await realpath(project);
+      await writeFile(
+        join(agentDir, "pi-herdsman", "config.json"),
+        `${JSON.stringify({ memoryProjects: [realProject] })}\n`,
+      );
+      await copyFile(
+        join(realAgentDir, "auth.json"),
+        join(agentDir, "auth.json"),
+      );
+      await copyFile(
+        join(realAgentDir, "models.json"),
+        join(agentDir, "models.json"),
+      );
+      await mkdir(sessionDir, { recursive: true });
+      const run = await memoryRpcRun({
+        project,
+        agentDir,
+        sessionDir,
+        extension,
+        extensions,
+        model,
+        steps,
+        disableMark,
+      });
+      const sessionFile = await newestSessionFile(sessionDir);
+      if (!sessionFile)
+        throw new Error(
+          `no session file in ${sessionDir}; stderr: ${run.stderr.slice(-2000)}`,
+        );
+      const entries = (await readFile(sessionFile, "utf8"))
+        .split("\n")
+        .filter((line) => line !== "")
+        .map((line) => JSON.parse(line));
+      runs.push({
+        arm,
+        sessionFile,
+        entries,
+        storeRoot: join(
+          agentDir,
+          "pi-herdsman",
+          "memory",
+          memoryStoreKey(realProject),
+        ),
+        errors: run.errors,
+        stderr: run.stderr,
+      });
+    }
+
+    const withMarkRun = runs.find((run) => run.arm === "withMark");
+    const withoutMarkRun = runs.find((run) => run.arm === "withoutMark");
+    const withMark = await memoryCacheRunReport(withMarkRun);
+    const withoutMark = await memoryCacheRunReport(withoutMarkRun);
+    const armOrder = runs.map((run) => run.arm);
+    const report = {
+      scenario: "memory-cache",
+      model,
+      compactorModel: MEMORY_COMPACTOR_MODEL,
+      extensions,
+      armOrder,
+      turns: MEMORY_CACHE_TURNS.length,
+      withMarkRatio: withMark.turnRatio.ratio,
+      withoutMarkRatio: withoutMark.turnRatio.ratio,
+      passed: withMark.turnRatio.ratio >= MEMORY_TARGET_TURN_RATIO,
+      notes: [
+        "The opencode-go Haiku proxy's cache accounting is not direct Anthropic usage; the ratio is the proxy's report.",
+        "Both arms enable project memory on an identical fixture; the without-mark arm sets PI_HERDSMAN_MEMORY_DISABLE_VIEW_MARK=1.",
+        `The with-mark turn cache ratio must reach ${MEMORY_TARGET_TURN_RATIO}.`,
+        "The compaction ratio is informational: both arms use the DeepSeek compactor, so its delta is uncontrolled cross-run noise.",
+        "No gap between turns may exceed 4 minutes; a longer stall fails the turn.",
+        `Arm order was randomized: ${armOrder.join(" then ")}.`,
+      ],
+      withMark,
+      withoutMark,
+      stepErrors: Object.fromEntries(runs.map((run) => [run.arm, run.errors])),
+      stderr: Object.fromEntries(
+        runs.map((run) => [run.arm, run.stderr.slice(-4000)]),
+      ),
+    };
+    report.markdown = memoryCacheMarkdown(report);
+    const reportPath = join(
+      tmpdir(),
+      "pi-herdsman-memory-cache-smoke-report.json",
+    );
+    await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+    const keepPath = args.keep
+      ? await keepMemoryArtifacts(args.keep, "memory-cache", runs, reportPath)
+      : undefined;
+    return { report, reportPath, keepPath };
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 }
 
 async function runMemoryScenario(args) {
@@ -4916,6 +5221,12 @@ async function runMemoryScenario(args) {
         turns: script.length,
         wallMs,
         errors: run.errors,
+        storeRoot: join(
+          agentDir,
+          "pi-herdsman",
+          "memory",
+          memoryStoreKey(realProject),
+        ),
         stderr: run.stderr,
       });
     }
@@ -4928,11 +5239,12 @@ async function runMemoryScenario(args) {
     }
     const memory = reports.memory;
     const native = reports.native;
-    const passed =
-      memory.turnRatio.ratio >= MEMORY_TARGET_TURN_RATIO &&
-      native.nativeCompactions >= MEMORY_MIN_NATIVE_COMPACTIONS;
+    // The turn cache ratio is informational here: on DeepSeek it tracks context
+    // size, not a broken prefix (there is no view mark). Only the native-arm
+    // validity check gates the scenario.
+    const passed = native.nativeCompactions >= MEMORY_MIN_NATIVE_COMPACTIONS;
     const report = {
-      scenario: "memory",
+      scenario: "memory-quality",
       model,
       compactorModel: MEMORY_COMPACTOR_MODEL,
       agentModel: MEMORY_AGENT_MODEL,
@@ -4943,7 +5255,7 @@ async function runMemoryScenario(args) {
       passed,
       notes: [
         "One run per arm: a probe total within 1 is not a win (noise).",
-        `The memory arm's turn cache ratio must reach ${MEMORY_TARGET_TURN_RATIO} (the phase 7 target); it relies on implicit prefix caching because the view mark is Anthropic-only.`,
+        "The turn cache ratio is informational for this scenario; it tracks context size rather than a broken prefix, because the view mark is Anthropic-only.",
         `The native arm must compact at least ${MEMORY_MIN_NATIVE_COMPACTIONS} times.`,
         "Native summarization usage is not surfaced separately; only its compaction count is reported.",
         `Arm order was randomized: ${arms.join(" then ")}.`,
@@ -4959,9 +5271,15 @@ async function runMemoryScenario(args) {
         runs.map((run) => [run.arm, run.stderr.slice(-4000)]),
       ),
     };
-    const reportPath = join(tmpdir(), "pi-herdsman-memory-smoke-report.json");
+    const reportPath = join(
+      tmpdir(),
+      "pi-herdsman-memory-quality-smoke-report.json",
+    );
     await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`);
-    return { report, reportPath };
+    const keepPath = args.keep
+      ? await keepMemoryArtifacts(args.keep, "memory-quality", runs, reportPath)
+      : undefined;
+    return { report, reportPath, keepPath };
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -4969,18 +5287,22 @@ async function runMemoryScenario(args) {
 
 async function main() {
   const args = parseSmokeArgs(process.argv.slice(2));
-  if (args.scenario === "memory") {
-    const result = await runMemoryScenario(args);
+  if (args.scenario === "memory-cache" || args.scenario === "memory-quality") {
+    const result =
+      args.scenario === "memory-cache"
+        ? await runMemoryCacheScenario(args)
+        : await runMemoryScenario(args);
     if (result.estimate) {
       console.log(result.estimate);
       return;
     }
-    const { report, reportPath } = result;
+    const { report, reportPath, keepPath } = result;
     console.log(
-      `smoke memory: ${report.passed ? "PASS" : "FAIL"}\n${JSON.stringify(report, null, 2)}`,
+      `smoke ${args.scenario}: ${report.passed ? "PASS" : "FAIL"}\n${JSON.stringify(report, null, 2)}`,
     );
     console.log(report.markdown);
     console.log(`report: ${reportPath}`);
+    if (keepPath) console.log(`kept: ${keepPath}`);
     if (!report.passed) process.exitCode = 1;
     return;
   }

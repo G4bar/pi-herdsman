@@ -3,6 +3,7 @@ import test from "node:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   assistantResultForSession,
   assistantResponseCompletedForSession,
@@ -432,13 +433,17 @@ test("smoke CLI parses scenarios and one-off model overrides", async () => {
     scenario: "core",
     model: undefined,
     yes: false,
+    keep: undefined,
+    allowAnthropic: false,
     managerReadyTimeoutMs: undefined,
     managerRecoveryDiagnostics: false,
   });
-  assert.deepEqual(parseSmokeArgs(["memory", "--yes"]), {
-    scenario: "memory",
+  assert.deepEqual(parseSmokeArgs(["memory-quality", "--yes"]), {
+    scenario: "memory-quality",
     model: undefined,
     yes: true,
+    keep: undefined,
+    allowAnthropic: false,
     managerReadyTimeoutMs: undefined,
     managerRecoveryDiagnostics: false,
   });
@@ -447,6 +452,8 @@ test("smoke CLI parses scenarios and one-off model overrides", async () => {
     "continuation",
     "chief-tree",
     "manager-recovery",
+    "memory-cache",
+    "memory-quality",
   ])
     assert.equal(parseSmokeArgs([scenario]).scenario, scenario);
   assert.deepEqual(
@@ -455,6 +462,8 @@ test("smoke CLI parses scenarios and one-off model overrides", async () => {
       scenario: "chief-tree",
       model: "provider/model:high",
       yes: false,
+      keep: undefined,
+      allowAnthropic: false,
       managerReadyTimeoutMs: undefined,
       managerRecoveryDiagnostics: false,
     },
@@ -465,6 +474,8 @@ test("smoke CLI parses scenarios and one-off model overrides", async () => {
       scenario: "continuation",
       model: "provider/model:xhigh",
       yes: false,
+      keep: undefined,
+      allowAnthropic: false,
       managerReadyTimeoutMs: undefined,
       managerRecoveryDiagnostics: false,
     },
@@ -472,7 +483,59 @@ test("smoke CLI parses scenarios and one-off model overrides", async () => {
   assert.throws(() => parseSmokeArgs(["core", "extra"]));
   assert.throws(() => parseSmokeArgs(["--unknown"]));
   assert.throws(() => parseSmokeArgs(["wat"]), /unknown smoke scenario/);
+  assert.throws(() => parseSmokeArgs(["memory"]), /unknown smoke scenario/);
   await assert.rejects(runScenario({}, "wat"), /unknown smoke scenario/);
+});
+
+test("memory smoke gates anthropic models and keeps artifacts outside the repo", () => {
+  const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
+  const base = {
+    model: undefined,
+    yes: false,
+    keep: undefined,
+    allowAnthropic: false,
+    managerReadyTimeoutMs: undefined,
+    managerRecoveryDiagnostics: false,
+  };
+  assert.deepEqual(parseSmokeArgs(["memory-cache"]), {
+    ...base,
+    scenario: "memory-cache",
+  });
+  assert.deepEqual(
+    parseSmokeArgs(["memory-cache", "--keep", "/tmp/pi-herdsman-keep"]),
+    { ...base, scenario: "memory-cache", keep: "/tmp/pi-herdsman-keep" },
+  );
+  assert.deepEqual(
+    parseSmokeArgs(["memory-quality", "--model", "opencode-go/x"]),
+    { ...base, scenario: "memory-quality", model: "opencode-go/x" },
+  );
+  assert.deepEqual(
+    parseSmokeArgs([
+      "memory-cache",
+      "--allow-anthropic",
+      "--model",
+      "anthropic/claude-haiku-4-5",
+    ]),
+    {
+      ...base,
+      scenario: "memory-cache",
+      allowAnthropic: true,
+      model: "anthropic/claude-haiku-4-5",
+    },
+  );
+  assert.throws(
+    () =>
+      parseSmokeArgs(["memory-cache", "--model", "anthropic/claude-haiku-4-5"]),
+    /needs --allow-anthropic/,
+  );
+  assert.throws(
+    () => parseSmokeArgs(["core", "--keep", "/tmp/pi-herdsman-keep"]),
+    /--keep is only valid/,
+  );
+  assert.throws(
+    () => parseSmokeArgs(["memory-cache", "--keep", join(repoRoot, ".keep")]),
+    /--keep must point outside the repository/,
+  );
 });
 
 test("manager-recovery timeout is bounded and scoped to its ready handshake", () => {
@@ -487,6 +550,8 @@ test("manager-recovery timeout is bounded and scoped to its ready handshake", ()
       scenario: "manager-recovery",
       model: undefined,
       yes: false,
+      keep: undefined,
+      allowAnthropic: false,
       managerReadyTimeoutMs: 45_000,
       managerRecoveryDiagnostics: true,
     },
