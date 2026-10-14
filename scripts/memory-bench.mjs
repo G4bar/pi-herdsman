@@ -7,7 +7,10 @@
  * It is opt-in and it spends real money, so it needs `--yes`. The replay sends
  * the exact request the runtime sends (`buildCompactionRequest`), with the same
  * over-length retry conversation (`overLengthRetry`), so an arm's numbers are
- * the runtime's numbers for that thinking level.
+ * the runtime's numbers for that thinking level. Its inputs are cuts of the
+ * store's final `view.json`, not the views the live run sent: every arm sees
+ * the same cut, so cross-arm comparisons are exact and recorded-vs-replay is
+ * approximate (later merges coarsen the prefix an early node is cut at).
  *
  *   npm run bench -- --store /tmp/pi-herdsman-memory-baseline/memory-quality-memory --yes
  *   node scripts/memory-bench.mjs --store <dir> --arms low --yes
@@ -383,7 +386,8 @@ function armMetrics({ built, failures, wallMs, price }) {
     meanNodeBytes: share(bytes, built.length),
     retention: { ...overall, share: share(overall.kept, overall.total) },
     byClass,
-    meanCallMs: share(millis, attempts),
+    // Per node, retries included: `ms` is the node's whole wall time.
+    meanCallMs: share(millis, built.length),
     wallMs,
   };
 }

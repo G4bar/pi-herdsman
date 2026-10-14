@@ -1377,7 +1377,9 @@ export class MemoryStore {
       const call = this.needsCall(parent);
       if (call) this.enqueue({ kind: "merge", line: parent });
       // A merge a call builds lands as a line of at most `LEAF_BYTES`, the
-      // model's own bound, so the view above it is not measured as unbuilt.
+      // model's own bound, so the placeholder it replaces is not counted; the
+      // over-length tail `build` keeps after its retries can undershoot this
+      // by one merge, which queues less rather than more.
       bytes +=
         this.lineBytes(parent) +
         (call ? LEAF_BYTES - UNBUILT_BYTES : 0) -
