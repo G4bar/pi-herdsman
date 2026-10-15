@@ -6,12 +6,13 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { buildSessionProjection } from "@earendil-works/pi-coding-agent";
 import type {
@@ -29,6 +30,7 @@ import {
   projectMemoryRoot,
   viewParts,
   type MemoryMessage,
+  type ViewLine,
 } from "./memory.ts";
 import type {
   MemoryCompactor,
@@ -37,10 +39,15 @@ import type {
 import {
   TURN_SETTLE_GRACE_MS,
   ordinaryLeadSession,
+  projectMemoryStatus,
   registerMemoryRuntime,
   type MemoryCompactorFactory,
+  type MemoryRuntimeSnapshot,
+  type ProjectMemoryRole,
+  type ProjectMemoryStatus,
 } from "./memory-runtime.ts";
 import { fakeContext, fakePi, PI_AGENTS_DIR } from "./support.ts";
+import { herdsmanConfigPath } from "./storage.ts";
 
 // --- fixtures ---------------------------------------------------------------
 
@@ -254,6 +261,7 @@ type HarnessOptions = {
 class Harness {
   readonly pi: ReturnType<typeof fakePi>;
   readonly compactors: FakeCompactor[] = [];
+  readonly runtime: ReturnType<typeof registerMemoryRuntime>;
 
   constructor(options: HarnessOptions = {}) {
     this.pi = fakePi({ thinkingLevel: options.thinkingLevel });
@@ -266,16 +274,19 @@ class Harness {
         compactors.push(compactor);
         return compactor;
       });
-    registerMemoryRuntime(this.pi.pi as unknown as ExtensionAPI, {
-      isOrdinaryLead: options.isOrdinaryLead ?? (() => true),
-      ...(options.settleGraceMs === undefined
-        ? {}
-        : { settleGraceMs: options.settleGraceMs }),
-      startCompactor: factory,
-      ...(options.onActiveChange === undefined
-        ? {}
-        : { onActiveChange: options.onActiveChange }),
-    });
+    this.runtime = registerMemoryRuntime(
+      this.pi.pi as unknown as ExtensionAPI,
+      {
+        isOrdinaryLead: options.isOrdinaryLead ?? (() => true),
+        ...(options.settleGraceMs === undefined
+          ? {}
+          : { settleGraceMs: options.settleGraceMs }),
+        startCompactor: factory,
+        ...(options.onActiveChange === undefined
+          ? {}
+          : { onActiveChange: options.onActiveChange }),
+      },
+    );
   }
 
   async emit(
@@ -427,6 +438,21 @@ function occupyLock(project: string): void {
   );
 }
 
+/** A successful build of `line`, as the compactor reports it to `onUsage`. */
+function built(line: ViewLine) {
+  return {
+    line,
+    kind: "leaf" as const,
+    input: 1,
+    output: 1,
+    reasoning: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    attempts: 1,
+    retries: 0,
+  };
+}
+
 // --- tests ------------------------------------------------------------------
 
 test("the settle grace is 30 seconds", () => {
@@ -546,6 +572,22 @@ test("activation follows the listed project, the role, persistence and the lock"
       activation.active,
       activation.name,
     );
+    // The snapshot tells `lock occupied` and `compactor failed` apart, so the
+    // status can name the reason the session is not active.
+    const { outcome } = harness.runtime.snapshot();
+    if (activation.occupied)
+      assert.deepEqual(
+        outcome,
+        { kind: "locked", pid: process.pid },
+        activation.name,
+      );
+    else if (activation.startError)
+      assert.deepEqual(
+        outcome,
+        { kind: "failed", reason: activation.startError },
+        activation.name,
+      );
+    else assert.equal(outcome, undefined, activation.name);
     if (activation.notice) {
       assert.equal(session.notices.length, 1, activation.name);
       assert.match(
@@ -571,6 +613,388 @@ test("activation follows the listed project, the role, persistence and the lock"
       assert.equal(mainLog(project).length, 0, activation.name);
     }
     await harness.shutdown(session, "quit");
+  }
+});
+
+type StatusCase = {
+  name: string;
+  role?: ProjectMemoryRole;
+  /** False when the cwd is not in memoryProjects at activation. */
+  listed?: boolean;
+  /** False leaves no compactor model configured. */
+  model?: boolean;
+  persisted?: boolean;
+  occupied?: boolean;
+  startError?: string;
+  /** The raw config.json content, for the unreadable-config row. */
+  invalidConfig?: string;
+  /** Listed only after activation, for the `next session` row. */
+  enableAfterStart?: boolean;
+  /** Fails node [0, 0] after activation, for the `failing` row. */
+  failing?: boolean;
+  /** An explicit snapshot, for a state the activation path cannot reach. */
+  runtime?: MemoryRuntimeSnapshot;
+  /** Status fields beyond word, reason and level, when the row carries them. */
+  expect?: Partial<ProjectMemoryStatus>;
+  word: string;
+  reason: string;
+  level?: "info" | "warning";
+};
+
+test("project memory status follows activation, role, config and model", async () => {
+  // One row per DESIGN §4.4 state, in priority order.
+  const cases: StatusCase[] = [
+    {
+      name: "active with a failing node",
+      failing: true,
+      word: "failing",
+      reason:
+        "This session uses project memory, but compaction is failing: provider unavailable",
+      level: "warning",
+    },
+    {
+      name: "active",
+      word: "on",
+      reason: "This session uses project memory.",
+    },
+    {
+      name: "Manager",
+      role: "manager",
+      word: "off",
+      reason: "Manager sessions do not use project memory.",
+    },
+    {
+      name: "Chief",
+      role: "chief",
+      word: "off",
+      reason: "Chief sessions do not use project memory.",
+    },
+    {
+      name: "managed-lead",
+      role: "managed-lead",
+      word: "off",
+      reason: "managed-lead sessions do not use project memory.",
+    },
+    {
+      name: "unsaved session",
+      persisted: false,
+      word: "off",
+      reason: "This session is not saved, so it cannot use project memory.",
+    },
+    {
+      name: "unreadable config",
+      invalidConfig: '{"unknown": 1}',
+      word: "off",
+      reason:
+        "config.json is invalid: Invalid Pi Herdsman config: unknown field unknown",
+      level: "warning",
+      expect: {
+        configError: "Invalid Pi Herdsman config: unknown field unknown",
+        listed: false,
+      },
+    },
+    {
+      name: "cwd not listed",
+      listed: false,
+      word: "off",
+      reason: "This project is not enabled.",
+    },
+    {
+      name: "no compactor model",
+      model: false,
+      word: "off",
+      reason: "No compactor model is chosen.",
+    },
+    {
+      name: "lock held by a live pid",
+      occupied: true,
+      word: "off",
+      reason: `Process ${process.pid} already has this project's memory open.`,
+    },
+    {
+      // The owner vanished between the claim attempt and the pid lookup: the
+      // activation path cannot be held in that window, so the snapshot is fed
+      // in directly.
+      name: "lock held by an unreadable owner",
+      runtime: {
+        active: false,
+        failing: undefined,
+        outcome: { kind: "locked", pid: undefined },
+      },
+      word: "off",
+      reason: "Another process already has this project's memory open.",
+    },
+    {
+      name: "compactor start failed",
+      startError: "project memory compactor has no model",
+      word: "off",
+      reason:
+        "The compactor could not start: project memory compactor has no model",
+      level: "warning",
+    },
+    {
+      name: "enabled after this session started",
+      listed: false,
+      enableAfterStart: true,
+      word: "next session",
+      reason: "Enabled. It turns on at the next session start.",
+    },
+  ];
+
+  for (const row of cases) {
+    const project = projectDir();
+    if (row.invalidConfig === undefined)
+      withProjects(row.listed === false ? [] : [project]);
+    else writeFileSync(herdsmanConfigPath(), row.invalidConfig);
+    if (row.occupied) occupyLock(project);
+    if (row.model === false) rmSync(COMPACTOR_DEFINITION, { force: true });
+
+    const session = new TestSession({
+      cwd: project,
+      file: row.persisted === false ? undefined : "/sessions/status.jsonl",
+    });
+    const startError = row.startError;
+    const harness = new Harness({
+      isOrdinaryLead: () => (row.role ?? "lead") === "lead",
+      ...(startError === undefined
+        ? {}
+        : {
+            startCompactor: () => {
+              throw new Error(startError);
+            },
+          }),
+    });
+    await harness.sessionStart(session);
+    if (row.enableAfterStart) withProjects([project]);
+    if (row.failing)
+      harness.compactors[0].options.onFailure?.({
+        line: [0, 0],
+        failures: 3,
+        error: "provider unavailable",
+      });
+
+    try {
+      const status = projectMemoryStatus(session.context(), {
+        role: row.role ?? "lead",
+        runtime: row.runtime ?? harness.runtime.snapshot(),
+      });
+      assert.equal(status.word, row.word, row.name);
+      assert.equal(status.reason, row.reason, row.name);
+      assert.equal(status.level, row.level ?? "info", row.name);
+      for (const [key, value] of Object.entries(row.expect ?? {}))
+        assert.deepEqual((status as any)[key], value, `${row.name}: ${key}`);
+    } finally {
+      if (row.model === false)
+        writeFileSync(COMPACTOR_DEFINITION, COMPACTOR_DEFINITION_TEXT);
+      if (row.invalidConfig !== undefined)
+        writeFileSync(herdsmanConfigPath(), "{}");
+      await harness.shutdown(session, "quit");
+    }
+  }
+});
+
+/** The status fields every report row shares, with the row's overrides. */
+function reportFields(
+  overrides: Partial<ProjectMemoryStatus>,
+): Partial<ProjectMemoryStatus> {
+  return {
+    word: "off",
+    level: "info",
+    projectResolved: true,
+    listed: true,
+    configError: undefined,
+    ...overrides,
+  };
+}
+
+test("the status report is the five lines of DESIGN §4.5", async () => {
+  const cases: {
+    name: string;
+    role?: ProjectMemoryRole;
+    /** False when the cwd is not in memoryProjects. */
+    listed?: boolean;
+    /** False leaves no compactor model configured. */
+    model?: boolean;
+    /** The compactor definition's thinking level, when set. */
+    thinking?: string;
+    /** Creates the store directory before the status is read. */
+    storeExists?: boolean;
+    /** Runs with a cwd that does not exist, so `realpathSync` throws. */
+    brokenCwd?: boolean;
+    /** Runs from a symlink to the listed project. */
+    symlinkCwd?: boolean;
+    lines: (project: string, cwd: string) => string[];
+    fields: (project: string, cwd: string) => Partial<ProjectMemoryStatus>;
+  }[] = [
+    {
+      name: "no compactor model",
+      model: false,
+      lines: (project) => [
+        "Project memory: off",
+        "No compactor model is chosen.",
+        `Project: ${realpathSync(project)} · enabled`,
+        "Compactor: unset",
+        `Store: ${projectMemoryRoot(project)} · not created yet`,
+      ],
+      fields: (project) =>
+        reportFields({
+          reason: "No compactor model is chosen.",
+          project: realpathSync(project),
+          model: undefined,
+        }),
+    },
+    {
+      name: "model set, session not active",
+      role: "manager",
+      lines: (project) => [
+        "Project memory: off",
+        "Manager sessions do not use project memory.",
+        `Project: ${realpathSync(project)} · enabled`,
+        "Compactor: test/compactor · low",
+        `Store: ${projectMemoryRoot(project)} · not created yet`,
+      ],
+      fields: (project) =>
+        reportFields({
+          reason: "Manager sessions do not use project memory.",
+          project: realpathSync(project),
+          model: "test/compactor",
+        }),
+    },
+    {
+      name: "project not enabled",
+      listed: false,
+      lines: (project) => [
+        "Project memory: off",
+        "This project is not enabled.",
+        `Project: ${realpathSync(project)} · not enabled`,
+        "Compactor: test/compactor · low",
+        `Store: ${projectMemoryRoot(project)} · not created yet`,
+      ],
+      fields: (project) =>
+        reportFields({
+          reason: "This project is not enabled.",
+          project: realpathSync(project),
+          listed: false,
+          model: "test/compactor",
+        }),
+    },
+    {
+      name: "store already created",
+      model: false,
+      storeExists: true,
+      lines: (project) => [
+        "Project memory: off",
+        "No compactor model is chosen.",
+        `Project: ${realpathSync(project)} · enabled`,
+        "Compactor: unset",
+        `Store: ${projectMemoryRoot(project)}`,
+      ],
+      fields: (project) =>
+        reportFields({
+          reason: "No compactor model is chosen.",
+          project: realpathSync(project),
+          model: undefined,
+        }),
+    },
+    {
+      name: "thinking high",
+      role: "manager",
+      thinking: "high",
+      lines: (project) => [
+        "Project memory: off",
+        "Manager sessions do not use project memory.",
+        `Project: ${realpathSync(project)} · enabled`,
+        "Compactor: test/compactor · high",
+        `Store: ${projectMemoryRoot(project)} · not created yet`,
+      ],
+      fields: (project) =>
+        reportFields({
+          reason: "Manager sessions do not use project memory.",
+          project: realpathSync(project),
+          model: "test/compactor",
+        }),
+    },
+    {
+      name: "cwd cannot be resolved",
+      brokenCwd: true,
+      lines: (_project, cwd) => [
+        "Project memory: off",
+        "This project is not enabled.",
+        `Project: ${cwd} · not enabled`,
+        "Compactor: test/compactor · low",
+        "Store: unavailable",
+      ],
+      fields: (_project, cwd) =>
+        reportFields({
+          reason: "This project is not enabled.",
+          project: cwd,
+          projectResolved: false,
+          listed: false,
+          model: "test/compactor",
+        }),
+    },
+    {
+      name: "cwd is a symlink to the listed project",
+      role: "manager",
+      symlinkCwd: true,
+      lines: (project) => [
+        "Project memory: off",
+        "Manager sessions do not use project memory.",
+        `Project: ${realpathSync(project)} · enabled`,
+        "Compactor: test/compactor · low",
+        `Store: ${projectMemoryRoot(project)} · not created yet`,
+      ],
+      fields: (project) =>
+        reportFields({
+          reason: "Manager sessions do not use project memory.",
+          project: realpathSync(project),
+          model: "test/compactor",
+        }),
+    },
+  ];
+
+  for (const row of cases) {
+    const project = projectDir();
+    withProjects(row.listed === false ? [] : [project]);
+    if (row.model === false) rmSync(COMPACTOR_DEFINITION, { force: true });
+    if (row.thinking !== undefined)
+      writeFileSync(
+        COMPACTOR_DEFINITION,
+        `---\nname: compactor\nmodel: test/compactor\nthinking: ${row.thinking}\n---\n`,
+      );
+    if (row.storeExists)
+      mkdirSync(projectMemoryRoot(project), { recursive: true });
+    const link = join(projectDir(), "link");
+    const cwd = row.brokenCwd
+      ? join(project, "missing")
+      : row.symlinkCwd
+        ? link
+        : project;
+    if (row.symlinkCwd) symlinkSync(project, link);
+
+    const session = new TestSession({ cwd, file: "/sessions/report.jsonl" });
+    const harness = new Harness({
+      isOrdinaryLead: () => (row.role ?? "lead") === "lead",
+    });
+    await harness.sessionStart(session);
+
+    try {
+      const status = projectMemoryStatus(session.context(), {
+        role: row.role ?? "lead",
+        runtime: harness.runtime.snapshot(),
+      });
+      assert.deepEqual(
+        status.report.split("\n"),
+        row.lines(project, cwd),
+        row.name,
+      );
+      for (const [key, value] of Object.entries(row.fields(project, cwd)))
+        assert.deepEqual((status as any)[key], value, `${row.name}: ${key}`);
+    } finally {
+      if (row.model === false || row.thinking !== undefined)
+        writeFileSync(COMPACTOR_DEFINITION, COMPACTOR_DEFINITION_TEXT);
+      await harness.shutdown(session, "quit");
+    }
   }
 });
 
@@ -1292,7 +1716,7 @@ test("a role transition ends ownership at the next turn boundary", async () => {
   freed.close();
 });
 
-test("a compaction failure notifies once and a shutdown stops the compactor", async () => {
+test("a compaction failure notifies once, is tracked per node, and a shutdown stops the compactor", async () => {
   const project = projectDir();
   withProjects([project]);
   const session = new TestSession({ cwd: project, file: "/sessions/a.jsonl" });
@@ -1316,8 +1740,68 @@ test("a compaction failure notifies once and a shutdown stops the compactor", as
   );
   assert.equal(session.notices[0].type, "warning");
 
+  // The snapshot sees the failing nodes, latest failure last: a re-failure of
+  // an earlier node moves it back to the end, and a built node drops only its
+  // own error.
+  assert.equal(harness.runtime.snapshot().failing, "provider unavailable");
+  compactor.options.onFailure?.({
+    line: [1, 0],
+    failures: 3,
+    error: "second node",
+  });
+  assert.equal(harness.runtime.snapshot().failing, "second node");
+  compactor.options.onFailure?.({
+    line: [0, 0],
+    failures: 4,
+    error: "third node",
+  });
+  assert.equal(harness.runtime.snapshot().failing, "third node");
+  compactor.options.onUsage?.(built([1, 0]));
+  assert.equal(harness.runtime.snapshot().failing, "third node");
+  compactor.options.onUsage?.(built([0, 0]));
+  assert.equal(harness.runtime.snapshot().failing, "provider unavailable");
+  compactor.options.onUsage?.(built([0, 1]));
+  assert.equal(harness.runtime.snapshot().failing, undefined);
+  assert.equal(session.notices.length, 1);
+
   await harness.shutdown(session, "quit");
   assert.equal(compactor.stopped, true);
+});
+
+test("a store that cannot open is recorded as a failed activation", async () => {
+  const project = projectDir();
+  withProjects([project]);
+  // A file where the store directory belongs, so `MemoryStore` cannot open.
+  const root = projectMemoryRoot(project);
+  mkdirSync(dirname(root), { recursive: true });
+  writeFileSync(root, "");
+
+  const session = new TestSession({
+    cwd: project,
+    file: "/sessions/blocked.jsonl",
+  });
+  const harness = new Harness();
+  await harness.sessionStart(session);
+
+  const snapshot = harness.runtime.snapshot();
+  assert.equal(snapshot.active, false);
+  assert.equal(snapshot.outcome?.kind, "failed");
+  assert.deepEqual(
+    session.notices.map((notice) => notice.type),
+    ["warning"],
+  );
+  assert.match(session.notices[0].message, /^Project memory is inactive: /);
+
+  const status = projectMemoryStatus(session.context(), {
+    role: "lead",
+    runtime: snapshot,
+  });
+  assert.equal(status.word, "off");
+  assert.equal(status.level, "warning");
+  assert.match(status.reason, /^The compactor could not start: /);
+
+  await harness.shutdown(session, "quit");
+  rmSync(root, { force: true });
 });
 
 // --- zoom and date ----------------------------------------------------------

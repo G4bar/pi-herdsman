@@ -95,6 +95,52 @@ export type MemoryCompactorFactory = (
   options: MemoryCompactorOptions,
 ) => MemoryCompactor;
 
+/** The latest activation's outcome, when it was not a clean success. */
+export type MemoryActivationOutcome =
+  | { kind: "locked"; pid: number | undefined }
+  | { kind: "failed"; reason: string };
+
+/** The read-only memory state the status report reads (DESIGN §4.4/§4.5). */
+export type MemoryRuntimeSnapshot = {
+  /** True while this session owns the project's memory. */
+  active: boolean;
+  /** The latest compaction failure, while any node is still failing. */
+  failing: string | undefined;
+  /** The latest activation's outcome; undefined after a clean activation. */
+  outcome: MemoryActivationOutcome | undefined;
+};
+
+/** The session roles the status states distinguish (DESIGN §4.4 rows 3–5). */
+export type ProjectMemoryRole = "lead" | "manager" | "chief" | "managed-lead";
+
+export type ProjectMemoryInput = {
+  role: ProjectMemoryRole;
+  /** The memory runtime's snapshot, or undefined when none is registered. */
+  runtime: MemoryRuntimeSnapshot | undefined;
+};
+
+/** The one state every row, help line and report derives from. */
+export type ProjectMemoryStatus = {
+  /** The state word the root row and the Status row show. */
+  word: "on" | "off" | "next session" | "failing";
+  /** The §4.4 reason sentence: the help line and report line 2. */
+  reason: string;
+  /** The report notice level. */
+  level: "info" | "warning";
+  /** The five-line report of §4.5. */
+  report: string;
+  /** The realpath of the cwd, or the cwd itself when realpath throws. */
+  project: string;
+  /** False when the cwd cannot be resolved, so the store path is unknown. */
+  projectResolved: boolean;
+  /** True when a listed project resolves to this cwd's realpath. */
+  listed: boolean;
+  /** The config read error, when `config.json` cannot be read. */
+  configError: string | undefined;
+  /** The configured compactor model token, or undefined when unset. */
+  model: string | undefined;
+};
+
 export type MemoryRuntimeOptions = {
   /**
    * True when the current session is an ordinary Lead session: never Manager,
@@ -143,6 +189,8 @@ type ActiveMemory = {
   frozen: FrozenTurn | undefined;
   /** True once a compaction failure was reported, so an outage notifies once. */
   reported: boolean;
+  /** The latest failure error per compactor node, so a built node clears it. */
+  failures: Map<string, string>;
   /** This turn's verbatim corpus, cached until the branch grows. */
   corpus: TurnCorpus | undefined;
   /** True once a gated call blocked this turn, so `zoomBefore` stops counting. */
@@ -199,10 +247,12 @@ export function ordinaryLeadSession(session: {
 export function registerMemoryRuntime(
   pi: ExtensionAPI,
   options: MemoryRuntimeOptions,
-): { isActive(): boolean } {
+): { isActive(): boolean; snapshot(): MemoryRuntimeSnapshot } {
   const settleGraceMs = options.settleGraceMs ?? TURN_SETTLE_GRACE_MS;
   const startCompactor = options.startCompactor ?? startMemoryCompactor;
   let active: ActiveMemory | undefined;
+  /** The latest `activate()` outcome, cleared when the next one starts. */
+  let activationOutcome: MemoryActivationOutcome | undefined;
   /**
    * True once this session was told about an extension-registered Lead
    * provider. It lives outside `ActiveMemory` so a project switch, which
@@ -241,22 +291,38 @@ export function registerMemoryRuntime(
     }
   }
 
-  /** Names the live owner, so a second concurrent session is not a mystery. */
-  function lockMessage(project: string): string {
+  /** The live lock owner's pid, or undefined when the lock cannot be read. */
+  function lockPid(project: string): number | undefined {
     try {
       const { claim } = readProcessLockStatus(
         join(projectMemoryRoot(project), "lock"),
         "project memory",
       );
-      return `Project memory is already open in process ${claim.pid}`;
+      return claim.pid;
     } catch {
-      return "Project memory is already open in another process";
+      return undefined;
     }
+  }
+
+  /** Names the live owner, so a second concurrent session is not a mystery. */
+  function lockMessage(project: string): string {
+    const pid = lockPid(project);
+    return pid === undefined
+      ? "Project memory is already open in another process"
+      : `Project memory is already open in process ${pid}`;
   }
 
   function reportCompactionFailure(failure: MemoryCompactorFailure): void {
     const memory = active;
-    if (!memory || memory.reported) return;
+    if (!memory) return;
+    // Recorded before the once-per-outage notice, so a still-failing node is
+    // visible to the status even while the notice stays single. Re-setting an
+    // existing node moves it to the end, so the snapshot's last value is the
+    // latest failure.
+    const key = lineLabel(failure.line);
+    memory.failures.delete(key);
+    memory.failures.set(key, failure.error);
+    if (memory.reported) return;
     memory.reported = true;
     notify(
       memory.ctx,
@@ -276,6 +342,7 @@ export function registerMemoryRuntime(
   }
 
   function activate(ctx: ExtensionContext): void {
+    activationOutcome = undefined;
     const project = listedProject(ctx.cwd);
     // A session outside an opted-in project, or outside the ordinary Lead
     // role, ends ownership: the lock is held across the sessions of one project.
@@ -306,6 +373,7 @@ export function registerMemoryRuntime(
       } catch (error) {
         if (!(error instanceof ProcessLockOccupiedError)) throw error;
         // A second concurrent session is not an error; it simply has no memory.
+        activationOutcome = { kind: "locked", pid: lockPid(project) };
         notify(
           ctx,
           `${lockMessage(project)}; this session runs without it.`,
@@ -325,7 +393,9 @@ export function registerMemoryRuntime(
           onFailure: (failure) => reportCompactionFailure(failure),
           // The harness reads these entries to measure cache use; they are never
           // sent to the model.
-          onUsage: (usage) =>
+          onUsage: (usage) => {
+            // A node that built is no longer failing, whatever failed before.
+            active?.failures.delete(lineLabel(usage.line));
             pi.appendEntry(USAGE_ENTRY_TYPE, {
               node: usage.line,
               kind: usage.kind,
@@ -336,10 +406,12 @@ export function registerMemoryRuntime(
               cacheWrite: usage.cacheWrite,
               attempts: usage.attempts,
               retries: usage.retries,
-            }),
+            });
+          },
         });
       } catch (error) {
         closeQuietly(store);
+        activationOutcome = { kind: "failed", reason: reason(error) };
         notify(ctx, `Project memory is inactive: ${reason(error)}`);
         return;
       }
@@ -354,6 +426,7 @@ export function registerMemoryRuntime(
         freezing: false,
         frozen: undefined,
         reported: false,
+        failures: new Map(),
         corpus: undefined,
         gateBlocked: false,
         blockCounts: new Map(),
@@ -539,6 +612,8 @@ export function registerMemoryRuntime(
       activate(ctx);
     } catch (error) {
       deactivate();
+      // A store that cannot open is the session's answer, not `next session`.
+      activationOutcome = { kind: "failed", reason: reason(error) };
       notify(ctx, `Project memory is inactive: ${reason(error)}`);
     }
     // A session that no longer owns memory re-projects, so a stale tool set
@@ -660,10 +735,49 @@ export function registerMemoryRuntime(
     if (memory) options.onActiveChange?.();
   });
 
+  /** The state the status menu reports from; dropped with `active`. */
+  function snapshot(): MemoryRuntimeSnapshot {
+    const memory = owning();
+    const failures = memory ? [...memory.failures.values()] : [];
+    return {
+      active: memory !== undefined,
+      failing: failures.at(-1),
+      outcome: activationOutcome,
+    };
+  }
+
   // Keys off `owning()` rather than the raw active state: a role change ends
   // ownership at the next read, and the Lead's tool projection and prompt
   // section both evaluate this before the turn starts.
-  return { isActive: () => owning() !== undefined };
+  return { isActive: () => owning() !== undefined, snapshot };
+}
+
+/** How the cwd resolves against a project list, the way listing matches. */
+type ProjectMatch = {
+  /** The realpath of the cwd, or the cwd itself when realpath throws. */
+  project: string;
+  /** False when the cwd cannot be resolved, so its store path is unknown. */
+  resolved: boolean;
+  /** True when a listed project resolves to the same realpath. */
+  listed: boolean;
+};
+
+function matchProject(cwd: string, projects: readonly string[]): ProjectMatch {
+  let real: string;
+  try {
+    real = realpathSync(cwd);
+  } catch {
+    return { project: cwd, resolved: false, listed: false };
+  }
+  for (const project of projects) {
+    try {
+      if (realpathSync(project) === real)
+        return { project: real, resolved: true, listed: true };
+    } catch {
+      // A listed project that is gone cannot match.
+    }
+  }
+  return { project: real, resolved: true, listed: false };
 }
 
 /** The listed project path the cwd resolves to, or undefined when it is not listed. */
@@ -676,20 +790,113 @@ function listedProject(cwd: string): string | undefined {
     return undefined;
   }
   if (projects.length === 0) return undefined;
-  let real: string;
+  const match = matchProject(cwd, projects);
+  return match.listed ? match.project : undefined;
+}
+
+/**
+ * The status states of DESIGN §4.4, applied top to bottom, first match wins.
+ * The menu row, its help line and the report all derive from this one result.
+ */
+export function projectMemoryStatus(
+  ctx: ExtensionContext,
+  input: ProjectMemoryInput,
+): ProjectMemoryStatus {
+  const runtime = input.runtime;
+  const active = runtime?.active ?? false;
+  const failing = runtime?.failing;
+  const outcome = runtime?.outcome;
+  let projects: string[] = [];
+  let configError: string | undefined;
   try {
-    real = realpathSync(cwd);
-  } catch {
-    return undefined;
+    projects = readConfig().memoryProjects;
+  } catch (error) {
+    configError = reason(error);
   }
-  for (const project of projects) {
-    try {
-      if (realpathSync(project) === real) return real;
-    } catch {
-      // A listed project that is gone cannot match.
-    }
+  const match = matchProject(ctx.cwd, projects);
+  // A malformed agent definition anywhere in the definitions directories makes
+  // discovery throw. The status still has to render, so the model reads unset
+  // and the reason names the definitions instead (DESIGN §4.4).
+  let compactor: Pick<
+    ReturnType<typeof resolveCompactorDefinition>,
+    "model" | "thinking"
+  > = {};
+  let definitionsError: string | undefined;
+  try {
+    compactor = resolveCompactorDefinition(ctx);
+  } catch (error) {
+    definitionsError = reason(error);
   }
-  return undefined;
+
+  let word: ProjectMemoryStatus["word"] = "off";
+  let reasonText: string;
+  let level: "info" | "warning" = "info";
+  if (active && failing !== undefined) {
+    word = "failing";
+    reasonText = `This session uses project memory, but compaction is failing: ${failing}`;
+    level = "warning";
+  } else if (active) {
+    word = "on";
+    reasonText = "This session uses project memory.";
+  } else if (input.role === "manager") {
+    reasonText = "Manager sessions do not use project memory.";
+  } else if (input.role === "chief") {
+    reasonText = "Chief sessions do not use project memory.";
+  } else if (input.role === "managed-lead") {
+    reasonText = "managed-lead sessions do not use project memory.";
+  } else if (ctx.sessionManager.getSessionFile() === undefined) {
+    reasonText = "This session is not saved, so it cannot use project memory.";
+  } else if (configError !== undefined) {
+    reasonText = `config.json is invalid: ${configError}`;
+    level = "warning";
+  } else if (definitionsError !== undefined) {
+    reasonText = `Agent definitions are invalid: ${definitionsError}`;
+    level = "warning";
+  } else if (!match.listed) {
+    reasonText = "This project is not enabled.";
+  } else if (compactor.model === undefined) {
+    reasonText = "No compactor model is chosen.";
+  } else if (outcome?.kind === "locked") {
+    reasonText =
+      outcome.pid === undefined
+        ? "Another process already has this project's memory open."
+        : `Process ${outcome.pid} already has this project's memory open.`;
+  } else if (outcome?.kind === "failed") {
+    reasonText = `The compactor could not start: ${outcome.reason}`;
+    level = "warning";
+  } else {
+    word = "next session";
+    reasonText = "Enabled. It turns on at the next session start.";
+  }
+
+  let store = "Store: unavailable";
+  if (match.resolved) {
+    const root = projectMemoryRoot(match.project);
+    store = existsSync(root)
+      ? `Store: ${root}`
+      : `Store: ${root} · not created yet`;
+  }
+  const report = [
+    `Project memory: ${word}`,
+    reasonText,
+    `Project: ${match.project} · ${match.listed ? "enabled" : "not enabled"}`,
+    compactor.model === undefined
+      ? "Compactor: unset"
+      : `Compactor: ${compactor.model} · ${compactor.thinking ?? "low"}`,
+    store,
+  ].join("\n");
+
+  return {
+    word,
+    reason: reasonText,
+    level,
+    report,
+    project: match.project,
+    projectResolved: match.resolved,
+    listed: match.listed,
+    configError,
+    model: compactor.model,
+  };
 }
 
 /** A backfilled message keeps its original kind as a text prefix. */

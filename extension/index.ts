@@ -251,6 +251,7 @@ import {
 import {
   ordinaryLeadSession,
   registerMemoryRuntime,
+  type MemoryRuntimeSnapshot,
 } from "./memory-runtime.ts";
 import { MEMORY_TOOL_NAMES } from "./memory-prompts.ts";
 import {
@@ -1067,6 +1068,8 @@ export default function (pi: ExtensionAPI): void {
   // Replaced by the memory runtime's handle, so tool projection and the Lead
   // prompt section can see ownership without importing memory-runtime.
   let projectMemoryActive = (): boolean => false;
+  let projectMemorySnapshot = (): MemoryRuntimeSnapshot | undefined =>
+    undefined;
   const activeRole = (): SessionRole => activeLeadRole(leadRuntime);
   const supervisionHost = {
     herdrSessionSnapshot,
@@ -1657,6 +1660,7 @@ export default function (pi: ExtensionAPI): void {
         mode: LeadExecutionMode,
       ) => leadRuntimes.setLeadExecutionMode(ctx, mode),
       leadExecutionPresentation: () => leadRuntimes.leadExecutionPresentation(),
+      memoryRuntimeSnapshot: () => projectMemorySnapshot(),
       agentDefinitionEnabled,
       agentDefinitionMetadata,
       expandAgentBodyFiles,
@@ -1982,7 +1986,13 @@ export default function (pi: ExtensionAPI): void {
       const herdsmanCommand = {
         description: "Open Pi Herdsman",
         getArgumentCompletions: (argumentPrefix: string) => {
-          const commands = ["stats", "definitions", "placement", "stop"];
+          const commands = [
+            "stats",
+            "definitions",
+            "memory",
+            "placement",
+            "stop",
+          ];
           const trimmed = argumentPrefix.trimStart();
           if (!trimmed || !trimmed.includes(" "))
             return commands
@@ -2256,6 +2266,7 @@ export default function (pi: ExtensionAPI): void {
         onActiveChange: () => roleTransitions.reconcileRoleTools(),
       });
       projectMemoryActive = memoryRuntime.isActive;
+      projectMemorySnapshot = memoryRuntime.snapshot;
     }
   }
   if (processRole !== "managed-agent") return;

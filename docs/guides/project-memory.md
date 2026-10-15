@@ -22,10 +22,31 @@ exact values need `zoom`. See
 
 ## Enable memory for a project
 
-Memory is user-wide only: nothing in a project can enable it, because an
-enabled project spends model calls on compaction. Edit the Herdsman
-configuration file directly and add the project's absolute directory to
-`memoryProjects`:
+Memory is user-wide and costs model calls, so enabling it takes an explicit
+action and a confirmation. Open Pi in the project and run:
+
+```text
+/herdsman memory
+```
+
+Select `Enable for this project…` and confirm the dialog. It names the resolved
+directory, the compaction cost, and that the change waits for the next session
+start, which includes a normal startup, a reload, `/new`, a resume, and a fork.
+The confirmation stores that resolved path:
+
+```text
+Project memory enabled for /home/you/projects/my-app. It turns on at the next session start.
+```
+
+Matching compares realpaths, so opening the project later through a symlink also
+matches. When no compactor model is chosen, the same step enables the project
+and then opens the model picker (see
+[Choose the compactor model](#choose-the-compactor-model)). `Enable for this
+project…` appears only when the configuration is readable and the directory is
+not already listed.
+
+As the direct alternative, edit the Herdsman configuration file and add the
+project's absolute directory to `memoryProjects`:
 
 ```text
 ~/.pi/agent/pi-herdsman/config.json
@@ -62,6 +83,10 @@ native and prints one notice:
 Project memory is off: choose the compactor model in /herdsman definitions -> compactor -> Model
 ```
 
+The `Compactor model` row in `/herdsman memory` opens the same picker as
+`Definitions` → `compactor` → `Model`, so either route works. Enabling a project
+without a model opens the picker immediately after the confirmation.
+
 Choose it in the interactive menu:
 
 1. Open `/herdsman definitions`.
@@ -78,8 +103,33 @@ for the fields it accepts.
 
 ## Verify that it is active
 
-Start a new Lead session in the listed project. Memory activates at session
-start, and there is no success banner, so check any of these:
+Open `/herdsman memory`, or select `Project memory` in `/herdsman`. The `Status`
+row and the root row show the current session's state word:
+
+- `on` — this session uses project memory.
+- `off` — this session does not. The help line names the cause: the project is
+  not enabled, no compactor model is chosen, another process already has the
+  project's memory open, the compactor could not start, the session is a
+  Manager, Chief, or `managed-lead` session, the session is not saved, or
+  `config.json` or the Agent definitions are invalid.
+- `next session` — the project is enabled and a compactor model is chosen now,
+  but this session did not activate memory at its start.
+- `failing` — this session uses project memory, but compaction is failing; the
+  help line carries the error.
+
+Selecting `Status` shows the full report and returns to the menu:
+
+```text
+Project memory: off
+No compactor model is chosen.
+Project: /home/you/projects/my-app · enabled
+Compactor: unset
+Store: /home/you/.pi/agent/pi-herdsman/memory/3f2a9c1b0d4e5f67 · not created yet
+```
+
+The store line is the project's directory; `not created yet` means no session
+has written to it. Memory activates at session start and has no success banner,
+so these also show whether it is running:
 
 - The `Project memory is off: …` notice does not appear.
 - The session's Lead has the `zoom` and `date` tools; ask it to zoom a message
@@ -139,14 +189,14 @@ project's memory over. The next session backfills the branch it resumes as
 
 ## Troubleshooting
 
-| Symptom                                                                          | Cause                                                                                                               | Fix                                                                                                                                          |
-| -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Project memory is off: choose the compactor model …`                            | No compactor model is set                                                                                           | Set `compactor` → `Model` in `/herdsman definitions`                                                                                         |
-| `Project memory is already open in process <pid>; this session runs without it.` | Another session owns the project                                                                                    | Continue in that session, or close it and start a new one                                                                                    |
-| `Project memory is inactive: …`                                                  | The compactor model is unavailable or has no credentials                                                            | Pick an available model, or configure its provider                                                                                           |
-| `Project memory compaction is failing: …`                                        | Compaction model calls are failing                                                                                  | Check the compactor model, its credentials, and provider availability                                                                        |
-| `Project memory log damage: N warning(s); first: …`                              | A store line is unreadable                                                                                          | The session continues with the records it can read; the damaged message's detail is lost. Delete the store directory to start over           |
-| Nothing happens, and no notice appears                                           | The working directory is not exactly a listed path, the session is not persisted, or `config.json` fails validation | Open Pi in the listed absolute directory (watch for a symlink or a subdirectory); a config error is reported where the configuration is read |
+| Symptom                                                                          | Cause                                                                                                                                       | Fix                                                                                                                                                                                                         |
+| -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Project memory is off: choose the compactor model …`                            | No compactor model is set                                                                                                                   | Set `compactor` → `Model` in `/herdsman definitions`                                                                                                                                                        |
+| `Project memory is already open in process <pid>; this session runs without it.` | Another session owns the project                                                                                                            | Continue in that session, or close it and start a new one                                                                                                                                                   |
+| `Project memory is inactive: …`                                                  | The compactor model is unavailable or has no credentials                                                                                    | Pick an available model, or configure its provider                                                                                                                                                          |
+| `Project memory compaction is failing: …`                                        | Compaction model calls are failing                                                                                                          | Check the compactor model, its credentials, and provider availability                                                                                                                                       |
+| `Project memory log damage: N warning(s); first: …`                              | A store line is unreadable                                                                                                                  | The session continues with the records it can read; the damaged message's detail is lost. Delete the store directory to start over                                                                          |
+| Nothing happens, and no notice appears                                           | The working directory is not exactly a listed path, the session is not persisted, or `config.json` or the Agent definitions fail validation | Run `/herdsman memory` → `Status`; its help line gives the exact reason. A symlink to the listed directory matches, a subdirectory does not, and a config error is reported where the configuration is read |
 
 ## See also
 

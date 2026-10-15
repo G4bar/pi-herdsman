@@ -18,6 +18,7 @@ Herdsman package version.
 /herdsman
 /herdsman stats
 /herdsman definitions
+/herdsman memory
 /herdsman placement [tab|subtree|split]
 /herdsman stop
 /lead [flexible|orchestrate]
@@ -32,8 +33,9 @@ For the Herdsman commands above, replacing `/herdsman` with `/agents` is
 equivalent. The `/manager`, `/chief`, and `/takeover` commands are unchanged.
 
 `/herdsman` opens the native Pi menu titled with the running Pi Herdsman package
-version. Its seven destinations are `Execution`, `Agents`, `Project manager`,
-`Session stats`, `Definitions`, `Settings`, and `Advanced…`. Active role state is secondary row
+version. Its eight destinations are `Execution`, `Agents`, `Project manager`,
+`Project memory`, `Session stats`, `Definitions`, `Settings`, and `Advanced…`.
+Active role state is secondary row
 metadata; the TUI updates contextual help for the selected row.
 
 `Execution` shows the current ordinary Lead mode (`Flexible` or `Orchestrate`).
@@ -174,6 +176,27 @@ session's settings.
 Standalone global definitions are editable too. Removing a model or thinking
 field selects `Inherit current session`; removing any other field inherits its
 lower-precedence value.
+
+## `/herdsman memory`
+
+Opens the `Project memory` menu for the current directory. The root `Project
+memory` row opens the same menu with the current state word as its description.
+
+`Status` shows whether this session uses project memory: `on`, `off`, `next
+session`, or `failing`, with the reason as its help line. Selecting it shows a
+five-line report: state word, reason, project path and whether it is enabled,
+compactor model and thinking level, and the project's store directory.
+
+`Enable for this project…` appears when the configuration is readable and the
+current directory is not already listed. It confirms the resolved path, the
+compaction cost, and that the change takes effect at the next session start,
+then adds the resolved path to `memoryProjects`. When no compactor model is
+chosen, the compactor Model picker opens immediately after.
+
+`Compactor model` shows the configured model (or `unset`) and opens the same
+picker as `Definitions` → `compactor` → `Model`.
+
+See [Project memory](../guides/project-memory.md).
 
 ## `/herdsman` → Agents → Running
 

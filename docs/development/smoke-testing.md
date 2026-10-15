@@ -441,9 +441,9 @@ In a lead session with UI:
 
 ### `/herdsman` and `/agents`
 
-Verify both `/herdsman` and `/agents` open the same seven destinations
-`Execution`, `Agents`, `Project manager`, `Session stats`, `Definitions`,
-`Settings`, and `Advanced…`.
+Verify both `/herdsman` and `/agents` open the same eight destinations
+`Execution`, `Agents`, `Project manager`, `Project memory`, `Session stats`,
+`Definitions`, `Settings`, and `Advanced…`.
 Verify active role state is secondary metadata and selected-row contextual help
 updates in the TUI. `/herdsman → Agents` opens only `Running`, `Layout`, and
 `Stop all…`, with the running count and effective placement as secondary

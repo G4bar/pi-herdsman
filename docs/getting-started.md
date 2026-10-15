@@ -88,9 +88,9 @@ Run:
 /herdsman
 ```
 
-The menu starts with `Agents`, `Project manager`, `Session stats`, `Definitions`,
-`Settings`, and `Advanced…`. Direct commands remain available when you already
-know which operation you want.
+The menu starts with `Agents`, `Project manager`, `Project memory`, `Session
+stats`, `Definitions`, `Settings`, and `Advanced…`. Direct commands remain
+available when you already know which operation you want.
 
 See [Commands](reference/commands.md) for the exact human-facing behavior.
 

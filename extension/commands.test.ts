@@ -103,6 +103,7 @@ import {
   sessionLeadExecutionState,
 } from "./lead-runtime.ts";
 import { MEMORY_LEAD_PROMPT, MEMORY_PROMPT_SECTION } from "./memory-prompts.ts";
+import { projectMemoryRoot } from "./memory.ts";
 
 const leadTools = [
   "list_agents",
@@ -5227,6 +5228,7 @@ test("Herdsman and agents share command handling and grammar", async () => {
   assert.deepEqual(herdsman.getArgumentCompletions(""), [
     { value: "stats", label: "stats" },
     { value: "definitions", label: "definitions" },
+    { value: "memory", label: "memory" },
     { value: "placement", label: "placement" },
     { value: "stop", label: "stop" },
   ]);
@@ -5249,9 +5251,9 @@ test("Herdsman and agents share command handling and grammar", async () => {
   await herdsman.handler("placement invalid", context);
   await herdsman.handler("anything", context);
   assert.deepEqual(notices, [
-    "Usage: /herdsman [stats | definitions | placement [tab|subtree|split] | stop]",
+    "Usage: /herdsman [stats | definitions | memory | placement [tab|subtree|split] | stop]",
     "Usage: /herdsman placement [tab|subtree|split]",
-    "Usage: /herdsman [stats | definitions | placement [tab|subtree|split] | stop]",
+    "Usage: /herdsman [stats | definitions | memory | placement [tab|subtree|split] | stop]",
   ]);
 });
 
@@ -6055,6 +6057,7 @@ test("Herdsman menu opens the progressive discovery menu", async () => {
     "Execution  Flexible",
     "Agents",
     "Project manager",
+    "Project memory  off",
     "Session stats",
     "Definitions",
     "Settings",
@@ -6073,6 +6076,1027 @@ test("Herdsman menu opens the progressive discovery menu", async () => {
   await pi.events.get("session_shutdown")?.[0]();
 });
 
+test("/herdsman memory opens the Project memory submenu and reports status", async () => {
+  setLeadEnvironment();
+  const overridePath = join(PI_AGENTS_DIR, "compactor.md");
+  const project = realFs.mkdtempSync(join(PI_AGENT_ROOT, "memory-menu-"));
+  realFs.writeFileSync(
+    overridePath,
+    '---\nname: "compactor"\nmodel: new/model\n---\n',
+  );
+  const pi = fakePi();
+  registerExtension!(pi.pi as never);
+  const command = pi.commandOptions.get("herdsman");
+  const prompts: { label: string; options: string[] }[] = [];
+  const notices: { message: string; level?: string }[] = [];
+  const context = fakeContext() as any;
+  context.hasUI = true;
+  context.mode = "rpc";
+  context.cwd = project;
+  context.ui.notify = (message: string, level?: string) => {
+    notices.push({ message, level });
+  };
+  const visits = new Map<string, number>();
+  context.ui.select = async (label: string, options: string[]) => {
+    prompts.push({ label, options });
+    const visit = visits.get(label) ?? 0;
+    visits.set(label, visit + 1);
+    if (label === "Project memory" && visit === 0)
+      return options.find((option) => option.startsWith("Status"));
+    return undefined;
+  };
+  try {
+    await command.handler("memory", context);
+    const menu = prompts.find(({ label }) => label === "Project memory");
+    assert.ok(menu, JSON.stringify(prompts.map(({ label }) => label)));
+    assert.deepEqual(menu.options, [
+      "Status  off",
+      "Enable for this project…",
+      "Compactor model  new/model",
+    ]);
+    assert.deepEqual(notices, [
+      {
+        message: [
+          "Project memory: off",
+          "This project is not enabled.",
+          `Project: ${realFs.realpathSync(project)} · not enabled`,
+          "Compactor: new/model · low",
+          `Store: ${projectMemoryRoot(project)} · not created yet`,
+        ].join("\n"),
+        level: "info",
+      },
+    ]);
+  } finally {
+    realFs.rmSync(overridePath, { force: true });
+    realFs.rmSync(project, { recursive: true, force: true });
+    await pi.events.get("session_shutdown")?.[0]();
+  }
+});
+
+test("/herdsman memory reports an invalid config.json as a warning", async () => {
+  setLeadEnvironment();
+  const configPath = join(PI_AGENT_ROOT, "pi-herdsman", "config.json");
+  const pi = fakePi();
+  registerExtension!(pi.pi as never);
+  const command = pi.commandOptions.get("herdsman");
+  const prior = realFs.existsSync(configPath)
+    ? realFs.readFileSync(configPath, "utf8")
+    : undefined;
+  realFs.mkdirSync(join(PI_AGENT_ROOT, "pi-herdsman"), { recursive: true });
+  realFs.writeFileSync(configPath, '{"unknown": 1}');
+  const context = fakeContext() as any;
+  context.hasUI = true;
+  context.mode = "rpc";
+  const notices: { message: string; level?: string }[] = [];
+  context.ui.notify = (message: string, level?: string) => {
+    notices.push({ message, level });
+  };
+  const rows: string[][] = [];
+  let visits = 0;
+  context.ui.select = async (label: string, options: string[]) => {
+    if (label !== "Project memory") return undefined;
+    rows.push(options);
+    visits++;
+    return visits === 1
+      ? options.find((option) => option.startsWith("Status"))
+      : undefined;
+  };
+  try {
+    await command.handler("memory", context);
+    assert.deepEqual(rows[0], ["Status  off", "Compactor model  unset"]);
+    assert.equal(notices.length, 1);
+    assert.equal(notices[0]?.level, "warning");
+    // The reason is both the Status help line and report line 2.
+    assert.equal(
+      notices[0]?.message.split("\n")[1],
+      "config.json is invalid: Invalid Pi Herdsman config: unknown field unknown",
+    );
+  } finally {
+    if (prior === undefined) realFs.rmSync(configPath, { force: true });
+    else realFs.writeFileSync(configPath, prior);
+    await pi.events.get("session_shutdown")?.[0]();
+  }
+});
+
+test("/herdsman memory sets the compactor model from its Compactor model row", async () => {
+  setLeadEnvironment();
+  const overridePath = join(PI_AGENTS_DIR, "compactor.md");
+  const pi = fakePi();
+  registerExtension!(pi.pi as never);
+  const command = pi.commandOptions.get("herdsman");
+  const context = fakeContext() as any;
+  context.hasUI = true;
+  context.mode = "rpc";
+  context.modelRegistry = {
+    refresh: async () => undefined,
+    getAll: () => [{ provider: "new", id: "model", reasoning: true }],
+    getAvailable: () => [{ provider: "new", id: "model", reasoning: true }],
+  };
+  const prompts: { label: string; options: string[] }[] = [];
+  const notices: string[] = [];
+  context.ui.notify = (message: string) => notices.push(message);
+  const visits = new Map<string, number>();
+  context.ui.select = async (label: string, options: string[]) => {
+    prompts.push({ label, options });
+    const visit = visits.get(label) ?? 0;
+    visits.set(label, visit + 1);
+    if (label === "Project memory")
+      return visit === 0
+        ? options.find((option) => option.startsWith("Compactor model"))
+        : undefined;
+    if (label === "Model")
+      return options.find((option) => option.startsWith("model"));
+    return undefined;
+  };
+  try {
+    await command.handler("memory", context);
+    const picker = prompts.find(({ label }) => label === "Model");
+    assert.ok(picker, JSON.stringify(prompts.map(({ label }) => label)));
+    assert.equal(picker.options[0], "Unset (project memory off)");
+    assert.ok(
+      picker.options.some((option) => option.startsWith("model")),
+      JSON.stringify(picker.options),
+    );
+    assert.ok(
+      notices.includes("compactor model set to new/model."),
+      JSON.stringify(notices),
+    );
+    // The submenu re-renders from the re-read status after the write.
+    const renders = prompts.filter(({ label }) => label === "Project memory");
+    assert.deepEqual(renders[1]?.options, [
+      "Status  off",
+      "Enable for this project…",
+      "Compactor model  new/model",
+    ]);
+  } finally {
+    realFs.rmSync(overridePath, { force: true });
+    await pi.events.get("session_shutdown")?.[0]();
+  }
+});
+
+test("cancelling the Project memory compactor model picker writes nothing", async () => {
+  setLeadEnvironment();
+  const overridePath = join(PI_AGENTS_DIR, "compactor.md");
+  realFs.rmSync(overridePath, { force: true });
+  const pi = fakePi();
+  registerExtension!(pi.pi as never);
+  const command = pi.commandOptions.get("herdsman");
+  const context = fakeContext() as any;
+  context.hasUI = true;
+  context.mode = "rpc";
+  context.modelRegistry = {
+    refresh: async () => undefined,
+    getAll: () => [{ provider: "new", id: "model", reasoning: true }],
+    getAvailable: () => [{ provider: "new", id: "model", reasoning: true }],
+  };
+  const notices: unknown[] = [];
+  context.ui.notify = (...args: unknown[]) => notices.push(args);
+  const visits = new Map<string, number>();
+  context.ui.select = async (label: string, options: string[]) => {
+    const visit = visits.get(label) ?? 0;
+    visits.set(label, visit + 1);
+    if (label === "Project memory" && visit === 0)
+      return options.find((option) => option.startsWith("Compactor model"));
+    // The picker's Esc (undefined) and the submenu's Esc both land here.
+    return undefined;
+  };
+  try {
+    await command.handler("memory", context);
+    assert.equal(visits.get("Model"), 1);
+    assert.equal(realFs.existsSync(overridePath), false);
+    assert.deepEqual(notices, []);
+  } finally {
+    realFs.rmSync(overridePath, { force: true });
+    await pi.events.get("session_shutdown")?.[0]();
+  }
+});
+
+/**
+ * Drives `/herdsman memory` against a temp project with a scripted select,
+ * confirm and model picker, then restores the config and the definitions.
+ * `configText` is read after the run and before the restore.
+ */
+async function runProjectMemoryMenu(options: {
+  cwd: string;
+  definitions: string;
+  config?: string;
+  fresh?: boolean;
+  confirm?: (title: string, message: string) => boolean;
+  select: (label: string, items: string[], visit: number) => string | undefined;
+}): Promise<{
+  rows: string[][];
+  notices: { message: string; level?: string }[];
+  confirms: { title: string; message: string }[];
+  prompts: { label: string; options: string[] }[];
+  configText: string | undefined;
+}> {
+  setLeadEnvironment();
+  const compactorPath = join(PI_AGENTS_DIR, "compactor.md");
+  realFs.writeFileSync(compactorPath, options.definitions);
+  const configDir = join(PI_AGENT_ROOT, "pi-herdsman");
+  const configPath = join(configDir, "config.json");
+  const prior = realFs.existsSync(configPath)
+    ? realFs.readFileSync(configPath, "utf8")
+    : undefined;
+  if (options.config === undefined) {
+    realFs.rmSync(configPath, { force: true });
+    if (options.fresh)
+      realFs.rmSync(configDir, { recursive: true, force: true });
+  } else {
+    realFs.mkdirSync(configDir, { recursive: true });
+    realFs.writeFileSync(configPath, options.config);
+  }
+  const pi = fakePi();
+  registerExtension!(pi.pi as never);
+  const context = fakeContext() as any;
+  context.hasUI = true;
+  context.mode = "rpc";
+  context.cwd = options.cwd;
+  context.modelRegistry = {
+    refresh: async () => undefined,
+    getAvailable: () => [{ provider: "new", id: "model", reasoning: true }],
+  };
+  const rows: string[][] = [];
+  const notices: { message: string; level?: string }[] = [];
+  const confirms: { title: string; message: string }[] = [];
+  const prompts: { label: string; options: string[] }[] = [];
+  const visits = new Map<string, number>();
+  context.ui.notify = (message: string, level?: string) => {
+    notices.push({ message, level });
+  };
+  context.ui.confirm = async (title: string, message: string) => {
+    confirms.push({ title, message });
+    return options.confirm ? options.confirm(title, message) : true;
+  };
+  context.ui.select = async (label: string, items: string[]) => {
+    prompts.push({ label, options: items });
+    const visit = visits.get(label) ?? 0;
+    visits.set(label, visit + 1);
+    if (label === "Project memory") rows.push(items);
+    return options.select(label, items, visit);
+  };
+  let configText: string | undefined;
+  try {
+    await pi.commandOptions.get("herdsman").handler("memory", context);
+    configText = realFs.existsSync(configPath)
+      ? realFs.readFileSync(configPath, "utf8")
+      : undefined;
+  } finally {
+    realFs.rmSync(compactorPath, { force: true });
+    if (prior === undefined) realFs.rmSync(configPath, { force: true });
+    else realFs.writeFileSync(configPath, prior);
+    await pi.events.get("session_shutdown")?.[0]();
+  }
+  return { rows, notices, confirms, prompts, configText };
+}
+
+/** The Enable row the enable flows select first. */
+const enableRow = (items: string[]): string | undefined =>
+  items.find((item) => item.startsWith("Enable for this project"));
+
+const COMPACTOR_WITH_MODEL = '---\nname: "compactor"\nmodel: new/model\n---\n';
+const COMPACTOR_WITHOUT_MODEL = '---\nname: "compactor"\n---\ncompactor\n';
+
+const ENABLE_CONFIRM_TITLE = "Enable project memory?";
+function enableConfirmMessage(project: string): string {
+  return [
+    `Ordinary Lead sessions opened in ${project} will share one project memory.`,
+    "Compaction makes about two compactor model calls per logged message, and the store is never pruned.",
+    "It turns on at the next session start.",
+  ].join("\n");
+}
+
+test("/herdsman memory enables the project for the next session start", async () => {
+  const project = realFs.mkdtempSync(join(PI_AGENT_ROOT, "memory-enable-"));
+  const seeded = '{\n  "autoActivateManager": true\n}\n';
+  try {
+    const { rows, notices, confirms, configText } = await runProjectMemoryMenu({
+      cwd: project,
+      definitions: COMPACTOR_WITH_MODEL,
+      config: seeded,
+      select: (_label, items, visit) =>
+        visit === 0 ? enableRow(items) : undefined,
+    });
+    const real = realFs.realpathSync(project);
+    assert.deepEqual(rows[0], [
+      "Status  off",
+      "Enable for this project…",
+      "Compactor model  new/model",
+    ]);
+    assert.deepEqual(confirms, [
+      { title: ENABLE_CONFIRM_TITLE, message: enableConfirmMessage(real) },
+    ]);
+    assert.deepEqual(notices, [
+      {
+        message: `Project memory enabled for ${real}. It turns on at the next session start.`,
+        level: "info",
+      },
+    ]);
+    // The seeded key survives: only memoryProjects is written.
+    assert.deepEqual(JSON.parse(configText ?? ""), {
+      autoActivateManager: true,
+      memoryProjects: [real],
+    });
+    // The re-render drops Enable and reads the new state.
+    assert.deepEqual(rows[1], [
+      "Status  next session",
+      "Compactor model  new/model",
+    ]);
+  } finally {
+    realFs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("/herdsman memory offers the compactor picker when no model is set", async () => {
+  for (const variant of [
+    { name: "pick a model", pick: "model" },
+    { name: "Esc", pick: "esc" },
+    { name: "Unset (project memory off)", pick: "unset" },
+  ]) {
+    const project = realFs.mkdtempSync(join(PI_AGENT_ROOT, "memory-picker-"));
+    try {
+      const { rows, notices, prompts, configText } = await runProjectMemoryMenu(
+        {
+          cwd: project,
+          definitions: COMPACTOR_WITHOUT_MODEL,
+          select: (label, items, visit) => {
+            if (label === "Model") {
+              if (variant.pick === "model")
+                return items.find((item) => item.startsWith("model"));
+              if (variant.pick === "unset")
+                return items.find((item) => item.startsWith("Unset ("));
+              return undefined;
+            }
+            if (label !== "Project memory") return undefined;
+            if (visit === 0) return enableRow(items);
+            // Read the state right after the picker, then the report.
+            return visit === 1
+              ? items.find((item) => item.startsWith("Status"))
+              : undefined;
+          },
+        },
+      );
+      const real = realFs.realpathSync(project);
+      // The picker is the existing compactor one, with the unset row.
+      const picker = prompts.find(({ label }) => label === "Model");
+      assert.equal(
+        picker?.options[0],
+        "Unset (project memory off)",
+        variant.name,
+      );
+      assert.equal(
+        notices[0]?.message,
+        `Project memory enabled for ${real}. Choose a compactor model to turn it on.`,
+        variant.name,
+      );
+      assert.equal(notices[0]?.level, "info", variant.name);
+      assert.deepEqual(JSON.parse(configText ?? ""), {
+        memoryProjects: [real],
+      });
+      if (variant.pick === "model") {
+        assert.equal(notices[1]?.message, "compactor model set to new/model.");
+        // The report is the only later notice and the row reads the new state.
+        assert.equal(notices.length, 3, variant.name);
+        assert.equal(
+          notices[2]?.message.split("\n")[0],
+          "Project memory: next session",
+          variant.name,
+        );
+        assert.deepEqual(rows[1], [
+          "Status  next session",
+          "Compactor model  new/model",
+        ]);
+      } else {
+        // Esc adds no notice; the unset row reports the model is already off.
+        if (variant.pick === "unset")
+          assert.equal(
+            notices[1]?.message,
+            "compactor model is already unset; project memory is off.",
+          );
+        const report = notices.at(-1);
+        assert.equal(
+          report?.message.split("\n")[1],
+          "No compactor model is chosen.",
+          variant.name,
+        );
+        assert.equal(
+          notices.length,
+          variant.pick === "unset" ? 3 : 2,
+          variant.name,
+        );
+        assert.deepEqual(rows[1], ["Status  off", "Compactor model  unset"]);
+      }
+    } finally {
+      realFs.rmSync(project, { recursive: true, force: true });
+    }
+  }
+});
+
+test("an enable without a compactor model preselects the row after the picker", async () => {
+  const { createLeadCommandRuntime } = await import("./lead-runtime.ts");
+  const config = await import("./config.ts");
+  const configPath = join(PI_AGENT_ROOT, "pi-herdsman", "config.json");
+  const prior = realFs.existsSync(configPath)
+    ? realFs.readFileSync(configPath, "utf8")
+    : undefined;
+  const project = realFs.mkdtempSync(join(PI_AGENT_ROOT, "memory-select-"));
+  setLeadEnvironment();
+  try {
+    for (const variant of [
+      { name: "a picked model", pick: "new/model", next: "status" },
+      { name: "Esc", pick: undefined, next: "compactor-model" },
+      {
+        name: "Unset (project memory off)",
+        pick: "unset",
+        next: "compactor-model",
+      },
+    ]) {
+      realFs.rmSync(configPath, { force: true });
+      const selections: (string | undefined)[] = [];
+      const notices: string[] = [];
+      let visits = 0;
+      const runtime = createLeadCommandRuntime({
+        readConfig: config.readConfig,
+        updateConfig: config.updateConfig,
+        leadExecutionPresentation: () => ({ managed: false, mode: "flexible" }),
+        roleActive: () => false,
+        memoryRuntimeSnapshot: () => undefined,
+        updateAgentOverride: () => ({ changed: false, path: undefined }),
+        selectMenu: async (
+          _ctx: unknown,
+          title: string,
+          _items: unknown[],
+          selected?: string,
+        ) => {
+          if (!title.startsWith("Project memory")) return undefined;
+          selections.push(selected);
+          return ++visits === 1 ? "enable" : undefined;
+        },
+        selectModelMenu: async () => variant.pick,
+      } as any);
+      await runtime.openMemoryMenu({
+        mode: "rpc",
+        hasUI: true,
+        cwd: project,
+        isProjectTrusted: () => false,
+        sessionManager: { getSessionFile: () => "/tmp/root.jsonl" },
+        modelRegistry: {
+          refresh: async () => undefined,
+          getAvailable: () => [
+            { provider: "new", id: "model", reasoning: true },
+          ],
+        },
+        ui: {
+          notify: (message: string) => notices.push(message),
+          confirm: async () => true,
+        },
+      } as any);
+      const real = realFs.realpathSync(project);
+      // The picked model turns memory on next start; Esc and the unset row
+      // leave the Compactor model row focused.
+      assert.deepEqual(selections, ["status", variant.next], variant.name);
+      assert.equal(
+        notices[0],
+        `Project memory enabled for ${real}. Choose a compactor model to turn it on.`,
+        variant.name,
+      );
+      assert.deepEqual(
+        JSON.parse(realFs.readFileSync(configPath, "utf8")),
+        { memoryProjects: [real] },
+        variant.name,
+      );
+    }
+  } finally {
+    if (prior === undefined) realFs.rmSync(configPath, { force: true });
+    else realFs.writeFileSync(configPath, prior);
+    realFs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("an enable with an unsaved cwd reports the error without confirming", async () => {
+  const missing = join(PI_AGENT_ROOT, "memory-missing-project");
+  realFs.rmSync(missing, { recursive: true, force: true });
+  const { notices, confirms, configText } = await runProjectMemoryMenu({
+    cwd: missing,
+    definitions: COMPACTOR_WITH_MODEL,
+    select: (_label, items, visit) =>
+      visit === 0 ? enableRow(items) : undefined,
+  });
+  assert.equal(confirms.length, 0);
+  assert.equal(notices.length, 1);
+  assert.equal(notices[0]?.level, "error");
+  assert.match(
+    notices[0]?.message ?? "",
+    /^Could not enable project memory: ENOENT: /u,
+  );
+  assert.equal(configText, undefined);
+});
+
+test("Enable is offered and works for every role and an unsaved session", async () => {
+  const { createLeadCommandRuntime } = await import("./lead-runtime.ts");
+  const config = await import("./config.ts");
+  const configPath = join(PI_AGENT_ROOT, "pi-herdsman", "config.json");
+  const prior = realFs.existsSync(configPath)
+    ? realFs.readFileSync(configPath, "utf8")
+    : undefined;
+  setLeadEnvironment();
+  try {
+    for (const row of [
+      { name: "Manager", roleActive: "manager", managed: false, saved: true },
+      { name: "Chief", roleActive: "chief", managed: false, saved: true },
+      {
+        name: "managed-lead",
+        roleActive: undefined,
+        managed: true,
+        saved: true,
+      },
+      {
+        name: "unsaved session",
+        roleActive: undefined,
+        managed: false,
+        saved: false,
+      },
+    ]) {
+      const project = realFs.mkdtempSync(join(PI_AGENT_ROOT, "memory-role-"));
+      realFs.rmSync(configPath, { force: true });
+      const labels: string[] = [];
+      const notices: string[] = [];
+      let visits = 0;
+      const runtime = createLeadCommandRuntime({
+        readConfig: config.readConfig,
+        updateConfig: config.updateConfig,
+        leadExecutionPresentation: () => ({
+          managed: row.managed,
+          mode: "flexible",
+        }),
+        roleActive: (role: string) => role === row.roleActive,
+        memoryRuntimeSnapshot: () => undefined,
+        selectMenu: async (_ctx: unknown, title: string, items: any[]) => {
+          if (!title.startsWith("Project memory")) return undefined;
+          labels.push(...items.map(({ label }) => label));
+          return ++visits === 1 ? "enable" : undefined;
+        },
+        selectModelMenu: async () => undefined,
+      } as any);
+      try {
+        await runtime.openMemoryMenu({
+          mode: "rpc",
+          hasUI: true,
+          cwd: project,
+          isProjectTrusted: () => false,
+          sessionManager: {
+            getSessionFile: () => (row.saved ? "/tmp/root.jsonl" : undefined),
+          },
+          modelRegistry: {
+            refresh: async () => undefined,
+            getAvailable: () => [
+              { provider: "new", id: "model", reasoning: true },
+            ],
+          },
+          ui: {
+            notify: (message: string) => notices.push(message),
+            confirm: async () => true,
+          },
+        } as any);
+        const real = realFs.realpathSync(project);
+        assert.ok(labels.includes("Enable for this project…"), row.name);
+        assert.deepEqual(
+          JSON.parse(realFs.readFileSync(configPath, "utf8")),
+          { memoryProjects: [real] },
+          row.name,
+        );
+        assert.match(
+          notices[0] ?? "",
+          /^Project memory enabled for /,
+          row.name,
+        );
+      } finally {
+        realFs.rmSync(project, { recursive: true, force: true });
+      }
+    }
+  } finally {
+    if (prior === undefined) realFs.rmSync(configPath, { force: true });
+    else realFs.writeFileSync(configPath, prior);
+  }
+});
+
+test("/herdsman memory writes nothing when the enable confirm is declined", async () => {
+  const project = realFs.mkdtempSync(join(PI_AGENT_ROOT, "memory-cancel-"));
+  const prior = '{\n  "autoActivateManager": true\n}\n';
+  try {
+    const { notices, confirms, configText } = await runProjectMemoryMenu({
+      cwd: project,
+      definitions: COMPACTOR_WITH_MODEL,
+      config: prior,
+      confirm: () => false,
+      select: (_label, items, visit) =>
+        visit === 0 ? enableRow(items) : undefined,
+    });
+    assert.equal(confirms[0]?.title, ENABLE_CONFIRM_TITLE);
+    assert.deepEqual(notices, []);
+    assert.equal(configText, prior);
+  } finally {
+    realFs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("/herdsman memory writes the realpath of a symlinked project", async () => {
+  const root = realFs.mkdtempSync(join(PI_AGENT_ROOT, "memory-link-"));
+  const project = join(root, "project");
+  realFs.mkdirSync(project);
+  const link = join(root, "link");
+  realFs.symlinkSync(project, link, "dir");
+  try {
+    const { notices, confirms, configText } = await runProjectMemoryMenu({
+      cwd: link,
+      definitions: COMPACTOR_WITH_MODEL,
+      // No config.json and no pi-herdsman/ directory yet: the lock writes it.
+      fresh: true,
+      select: (_label, items, visit) =>
+        visit === 0 ? enableRow(items) : undefined,
+    });
+    const real = realFs.realpathSync(project);
+    assert.notEqual(link, real);
+    assert.deepEqual(JSON.parse(configText ?? ""), {
+      memoryProjects: [real],
+    });
+    assert.ok(confirms[0]?.message.includes(real), confirms[0]?.message);
+    assert.equal(
+      notices[0]?.message,
+      `Project memory enabled for ${real}. It turns on at the next session start.`,
+    );
+  } finally {
+    realFs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("/herdsman memory hides Enable for an invalid config or a listed project", async () => {
+  const project = realFs.mkdtempSync(join(PI_AGENT_ROOT, "memory-hidden-"));
+  const real = realFs.realpathSync(project);
+  for (const variant of [
+    { name: "invalid config", config: '{"unknown": 1}', status: "Status  off" },
+    { name: "unreadable config", config: "{oops", status: "Status  off" },
+    {
+      name: "already listed",
+      config: JSON.stringify({ memoryProjects: [real] }),
+      status: "Status  next session",
+    },
+  ]) {
+    const { rows } = await runProjectMemoryMenu({
+      cwd: project,
+      definitions: COMPACTOR_WITH_MODEL,
+      config: variant.config,
+      select: () => undefined,
+    });
+    assert.deepEqual(
+      rows[0],
+      [variant.status, "Compactor model  new/model"],
+      variant.name,
+    );
+  }
+  realFs.rmSync(project, { recursive: true, force: true });
+});
+
+test("/herdsman memory reports a project enabled by another process", async () => {
+  const project = realFs.mkdtempSync(join(PI_AGENT_ROOT, "memory-race-ok-"));
+  const real = realFs.realpathSync(project);
+  const configDir = join(PI_AGENT_ROOT, "pi-herdsman");
+  const configPath = join(configDir, "config.json");
+  try {
+    const { notices, rows, configText } = await runProjectMemoryMenu({
+      cwd: project,
+      definitions: COMPACTOR_WITH_MODEL,
+      // The other process wins the race between the render and the confirm.
+      confirm: () => {
+        realFs.mkdirSync(configDir, { recursive: true });
+        realFs.writeFileSync(
+          configPath,
+          JSON.stringify({ memoryProjects: [real] }),
+        );
+        return true;
+      },
+      select: (_label, items, visit) =>
+        visit === 0 ? enableRow(items) : undefined,
+    });
+    assert.deepEqual(notices, [
+      {
+        message: `Project memory is already enabled for ${real}.`,
+        level: "info",
+      },
+    ]);
+    // Nothing was appended and the row is gone on the next render.
+    assert.deepEqual(JSON.parse(configText ?? ""), { memoryProjects: [real] });
+    assert.deepEqual(rows[1], [
+      "Status  next session",
+      "Compactor model  new/model",
+    ]);
+  } finally {
+    realFs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("/herdsman memory reports an unwritable config and keeps the file", async () => {
+  const project = realFs.mkdtempSync(join(PI_AGENT_ROOT, "memory-race-bad-"));
+  const configDir = join(PI_AGENT_ROOT, "pi-herdsman");
+  const configPath = join(configDir, "config.json");
+  const broken = "{oops";
+  try {
+    const { notices, configText } = await runProjectMemoryMenu({
+      cwd: project,
+      definitions: COMPACTOR_WITH_MODEL,
+      // The other process leaves a config that cannot be parsed.
+      confirm: () => {
+        realFs.mkdirSync(configDir, { recursive: true });
+        realFs.writeFileSync(configPath, broken);
+        return true;
+      },
+      select: (_label, items, visit) =>
+        visit === 0 ? enableRow(items) : undefined,
+    });
+    assert.equal(notices.length, 1);
+    assert.equal(notices[0]?.level, "error");
+    assert.match(
+      notices[0]?.message ?? "",
+      /^Could not enable project memory: Invalid Pi Herdsman config JSON: /u,
+    );
+    assert.equal(configText, broken);
+  } finally {
+    realFs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("/herdsman memory keeps the enable when the compactor picker fails", async () => {
+  const project = realFs.mkdtempSync(join(PI_AGENT_ROOT, "memory-baddefs-"));
+  try {
+    const { notices, configText } = await runProjectMemoryMenu({
+      cwd: project,
+      // Malformed definitions: the picker's compactor discovery throws.
+      definitions: '---\nname: "compactor"\nmodel: [unclosed\n---\n',
+      select: (_label, items, visit) =>
+        visit === 0 ? enableRow(items) : undefined,
+    });
+    const real = realFs.realpathSync(project);
+    // The config write and its notice stay applied ahead of the failure.
+    assert.deepEqual(JSON.parse(configText ?? ""), {
+      memoryProjects: [real],
+    });
+    assert.deepEqual(notices[0], {
+      message: `Project memory enabled for ${real}. Choose a compactor model to turn it on.`,
+      level: "info",
+    });
+    assert.equal(notices[1]?.level, "error");
+    assert.equal(notices.length, 2);
+  } finally {
+    realFs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("the Project memory submenu keeps its row selected and Esc returns to the root", async () => {
+  const { createLeadCommandRuntime } = await import("./lead-runtime.ts");
+  const menus: { menu: string; selected?: string }[] = [];
+  let rootVisits = 0;
+  let memoryVisits = 0;
+  let pickerSelected: string | undefined;
+  const runtime = createLeadCommandRuntime({
+    version: packageMetadata.version,
+    leadExecutionPresentation: () => ({ managed: false, mode: "flexible" }),
+    roleActive: () => false,
+    memoryRuntimeSnapshot: () => undefined,
+    updateAgentOverride: () => ({ changed: true, path: undefined }),
+    selectModelMenu: async (
+      _ctx: unknown,
+      _items: unknown[],
+      selected?: string,
+    ) => {
+      pickerSelected = selected;
+      return "new/model";
+    },
+    selectMenu: async (
+      _ctx: unknown,
+      title: string,
+      _items: unknown[],
+      selected?: string,
+    ) => {
+      menus.push({
+        menu: title.startsWith("Pi Herdsman") ? "root" : title,
+        selected,
+      });
+      if (title.startsWith("Pi Herdsman"))
+        return ++rootVisits === 1 ? "memory" : undefined;
+      return ++memoryVisits === 1 ? "compactor-model" : undefined;
+    },
+  } as any);
+  await runtime.runHerdsmanCommand("", {
+    hasUI: true,
+    mode: "rpc",
+    cwd: "/tmp",
+    isProjectTrusted: () => false,
+    sessionManager: { getSessionFile: () => "/tmp/root.jsonl" },
+    modelRegistry: {
+      refresh: async () => undefined,
+      getAvailable: () => [{ provider: "new", id: "model", reasoning: true }],
+    },
+    ui: { notify: () => undefined },
+  } as any);
+  assert.deepEqual(menus, [
+    { menu: "root", selected: "execution" },
+    { menu: "Project memory", selected: "status" },
+    // Back in the submenu after the picker, on the Compactor model row.
+    { menu: "Project memory", selected: "compactor-model" },
+    // Esc in the submenu returns to the root, which preselects the row again.
+    { menu: "root", selected: "memory" },
+  ]);
+  assert.equal(pickerSelected, "unset");
+});
+
+test("a malformed agent definition does not break the Herdsman menus", async () => {
+  setLeadEnvironment();
+  const overridePath = join(PI_AGENTS_DIR, "compactor.md");
+  const pi = fakePi();
+  registerExtension!(pi.pi as never);
+  realFs.writeFileSync(
+    overridePath,
+    '---\nname: "compactor"\nmodel: [unclosed\n---\n',
+  );
+  const context = fakeContext() as any;
+  context.hasUI = true;
+  context.mode = "rpc";
+  const notices: { message: string; level?: string }[] = [];
+  context.ui.notify = (message: string, level?: string) => {
+    notices.push({ message, level });
+  };
+  const prompts: { label: string; options: string[] }[] = [];
+  const visits = new Map<string, number>();
+  context.ui.select = async (label: string, options: string[]) => {
+    prompts.push({ label, options });
+    const visit = visits.get(label) ?? 0;
+    visits.set(label, visit + 1);
+    if (label.startsWith("Pi Herdsman")) return undefined;
+    if (label === "Project memory")
+      return visit === 0
+        ? options.find((option) => option.startsWith("Status"))
+        : undefined;
+    return undefined;
+  };
+  try {
+    await pi.commandOptions.get("herdsman").handler("", context);
+    assert.deepEqual(prompts[0]?.options, [
+      "Execution  Flexible",
+      "Agents",
+      "Project manager",
+      "Project memory  off",
+      "Session stats",
+      "Definitions",
+      "Settings",
+      "Advanced…",
+    ]);
+    await pi.commandOptions.get("herdsman").handler("memory", context);
+    const menu = prompts.find(({ label }) => label === "Project memory");
+    assert.deepEqual(menu?.options, [
+      "Status  off",
+      "Enable for this project…",
+      "Compactor model  unset",
+    ]);
+    assert.equal(notices.length, 1);
+    assert.equal(notices[0]?.level, "warning");
+    const reason = notices[0]?.message.split("\n")[1] ?? "";
+    assert.match(reason, /^Agent definitions are invalid: /u);
+    assert.ok(reason.includes("compactor.md"), reason);
+  } finally {
+    realFs.rmSync(overridePath, { force: true });
+    await pi.events.get("session_shutdown")?.[0]();
+  }
+});
+
+test("Project memory rows and help render in the TUI", async () => {
+  setLeadEnvironment();
+  const pi = fakePi();
+  registerExtension!(pi.pi as never);
+  const context = fakeContext() as any;
+  context.hasUI = true;
+  context.mode = "tui";
+  const rendered: string[][] = [];
+  let customCall = 0;
+  context.ui.custom = async (factory: any) =>
+    new Promise((resolve) => {
+      const component = factory(
+        { requestRender: () => undefined },
+        {
+          fg: (_color: string, text: string) => text,
+          bold: (text: string) => text,
+        },
+        {},
+        resolve,
+      );
+      const snapshot = () => component.render(200);
+      rendered.push(snapshot());
+      if (customCall++ === 0) {
+        // The root menu on the Project memory row.
+        for (let i = 0; i < 3; i++) component.handleInput("\u001b[B");
+        rendered.push(snapshot());
+        component.handleInput("\u001b");
+        return;
+      }
+      // The submenu on Status, then on Enable, then on Compactor model.
+      component.handleInput("\u001b[B");
+      rendered.push(snapshot());
+      component.handleInput("\u001b[B");
+      rendered.push(snapshot());
+      component.handleInput("\u001b");
+    });
+  try {
+    await pi.commandOptions.get("herdsman").handler("", context);
+    await pi.commandOptions.get("herdsman").handler("memory", context);
+    assert.ok(
+      rendered[1]?.some((line) =>
+        line.includes(
+          "See whether this session uses project memory, and enable it for this project.",
+        ),
+      ),
+      JSON.stringify(rendered[1]),
+    );
+    const submenu = rendered[2] ?? [];
+    const statusRow = submenu.findIndex((line) => /Status\s+off/u.test(line));
+    const enableRow = submenu.findIndex((line) =>
+      /Enable for this project…/u.test(line),
+    );
+    const modelRow = submenu.findIndex((line) =>
+      /Compactor model\s+unset/u.test(line),
+    );
+    assert.ok(statusRow >= 0, JSON.stringify(submenu));
+    assert.ok(enableRow > statusRow, JSON.stringify(submenu));
+    assert.ok(modelRow > enableRow, JSON.stringify(submenu));
+    assert.ok(
+      submenu.some((line) => line.includes("This project is not enabled.")),
+      JSON.stringify(submenu),
+    );
+    assert.ok(
+      rendered[3]?.some((line) =>
+        line.includes("Add this directory to memoryProjects."),
+      ),
+      JSON.stringify(rendered[3]),
+    );
+    assert.ok(
+      rendered[4]?.some((line) =>
+        line.includes(
+          "Model for project memory compactions. There is no default; project memory stays off until a model is chosen.",
+        ),
+      ),
+      JSON.stringify(rendered[4]),
+    );
+  } finally {
+    await pi.events.get("session_shutdown")?.[0]();
+  }
+});
+
+test("Project memory Status help names each non-Lead role", async () => {
+  const { createLeadCommandRuntime } = await import("./lead-runtime.ts");
+  const cases = [
+    {
+      name: "manager",
+      roleActive: "manager",
+      managed: false,
+      reason: "Manager sessions do not use project memory.",
+    },
+    {
+      name: "chief",
+      roleActive: "chief",
+      managed: false,
+      reason: "Chief sessions do not use project memory.",
+    },
+    {
+      name: "managed-lead",
+      roleActive: undefined,
+      managed: true,
+      reason: "managed-lead sessions do not use project memory.",
+    },
+  ];
+  for (const row of cases) {
+    let help: string | undefined;
+    const runtime = createLeadCommandRuntime({
+      leadExecutionPresentation: () => ({
+        managed: row.managed,
+        mode: "flexible",
+      }),
+      roleActive: (role: string) => role === row.roleActive,
+      memoryRuntimeSnapshot: () => undefined,
+      selectMenu: async (_ctx: unknown, _title: string, items: any[]) => {
+        help = items.find(({ label }) => label === "Status")?.help;
+        return undefined;
+      },
+    } as any);
+    await runtime.openMemoryMenu({
+      mode: "rpc",
+      hasUI: true,
+      cwd: "/tmp",
+      isProjectTrusted: () => false,
+      sessionManager: { getSessionFile: () => "/tmp/root.jsonl" },
+      ui: { notify: () => undefined },
+    } as any);
+    assert.equal(help, row.reason, row.name);
+  }
+});
+
 test("Herdsman root renders when status and definition metadata fail", async () => {
   const { createLeadCommandRuntime } = await import("./lead-runtime.ts");
   let rootLabels: string[] = [];
@@ -6087,6 +7111,7 @@ test("Herdsman root renders when status and definition metadata fail", async () 
     },
     leadExecutionPresentation: () => ({ managed: false, mode: "flexible" }),
     roleActive: () => false,
+    memoryRuntimeSnapshot: () => undefined,
     selectMenu: async (_ctx: unknown, _title: string, items: any[]) => {
       rootLabels = items.map(({ label }) => label);
       return undefined;
@@ -6094,12 +7119,16 @@ test("Herdsman root renders when status and definition metadata fail", async () 
   } as any);
   await runtime.runHerdsmanCommand("", {
     hasUI: true,
+    cwd: "/tmp",
+    isProjectTrusted: () => false,
+    sessionManager: { getSessionFile: () => "/tmp/root.jsonl" },
     ui: { notify: (message: string) => notices.push(message) },
   } as any);
   assert.deepEqual(rootLabels, [
     "Execution",
     "Agents",
     "Project manager",
+    "Project memory",
     "Session stats",
     "Definitions",
     "Settings",
@@ -6177,6 +7206,7 @@ test("Herdsman role menus dispatch through the shared role transition", async ()
         }),
         roleActive: (selectedRole: string) =>
           selectedRole === role && scenario.active,
+        memoryRuntimeSnapshot: () => undefined,
         transitionRole: async (selectedRole: string, leave: boolean) => {
           dispatched.push([selectedRole, leave]);
           return "transition requested";
@@ -6199,6 +7229,9 @@ test("Herdsman role menus dispatch through the shared role transition", async ()
       const notices: string[] = [];
       await runtime.runHerdsmanCommand("", {
         hasUI: true,
+        cwd: "/tmp",
+        isProjectTrusted: () => false,
+        sessionManager: { getSessionFile: () => "/tmp/root.jsonl" },
         ui: { notify: (message: string) => notices.push(message) },
       } as any);
       const title = role === "manager" ? "Project manager" : "Chief mode";
@@ -6309,7 +7342,7 @@ test("Herdsman root contextual help follows the selected row", async () => {
     await pi.commandOptions.get("herdsman").handler("", context);
     const help = (index: number) =>
       observed[index]?.find((line) =>
-        /Choose this ordinary Lead session|Manage running Agents, layout, and the owned Agent tree|Coordinate durable project work|Show Pi-native token usage|Inspect effective Agent and Lead definitions|Configure future-session/u.test(
+        /Choose this ordinary Lead session|Manage running Agents, layout, and the owned Agent tree|Coordinate durable project work|See whether this session uses project memory|Show Pi-native token usage|Inspect effective Agent and Lead definitions|Configure future-session/u.test(
           line,
         ),
       ) ?? "";
@@ -6327,10 +7360,14 @@ test("Herdsman root contextual help follows the selected row", async () => {
     );
     assert.match(
       help(3),
-      /Show Pi-native token usage and cost for this session and managed work\./u,
+      /See whether this session uses project memory, and enable it for this project\./u,
     );
     assert.match(
       help(4),
+      /Show Pi-native token usage and cost for this session and managed work\./u,
+    );
+    assert.match(
+      help(5),
       /Inspect effective Agent and Lead definitions and edit global overrides\./u,
     );
   } finally {
@@ -6814,7 +7851,8 @@ test("message limit edits stay in the submenu with the edited field selected", a
       renders.push(component.render(200));
       switch (customCalls++) {
         case 0:
-          for (let i = 0; i < 5; i++) component.handleInput("\u001b[B");
+          // Six rows down from Execution reaches Settings.
+          for (let i = 0; i < 6; i++) component.handleInput("\u001b[B");
           component.handleInput("\r");
           break;
         case 1:
