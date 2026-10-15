@@ -46,6 +46,7 @@ import {
 } from "./memory.ts";
 import {
   SHUTDOWN_DRAIN_MS,
+  extensionRegisteredProvider,
   start as startMemoryCompactor,
   type MemoryCompactor,
   type MemoryCompactorFailure,
@@ -87,19 +88,6 @@ const NO_COMPACTOR_MODEL_NOTICE =
  */
 const PROVIDER_STATE_NOTICE =
   "Project memory replaces the conversation with the project view each turn, so a provider that keeps its own per-session conversation state (for example pi-claude-bridge with Claude Code session reuse) cannot reuse it and may re-send the full view every turn.";
-
-/**
- * True when Pi reports the provider as one an extension registered. Pi's list
- * never holds a built-in id, and a registry without the method reads as empty.
- */
-function extensionRegisteredProvider(
-  ctx: ExtensionContext,
-  provider: string,
-): boolean {
-  return (ctx.modelRegistry?.getRegisteredProviderIds?.() ?? []).includes(
-    provider,
-  );
-}
 
 export type MemoryCompactorFactory = (
   store: MemoryStore,
@@ -155,8 +143,6 @@ type ActiveMemory = {
   frozen: FrozenTurn | undefined;
   /** True once a compaction failure was reported, so an outage notifies once. */
   reported: boolean;
-  /** True once the extension-registered Lead provider was told, once. */
-  providerNotice: boolean;
   /** This turn's verbatim corpus, cached until the branch grows. */
   corpus: TurnCorpus | undefined;
   /** True once a gated call blocked this turn, so `zoomBefore` stops counting. */
@@ -217,6 +203,12 @@ export function registerMemoryRuntime(
   const settleGraceMs = options.settleGraceMs ?? TURN_SETTLE_GRACE_MS;
   const startCompactor = options.startCompactor ?? startMemoryCompactor;
   let active: ActiveMemory | undefined;
+  /**
+   * True once this session was told about an extension-registered Lead
+   * provider. It lives outside `ActiveMemory` so a project switch, which
+   * rebuilds that record, cannot repeat the notice.
+   */
+  let providerNoticeSent = false;
 
   function notify(
     ctx: ExtensionContext,
@@ -362,7 +354,6 @@ export function registerMemoryRuntime(
         freezing: false,
         frozen: undefined,
         reported: false,
-        providerNotice: false,
         corpus: undefined,
         gateBlocked: false,
         blockCounts: new Map(),
@@ -592,10 +583,10 @@ export function registerMemoryRuntime(
     if (!memory) return;
     // A provider that keeps its own per-session conversation state cannot
     // reuse the view; say so once per session, on the first prepared turn.
-    if (!memory.providerNotice) {
+    if (!providerNoticeSent) {
       const provider = ctx.model?.provider;
       if (provider && extensionRegisteredProvider(ctx, provider)) {
-        memory.providerNotice = true;
+        providerNoticeSent = true;
         notify(ctx, PROVIDER_STATE_NOTICE, "info");
       }
     }

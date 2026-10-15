@@ -7649,9 +7649,13 @@ test("Definitions configures the reserved compactor after the Lead definitions",
   registerExtension!(pi.pi as never);
   const command = pi.commandOptions.get("agents");
   const prompts: { label: string; options: string[] }[] = [];
+  const notices: string[] = [];
   const context = fakeContext() as any;
   context.hasUI = true;
   context.mode = "rpc";
+  context.ui.notify = (...args: unknown[]) => {
+    notices.push(String(args[0]));
+  };
   context.modelRegistry = {
     refresh: async () => undefined,
     getAll: () => [{ provider: "new", id: "model", reasoning: true }],
@@ -7704,6 +7708,10 @@ test("Definitions configures the reserved compactor after the Lead definitions",
       /model: new\/model/u,
     );
     assert.match(realFs.readFileSync(overridePath, "utf8"), /thinking: high/u);
+    assert.ok(
+      notices.includes("compactor model set to new/model."),
+      JSON.stringify(notices),
+    );
     assert.equal(
       discoverAgentDefinitions().some(
         (definition) => definition.name === "compactor",
@@ -7713,6 +7721,58 @@ test("Definitions configures the reserved compactor after the Lead definitions",
   } finally {
     await pi.events.get("session_shutdown")?.[0]();
     realFs.rmSync(overridePath, { force: true });
+  }
+});
+
+test("Definitions shows an unset compactor model as memory off, without an inherit option", async () => {
+  setLeadEnvironment();
+  const pi = fakePi();
+  registerExtension!(pi.pi as never);
+  const command = pi.commandOptions.get("agents");
+  const context = fakeContext() as any;
+  context.hasUI = true;
+  context.mode = "rpc";
+  context.model = { provider: "current-provider", id: "current-model" };
+  context.thinkingLevel = "high";
+  context.modelRegistry = {
+    refresh: async () => undefined,
+    getAll: () => [{ provider: "new", id: "model", reasoning: true }],
+    getAvailable: () => [{ provider: "new", id: "model", reasoning: true }],
+  };
+  const prompts: { label: string; options: string[] }[] = [];
+  const visits = new Map<string, number>();
+  context.ui.select = async (label: string, options: string[]) => {
+    prompts.push({ label, options });
+    const visit = visits.get(label) ?? 0;
+    visits.set(label, visit + 1);
+    if (label === "Definitions")
+      return visit === 0
+        ? options.find((option) => option.includes("compactor"))
+        : undefined;
+    if (label === "compactor")
+      return visit === 0
+        ? options.find((option) => option.startsWith("Model"))
+        : undefined;
+    return undefined;
+  };
+  try {
+    await command.handler("definitions", context);
+    const compactorMenu = prompts.find(({ label }) => label === "compactor");
+    const modelRow = compactorMenu?.options.find((option) =>
+      option.startsWith("Model"),
+    );
+    assert.match(modelRow ?? "", /unset · memory off/u);
+    const picker = prompts.find(({ label }) => label === "Model");
+    assert.ok(picker, JSON.stringify(prompts.map(({ label }) => label)));
+    assert.ok(
+      !picker!.options.some((option) =>
+        option.includes("Inherit current session"),
+      ),
+      JSON.stringify(picker!.options),
+    );
+    assert.ok(picker!.options.some((option) => option.startsWith("model")));
+  } finally {
+    await pi.events.get("session_shutdown")?.[0]();
   }
 });
 

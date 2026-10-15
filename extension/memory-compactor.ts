@@ -192,7 +192,7 @@ function sessionIdOf(ctx: ExtensionContext): string | undefined {
  * never holds a built-in id, and a registry without the method reads as empty,
  * so a session hint is forwarded as it was before this check existed.
  */
-function extensionRegisteredProvider(
+export function extensionRegisteredProvider(
   ctx: ExtensionContext,
   provider: string,
 ): boolean {

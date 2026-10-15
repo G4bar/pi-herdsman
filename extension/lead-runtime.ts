@@ -1410,9 +1410,11 @@ export function createLeadCommandRuntime(host: LeadCommandHost) {
         model:
           typeof definition.frontmatter.model === "string"
             ? compactModelToken(definition.frontmatter.model)
-            : ctx.model
-              ? `inherit · ${compactModelToken(modelToken(ctx.model))}`
-              : "inherit",
+            : definition.name === COMPACTOR_DEFINITION_NAME
+              ? "unset · memory off"
+              : ctx.model
+                ? `inherit · ${compactModelToken(modelToken(ctx.model))}`
+                : "inherit",
         thinking:
           definition.frontmatter.thinking === false
             ? "off"
@@ -1651,18 +1653,26 @@ export function createLeadCommandRuntime(host: LeadCommandHost) {
             const selectedModel = await host.selectModelMenu(
               ctx,
               [
-                {
-                  value: "inherit",
-                  label: "Inherit current session",
-                  searchText: "Inherit current session inherit",
-                },
+                // An unset compactor model means memory off, not the Lead's
+                // model, so the compactor model has no inherit option.
+                ...(compactorDefinition
+                  ? []
+                  : [
+                      {
+                        value: "inherit",
+                        label: "Inherit current session",
+                        searchText: "Inherit current session inherit",
+                      },
+                    ]),
                 ...modelItems,
               ],
               configured
                 ? resolvedConfigured
                   ? modelToken(resolvedConfigured)
                   : configured
-                : "inherit",
+                : compactorDefinition
+                  ? undefined
+                  : "inherit",
             );
             if (!selectedModel) continue;
             value = selectedModel === "inherit" ? undefined : selectedModel;
@@ -1720,13 +1730,27 @@ export function createLeadCommandRuntime(host: LeadCommandHost) {
             throw new Error(
               `agent ${definition.name} override verification failed`,
             );
-          ctx.ui.notify(
-            result.changed
-              ? field === "enabled"
-                ? `${definition.name} ${value ? "enabled" : "disabled"}.`
-                : `${definition.name} ${field} ${value === undefined ? "inherited" : `set to ${value}`}.`
-              : `${definition.name} ${field} is already inherited; no change made.`,
-          );
+          const compactorModel = compactorDefinition && field === "model";
+          let message: string;
+          if (!result.changed) {
+            if (compactorModel)
+              message =
+                value === undefined
+                  ? `${definition.name} model is already unset; project memory is off.`
+                  : `${definition.name} model is already set to ${value}.`;
+            else
+              message = `${definition.name} ${field} is already inherited; no change made.`;
+          } else if (field === "enabled") {
+            message = `${definition.name} ${value ? "enabled" : "disabled"}.`;
+          } else if (compactorModel) {
+            message =
+              value === undefined
+                ? `${definition.name} model cleared; project memory is off.`
+                : `${definition.name} model set to ${value}.`;
+          } else {
+            message = `${definition.name} ${field} ${value === undefined ? "inherited" : `set to ${value}`}.`;
+          }
+          ctx.ui.notify(message);
           definition = verified;
         }
       }

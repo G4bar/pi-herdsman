@@ -624,13 +624,40 @@ for (const [name, provider, registered, expected] of providerNoticeCases)
     const harness = new Harness();
     await harness.sessionStart(session);
 
-    for (let turn = 0; turn < 3; turn += 1)
-      await harness.context(session, []);
+    for (let turn = 0; turn < 3; turn += 1) await harness.context(session, []);
     const infos = session.notices.filter((notice) => notice.type === "info");
     assert.equal(infos.length, expected, name);
     if (expected === 1) assert.match(infos[0]!.message, /cannot reuse it/);
     await harness.shutdown(session, "quit");
   });
+
+test("the provider notice is once per session, not once per project", async () => {
+  const first = projectDir();
+  const second = projectDir();
+  withProjects([first, second]);
+  const alpha = new TestSession({ cwd: first, file: "/sessions/a.jsonl" });
+  const beta = new TestSession({ cwd: second, file: "/sessions/b.jsonl" });
+  for (const session of [alpha, beta]) {
+    session.model = { provider: "ext", id: "lead" };
+    session.registeredProviders = ["ext"];
+  }
+  const harness = new Harness();
+  await harness.sessionStart(alpha);
+  await harness.context(alpha, []);
+  // A project switch rebuilds the ownership record; the notice stays sent.
+  await harness.sessionStart(beta);
+  await harness.context(beta, []);
+
+  assert.equal(
+    alpha.notices.filter((notice) => notice.type === "info").length,
+    1,
+  );
+  assert.equal(
+    beta.notices.filter((notice) => notice.type === "info").length,
+    0,
+  );
+  await harness.shutdown(beta, "quit");
+});
 
 test("a damaged log is reported once with its first warning", async () => {
   const project = projectDir();
