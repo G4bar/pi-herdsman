@@ -109,7 +109,13 @@ environment (an isolated
 this worktree's `extension/index.ts` directly, so no build is needed. Delegation
 steps use the invoking Herdr workspace, so the real Pi agent directory must
 contain Herdr's `herdr-agent-state.ts` integration; the scenario copies it into
-the temporary agent directory. `memory-horizon` delegates real agents, so it is
+the temporary agent directory. In that workspace the harness closes the Herdr
+tabs and panes those delegations create when a Lead child exits, whether it ends
+normally, fails or is killed, and from its own Ctrl+C/SIGTERM guard; it closes
+only topology that appeared after the run started and holds a pane whose cwd is
+under the run's temporary root, so unrelated tabs are never touched. A hard kill
+of the harness itself (`SIGKILL` of `node`) cannot sweep.
+`memory-horizon` delegates real agents, so it is
 the one scenario that refuses to start, with a clear message, when that
 integration is missing. All three make real model calls and print a cost
 estimate; all three refuse to start without `--yes`.

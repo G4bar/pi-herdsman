@@ -51,6 +51,8 @@ import {
   parseHerdrOutput,
   parseSmokeArgs,
   cleanupMemoryResources,
+  sweepMemoryTopology,
+  memorySweepTargets,
   copyIfExists,
   installMemorySignalHandlers,
   memoryGateReport,
@@ -1235,17 +1237,134 @@ test("memory scenarios install one-time interrupt guards", () => {
   assert.equal(process.listenerCount("SIGTERM"), before + 1);
 });
 
-test("memory signal cleanup kills children and removes temp roots", async () => {
+test("memory signal cleanup kills children, sweeps Herdr, then removes temp roots", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-herdsman-signal-"));
   await writeFile(join(root, "session.jsonl"), "{}\n");
-  const killed = [];
+  const order: string[] = [];
   const count = await cleanupMemoryResources({
-    children: [{ kill: (signal) => killed.push(signal) }],
+    children: [{ kill: (signal: string) => order.push(signal) }],
     roots: [root],
+    sweep: async () => {
+      // The sweep proves ownership from the run's roots, so it runs before them.
+      await stat(join(root, "session.jsonl"));
+      order.push("sweep");
+    },
   });
-  assert.deepEqual(killed, ["SIGKILL"]);
+  assert.deepEqual(order, ["SIGKILL", "sweep"]);
   assert.equal(count, 1);
   await assert.rejects(stat(root), /ENOENT/);
+});
+
+test("a failed memory sweep still removes the temp roots", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-herdsman-sweep-"));
+  const count = await cleanupMemoryResources({
+    children: [],
+    roots: [root],
+    sweep: async () => {
+      throw new Error("herdr tab list failed");
+    },
+  });
+  assert.equal(count, 1);
+  await assert.rejects(stat(root), /ENOENT/);
+});
+
+test("the memory sweep closes only tabs and panes it can prove the run owns", () => {
+  const roots = ["/tmp/pi-herdsman-run"];
+  // `w:p0` is a pane from before the run whose cwd still matches the roots: the
+  // sweep additionally needs the id to be absent from the baseline.
+  const baseline = {
+    tabs: [{ tab_id: "w:t1" }, { tab_id: "w:t2" }],
+    panes: [
+      { pane_id: "w:p0", tab_id: "w:t2", cwd: "/tmp/pi-herdsman-run/old" },
+      { pane_id: "w:p1", tab_id: "w:t1", cwd: "/repo" },
+    ],
+  };
+  const pane = (pane_id: string, tab_id: string, cwd: string) => ({
+    pane_id,
+    tab_id,
+    cwd,
+  });
+  const cases = [
+    {
+      name: "a new tab whose pane cwd is under the run root is closed",
+      tabs: [{ tab_id: "w:t3" }],
+      panes: [pane("w:p2", "w:t3", "/tmp/pi-herdsman-run/project-memory")],
+      expected: { tabs: ["w:t3"], panes: [] },
+    },
+    {
+      name: "a pane that already existed is never a target",
+      tabs: [],
+      panes: [],
+      expected: { tabs: [], panes: [] },
+    },
+    {
+      name: "a tab that already existed is kept, its new split pane is closed",
+      tabs: [{ tab_id: "w:t2" }],
+      panes: [pane("w:p2", "w:t2", "/tmp/pi-herdsman-run/project-memory")],
+      expected: { tabs: [], panes: ["w:p2"] },
+    },
+    {
+      name: "a new tab with no owned cwd is kept",
+      tabs: [{ tab_id: "w:t4" }],
+      panes: [pane("w:p3", "w:t4", "/repo")],
+      expected: { tabs: [], panes: [] },
+    },
+    {
+      name: "a new tab whose cwd is a sibling of the run root is kept",
+      tabs: [{ tab_id: "w:t5" }],
+      panes: [pane("w:p4", "w:t5", "/tmp/pi-herdsman-run-2/project")],
+      expected: { tabs: [], panes: [] },
+    },
+    {
+      name: "the harness's own tab is kept, only the run's split pane in it closes",
+      tabs: [{ tab_id: "w:t6" }],
+      panes: [pane("w:p5", "w:t6", "/tmp/pi-herdsman-run/project")],
+      expected: { tabs: [], panes: ["w:p5"] },
+    },
+  ];
+  for (const testCase of cases)
+    assert.deepEqual(
+      memorySweepTargets({
+        baseline,
+        observed: {
+          tabs: [...baseline.tabs, ...testCase.tabs],
+          panes: [...baseline.panes, ...testCase.panes],
+        },
+        roots,
+        hostTabId: "w:t6",
+      }),
+      testCase.expected,
+      testCase.name,
+    );
+});
+
+test("a failed tab close warns once and does not stop the sweep", async () => {
+  const warnings: string[] = [];
+  const attempted: string[] = [];
+  const closed = await sweepMemoryTopology({
+    baseline: { tabs: [], panes: [] },
+    observed: {
+      tabs: [{ tab_id: "w:t3" }, { tab_id: "w:t4" }],
+      panes: [
+        { pane_id: "w:p2", tab_id: "w:t3", cwd: "/tmp/pi-herdsman-run/a" },
+        { pane_id: "w:p3", tab_id: "w:t4", cwd: "/tmp/pi-herdsman-run/b" },
+      ],
+    },
+    roots: ["/tmp/pi-herdsman-run"],
+    hostTabId: "w:t1",
+    close: async (kind: string, id: string) => {
+      attempted.push(`${kind} ${id}`);
+      if (id === "w:t3") throw new Error("herdr tab close failed");
+    },
+    warn: (message: string) => {
+      warnings.push(message);
+    },
+  });
+  assert.deepEqual(attempted, ["tab w:t3", "tab w:t4"]);
+  assert.deepEqual(closed, ["w:t4"]);
+  assert.deepEqual(warnings, [
+    "smoke: could not close tab w:t3: herdr tab close failed",
+  ]);
 });
 
 test("copyIfExists swallows missing parts but rethrows real failures", async () => {

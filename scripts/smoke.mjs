@@ -4495,21 +4495,149 @@ async function keepMemoryArtifacts(keep, scenario, runs, reportPath) {
   return target;
 }
 
-/** Live memory child processes and temp roots, for signal cleanup. */
+/** Live memory child processes, temp roots and Herdr baseline, for signal cleanup. */
 const memoryLiveChildren = new Set();
 const memoryLiveRoots = new Set();
+/**
+ * The host workspace's Herdr tabs and panes from before the run's first child
+ * spawned. A memory scenario runs in the developer's own workspace, so only
+ * what appeared after this snapshot can belong to the run.
+ */
+let memoryLiveTopology;
 let memorySignalHandlersInstalled = false;
 
+/** The host workspace's tabs and panes, or undefined if either listing fails. */
+async function hostHerdrTopology() {
+  const workspaceId = process.env.HERDR_WORKSPACE_ID;
+  if (!workspaceId) return undefined;
+  const [tabs, panes] = await Promise.all([
+    tryHerdr(["tab", "list", "--workspace", workspaceId], {
+      timeout: OBSERVATION_TIMEOUT_MS,
+    }),
+    tryHerdr(["pane", "list", "--workspace", workspaceId], {
+      timeout: OBSERVATION_TIMEOUT_MS,
+    }),
+  ]);
+  if (!tabs.ok || !panes.ok) return undefined;
+  return { tabs: tabs.value?.tabs ?? [], panes: panes.value?.panes ?? [] };
+}
+
 /**
- * Kills live memory children and removes their temp roots, so an interrupt
- * does not orphan a metered `pi` child or leak fixture/session/store files.
+ * The Herdr tabs and panes the sweep may close: each one appeared after the
+ * baseline and holds a pane whose cwd is under this run's temp roots, which no
+ * other run's panes share. The harness's own tab is never a target, and a tab
+ * whose panes carry no owned cwd is left alone.
  */
-export async function cleanupMemoryResources({ children, roots }) {
+export function memorySweepTargets({ baseline, observed, roots, hostTabId }) {
+  const beforeTabs = new Set(baseline.tabs.map((tab) => tab.tab_id));
+  const beforePanes = new Set(baseline.panes.map((pane) => pane.pane_id));
+  const newPanes = observed.panes.filter(
+    (pane) =>
+      !beforePanes.has(pane.pane_id) &&
+      typeof pane.cwd === "string" &&
+      roots.some((root) => insideDirectory(root, pane.cwd)),
+  );
+  // A delegated agent gets its own tab, rooted in the run's project directory;
+  // a pane split into a tab that already existed is not covered by that.
+  const tabs = observed.tabs
+    .filter(
+      (tab) =>
+        tab.tab_id !== hostTabId &&
+        !beforeTabs.has(tab.tab_id) &&
+        newPanes.some((pane) => pane.tab_id === tab.tab_id),
+    )
+    .map((tab) => tab.tab_id);
+  const panes = newPanes
+    .filter((pane) => !tabs.includes(pane.tab_id))
+    .map((pane) => pane.pane_id);
+  return { tabs, panes };
+}
+
+/**
+ * Closes the tabs and panes the sweep proved belong to the run. A close that
+ * fails is one stderr warning and never masks the caller's error.
+ */
+export async function sweepMemoryTopology({
+  baseline,
+  observed,
+  roots,
+  hostTabId,
+  close,
+  warn = (message) => process.stderr.write(`${message}\n`),
+}) {
+  const { tabs, panes } = memorySweepTargets({
+    baseline,
+    observed,
+    roots,
+    hostTabId,
+  });
+  const closed = [];
+  for (const [kind, ids] of [
+    ["pane", panes],
+    ["tab", tabs],
+  ])
+    for (const id of ids) {
+      try {
+        await close(kind, id);
+        closed.push(id);
+      } catch (error) {
+        warn(`smoke: could not close ${kind} ${id}: ${error?.message ?? error}`);
+      }
+    }
+  return closed;
+}
+
+/**
+ * Closes the Herdr tabs and panes the live memory run's delegated agents left in
+ * the developer's workspace. A failed listing closes nothing, because ownership
+ * is proven from the listing.
+ */
+async function sweepMemoryHerdr(roots = [...memoryLiveRoots]) {
+  try {
+    const observed = await hostHerdrTopology();
+    if (!memoryLiveTopology || !observed) return [];
+    return await sweepMemoryTopology({
+      baseline: memoryLiveTopology,
+      observed,
+      roots,
+      hostTabId: process.env.HERDR_TAB_ID,
+      close: (kind, id) =>
+        herdr([kind, "close", id], { timeout: OBSERVATION_TIMEOUT_MS }),
+    });
+  } catch (error) {
+    process.stderr.write(
+      `smoke: could not sweep Herdr tabs: ${error?.message ?? error}\n`,
+    );
+    return [];
+  }
+}
+
+/** Snapshots the host workspace before the run's first Lead child spawns. */
+async function memoryTopologyBaseline() {
+  memoryLiveTopology ??= await hostHerdrTopology();
+  return memoryLiveTopology;
+}
+
+/**
+ * Kills live memory children, closes the Herdr tabs and panes they created and
+ * removes their temp roots, so an interrupt does not orphan a metered `pi`
+ * child, a host-workspace tab or fixture/session/store files.
+ */
+export async function cleanupMemoryResources({ children, roots, sweep }) {
   for (const child of children) {
     try {
       child.kill("SIGKILL");
     } catch {
       // A child that already exited is fine.
+    }
+  }
+  if (sweep) {
+    try {
+      await sweep();
+    } catch (error) {
+      process.stderr.write(
+        `smoke: could not sweep Herdr tabs: ${error?.message ?? error}\n`,
+      );
     }
   }
   await Promise.all(
@@ -4531,9 +4659,12 @@ export function installMemorySignalHandlers() {
       const roots = [...memoryLiveRoots];
       memoryLiveChildren.clear();
       memoryLiveRoots.clear();
-      void cleanupMemoryResources({ children, roots }).finally(() =>
-        process.exit(code),
-      );
+      // The roots are gone from the set, so the sweep gets them explicitly.
+      void cleanupMemoryResources({
+        children,
+        roots,
+        sweep: () => sweepMemoryHerdr(roots),
+      }).finally(() => process.exit(code));
     });
 }
 
@@ -4887,6 +5018,7 @@ async function memoryRpcRun({
   continueSession = false,
   onTurn,
 }) {
+  await memoryTopologyBaseline();
   const child = spawn(
     "pi",
     [
@@ -5031,6 +5163,9 @@ async function memoryRpcRun({
         resolve();
       });
     });
+    // Every memory scenario's children exit here, so one sweep covers the
+    // normal, failed and SIGKILL paths without a copy per scenario.
+    await sweepMemoryHerdr();
   }
   return { stderr, errors, killed };
 }
@@ -5896,6 +6031,7 @@ async function runMemoryCacheScenario(args) {
     return { report, reportPath, keepPath };
   } finally {
     memoryLiveRoots.delete(root);
+    memoryLiveTopology = undefined;
     await rm(root, { recursive: true, force: true });
   }
 }
@@ -6040,6 +6176,7 @@ async function runMemoryScenario(args) {
     return { report, reportPath, keepPath };
   } finally {
     memoryLiveRoots.delete(root);
+    memoryLiveTopology = undefined;
     await rm(root, { recursive: true, force: true });
   }
 }
@@ -7122,6 +7259,7 @@ async function runMemoryHorizonScenario(args) {
     return { report, reportPath, keepPath };
   } finally {
     memoryLiveRoots.delete(root);
+    memoryLiveTopology = undefined;
     await rm(root, { recursive: true, force: true });
   }
 }
