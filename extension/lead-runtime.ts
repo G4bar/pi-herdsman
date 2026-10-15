@@ -1654,9 +1654,15 @@ export function createLeadCommandRuntime(host: LeadCommandHost) {
               ctx,
               [
                 // An unset compactor model means memory off, not the Lead's
-                // model, so the compactor model has no inherit option.
+                // model, so the compactor clears it instead of inheriting.
                 ...(compactorDefinition
-                  ? []
+                  ? [
+                      {
+                        value: "unset",
+                        label: "Unset (project memory off)",
+                        searchText: "Unset project memory off memory off",
+                      },
+                    ]
                   : [
                       {
                         value: "inherit",
@@ -1671,11 +1677,14 @@ export function createLeadCommandRuntime(host: LeadCommandHost) {
                   ? modelToken(resolvedConfigured)
                   : configured
                 : compactorDefinition
-                  ? undefined
+                  ? "unset"
                   : "inherit",
             );
             if (!selectedModel) continue;
-            value = selectedModel === "inherit" ? undefined : selectedModel;
+            value =
+              selectedModel === "inherit" || selectedModel === "unset"
+                ? undefined
+                : selectedModel;
           } else if (action === "thinking") {
             field = "thinking";
             await ctx.modelRegistry.refresh();

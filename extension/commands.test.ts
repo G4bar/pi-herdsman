@@ -7662,6 +7662,7 @@ test("Definitions configures the reserved compactor after the Lead definitions",
     getAvailable: () => [{ provider: "new", id: "model", reasoning: true }],
   };
   const visits = new Map<string, number>();
+  const overrides: string[] = [];
   context.ui.select = async (label: string, options: string[]) => {
     prompts.push({ label, options });
     const visit = visits.get(label) ?? 0;
@@ -7671,13 +7672,19 @@ test("Definitions configures the reserved compactor after the Lead definitions",
         ? options.find((option) => option.includes("compactor"))
         : undefined;
     if (label === "compactor")
-      return visit < 2
+      return visit < 3
         ? options.find((option) =>
-            option.startsWith(visit === 0 ? "Model" : "Thinking"),
+            option.startsWith(visit === 2 ? "Thinking" : "Model"),
           )
         : undefined;
-    if (label === "Model")
-      return options.find((option) => option.startsWith("model"));
+    if (label === "Model") {
+      // The second visit clears the model again with the unset option.
+      if (visit === 1)
+        overrides.push(realFs.readFileSync(overridePath, "utf8"));
+      return options.find((option) =>
+        option.startsWith(visit === 0 ? "model" : "Unset (project memory off)"),
+      );
+    }
     if (label === "Thinking")
       return options.find((option) => option === "high");
     return undefined;
@@ -7702,14 +7709,17 @@ test("Definitions configures the reserved compactor after the Lead definitions",
       .filter(({ label }) => label === "compactor")
       .map(({ options }) => options.map((option) => option.split(/\s{2}/u)[0]));
     assert.deepEqual(openActions[0], ["Model", "Thinking", "Details…"]);
-    assert.equal(openActions.length, 3);
-    assert.match(
-      realFs.readFileSync(overridePath, "utf8"),
-      /model: new\/model/u,
-    );
+    assert.equal(openActions.length, 4);
+    // The model was set first, then cleared by the unset option.
+    assert.match(overrides[0] ?? "", /model: new\/model/u);
+    assert.doesNotMatch(realFs.readFileSync(overridePath, "utf8"), /^model:/mu);
     assert.match(realFs.readFileSync(overridePath, "utf8"), /thinking: high/u);
     assert.ok(
       notices.includes("compactor model set to new/model."),
+      JSON.stringify(notices),
+    );
+    assert.ok(
+      notices.includes("compactor model cleared; project memory is off."),
       JSON.stringify(notices),
     );
     assert.equal(
@@ -7770,6 +7780,7 @@ test("Definitions shows an unset compactor model as memory off, without an inher
       ),
       JSON.stringify(picker!.options),
     );
+    assert.ok(picker!.options.includes("Unset (project memory off)"));
     assert.ok(picker!.options.some((option) => option.startsWith("model")));
   } finally {
     await pi.events.get("session_shutdown")?.[0]();
