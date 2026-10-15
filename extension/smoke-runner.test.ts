@@ -63,6 +63,9 @@ import {
   horizonScoreTable,
   horizonScoreSummary,
   horizonWinRule,
+  horizonBulkLog,
+  horizonEmitSource,
+  sendMemoryPrompt,
   scoreMemoryProbes,
   formatSmokeFailure,
   herdrErrorCode,
@@ -1086,10 +1089,90 @@ test("the horizon win rule needs the margin in every run and in the mean", () =>
   assert.equal(partial.nativeMean, 9);
   assert.equal(partial.meanDelta, 3);
   assert.equal(partial.claim, "memory better");
+  // A faulted run is never counted, even when it would flip the claim: the
+  // invalid pair is dropped from the pairs, the deltas, both means and the
+  // claim. A missing `valid` still counts (the `totals` helper above omits it).
+  const faulted = horizonWinRule({
+    memory: [
+      { run: 1, total: 12, valid: true },
+      { run: 2, total: 1, valid: false },
+    ],
+    "native-continue": [
+      { run: 1, total: 9, valid: true },
+      { run: 2, total: 15, valid: false },
+    ],
+  });
+  assert.deepEqual(faulted.pairs, [{ run: 1, memory: 12, native: 9 }]);
+  assert.deepEqual(faulted.deltas, [3]);
+  assert.equal(faulted.memoryMean, 12);
+  assert.equal(faulted.nativeMean, 9);
+  assert.equal(faulted.meanDelta, 3);
+  assert.equal(faulted.claim, "memory better");
   const informational = horizonWinRule(totals([12, 13], [9, 10], [0, 0]));
   assert.equal(informational.claim, "memory better");
   assert.equal(informational.freshMean, 0);
   assert.match(informational.detail, /native-fresh \(informational/);
+});
+
+test("the pasted bulk log is byte-identical to what emit.mjs prints", () => {
+  // The bulk turn's user prompt pastes the same lines the scout's `emit.mjs`
+  // prints; run the generated source with a fake argv and console.
+  const printed: string[] = [];
+  const run = new Function("process", "console", horizonEmitSource());
+  run(
+    { argv: [process.execPath, "emit.mjs", "billing", "40"] },
+    { log: (line: string) => printed.push(line) },
+  );
+  assert.equal(printed.join("\n"), horizonBulkLog("billing", 40));
+  // Different topics differ, so the equality above is not vacuous.
+  assert.notEqual(horizonBulkLog("billing", 40), horizonBulkLog("ledger", 40));
+});
+
+test("a busy prompt rejection is resent and any other rejection is returned", async () => {
+  const busy = {
+    success: false,
+    error:
+      "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
+  };
+  // Busy twice, then accepted: the same prompt is resent and the success wins.
+  const sent: string[] = [];
+  let calls = 0;
+  const accepted = await sendMemoryPrompt(
+    async (command: { message: string }) => {
+      calls += 1;
+      sent.push(command.message);
+      return calls <= 2 ? busy : { success: true };
+    },
+    "turn",
+    { delayMs: 0 },
+  );
+  assert.equal(accepted.success, true);
+  assert.equal(calls, 3);
+  assert.deepEqual(sent, ["turn", "turn", "turn"]);
+  // Still busy on the last try: bounded at 5, and the failure is returned.
+  calls = 0;
+  const rejected = await sendMemoryPrompt(
+    async () => {
+      calls += 1;
+      return busy;
+    },
+    "turn",
+    { delayMs: 0 },
+  );
+  assert.equal(rejected.success, false);
+  assert.equal(calls, 5);
+  // A non-busy rejection goes straight back, with no retry.
+  calls = 0;
+  const refused = await sendMemoryPrompt(
+    async () => {
+      calls += 1;
+      return { success: false, error: "model not found" };
+    },
+    "turn",
+    { delayMs: 0 },
+  );
+  assert.equal(refused.error, "model not found");
+  assert.equal(calls, 1);
 });
 
 test("the horizon score summary means the runs and holds the win rule", () => {

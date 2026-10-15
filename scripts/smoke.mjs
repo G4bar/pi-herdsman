@@ -4246,6 +4246,14 @@ const MEMORY_RESULT_TIMEOUT_MS = 180_000;
  */
 const MEMORY_SHUTDOWN_TIMEOUT_MS = 90_000;
 const MEMORY_KILL_GRACE_MS = 10_000;
+/**
+ * A prompt can be rejected with "Agent is already processing" while the
+ * previous turn is still finalizing, because the settle counter is loose on
+ * purpose. Resend the same prompt a bounded number of times instead of failing
+ * the segment; any other rejection keeps the existing error path.
+ */
+const MEMORY_PROMPT_RETRIES = 5;
+const MEMORY_PROMPT_RETRY_DELAY_MS = 2_000;
 /** The native arm must compact at least this often for the A/B to mean anything. */
 const MEMORY_MIN_NATIVE_COMPACTIONS = 2;
 const MEMORY_TARGET_TURN_RATIO = 0.95;
@@ -4573,7 +4581,7 @@ function memorySuiteSource() {
 /** The bulk turn's log size: 40 lines of 150 characters, about 7 KB. */
 const HORIZON_BULK_LINES = 40;
 
-/** One bulk log line, the same shape `horizonEmitSource` prints. */
+/** One bulk log line, the same shape `horizonBulkLog` joins. */
 function horizonLogLine(topic, index) {
   const token = ((index * 2654435761) % 4294967296)
     .toString(16)
@@ -4582,15 +4590,27 @@ function horizonLogLine(topic, index) {
 }
 
 /**
- * The horizon scenario's log file, for the step that asks a scout what
- * `scripts/emit.mjs` prints. The bulk turns paste the same lines.
+ * The bulk turn's log, byte-for-byte what `emit.mjs` prints for the same topic
+ * and line count: the pasted block and the file the scout reads must agree.
  */
-function horizonEmitSource() {
+export function horizonBulkLog(topic, lines) {
+  return Array.from({ length: lines }, (_, index) =>
+    horizonLogLine(topic, index),
+  ).join("\n");
+}
+
+/**
+ * The horizon scenario's log file, for the step that asks a scout what
+ * `scripts/emit.mjs` prints. It embeds the same two functions the bulk turns
+ * paste, so the two copies cannot drift.
+ */
+export function horizonEmitSource() {
   return [
     'const topic = process.argv[2] ?? "topic";',
     "const lines = Number(process.argv[3] ?? 40);",
     `const horizonLogLine = ${horizonLogLine.toString()};`,
-    "for (let i = 0; i < lines; i++) console.log(horizonLogLine(topic, i));",
+    `const horizonBulkLog = ${horizonBulkLog.toString()};`,
+    "console.log(horizonBulkLog(topic, lines));",
     "",
   ].join("\n");
 }
@@ -4821,6 +4841,31 @@ function memoryScript() {
   ];
 }
 
+/** True for the transient "the agent is still finishing its last turn" send. */
+function memoryPromptBusy(response) {
+  return /already processing/i.test(response.error ?? "");
+}
+
+/**
+ * Send one turn's prompt, resending it while the agent reports it is still
+ * finishing the previous turn. Any other rejection (or the last try) returns
+ * the response, and the caller keeps its existing `!response.success` path.
+ */
+export async function sendMemoryPrompt(
+  send,
+  message,
+  { tries = MEMORY_PROMPT_RETRIES, delayMs = MEMORY_PROMPT_RETRY_DELAY_MS } = {},
+) {
+  let response;
+  for (let attempt = 0; attempt < tries; attempt += 1) {
+    response = await send({ type: "prompt", message });
+    if (response.success || !memoryPromptBusy(response)) return response;
+    if (attempt < tries - 1)
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
+  return response;
+}
+
 /**
  * Drives one Pi RPC session through the script and returns its stderr. One JSON
  * record per line, split on LF only; U+2028 can appear inside JSON.
@@ -4952,7 +4997,7 @@ async function memoryRpcRun({
     for (const [index, step] of steps.entries()) {
       // Best-effort attribution: a tardy settle from a timed-out step can resolve the next wait.
       const expected = settleCount + (step.settles ?? 1);
-      const response = await send({ type: "prompt", message: step.prompt });
+      const response = await sendMemoryPrompt(send, step.prompt);
       if (!response.success)
         throw new Error(`prompt rejected: ${response.error ?? "unknown"}`);
       try {
@@ -5407,7 +5452,10 @@ export function horizonScoreTable(probes) {
  * from the per-run deltas, so it must not move the mean either.
  */
 export function horizonWinRule(totals, margin = MEMORY_HORIZON_WIN_MARGIN) {
-  const arm = (name) => totals[name] ?? [];
+  // An invalid run is never counted; a missing `valid` (older reports, the
+  // test helper) still counts, so only an explicit `false` is dropped.
+  const arm = (name) =>
+    (totals[name] ?? []).filter((row) => row.valid !== false);
   const mean = (values) =>
     values.length
       ? values.reduce((total, value) => total + value, 0) / values.length
@@ -6093,11 +6141,9 @@ function horizonBulkSteps(count, offset) {
   ];
   return Array.from({ length: count }, (_, index) => {
     const topic = topics[(offset + index) % topics.length];
-    const log = Array.from({ length: HORIZON_BULK_LINES }, (_, line) =>
-      horizonLogLine(topic, line),
-    ).join("\n");
+    const log = horizonBulkLog(topic, HORIZON_BULK_LINES);
     return {
-      prompt: `Paste of the ${topic} job log from a moment ago:\n\n${log}\n\n${asks[index % asks.length]}`,
+      prompt: `Paste of the ${topic} job log from a moment ago:\n\n${log}\n\n${asks[index % asks.length]} Reply directly without using tools.`,
     };
   });
 }
