@@ -4504,6 +4504,8 @@ const memoryLiveRoots = new Set();
  * what appeared after this snapshot can belong to the run.
  */
 let memoryLiveTopology;
+let memoryTopologyBaselineTaken = false;
+let memorySweepInFlight;
 let memorySignalHandlersInstalled = false;
 
 /** The host workspace's tabs and panes, or undefined if either listing fails. */
@@ -4563,7 +4565,9 @@ export async function sweepMemoryTopology({
   roots,
   hostTabId,
   close,
-  warn = (message) => process.stderr.write(`${message}\n`),
+  warn = (message) => {
+    process.stderr.write(`${message}\n`);
+  },
 }) {
   const { tabs, panes } = memorySweepTargets({
     baseline,
@@ -4581,7 +4585,9 @@ export async function sweepMemoryTopology({
         await close(kind, id);
         closed.push(id);
       } catch (error) {
-        warn(`smoke: could not close ${kind} ${id}: ${error?.message ?? error}`);
+        warn(
+          `smoke: could not close ${kind} ${id}: ${error?.message ?? error}`,
+        );
       }
     }
   return closed;
@@ -4589,17 +4595,26 @@ export async function sweepMemoryTopology({
 
 /**
  * Closes the Herdr tabs and panes the live memory run's delegated agents left in
- * the developer's workspace. A failed listing closes nothing, because ownership
- * is proven from the listing.
+ * the developer's workspace. Ownership is proven from the listing, so a missing
+ * baseline and a failed listing all close nothing and say
+ * so in one line.
  */
 async function sweepMemoryHerdr(roots = [...memoryLiveRoots]) {
   try {
     const observed = await hostHerdrTopology();
-    if (!memoryLiveTopology || !observed) return [];
+    const reason = !memoryLiveTopology
+      ? "no host-workspace baseline"
+      : !observed
+        ? "the host-workspace listing failed"
+        : undefined;
+    if (reason) {
+      process.stderr.write(`smoke: Herdr sweep skipped: ${reason}\n`);
+      return [];
+    }
     return await sweepMemoryTopology({
       baseline: memoryLiveTopology,
       observed,
-      roots,
+      roots: await realMemoryRoots(roots),
       hostTabId: process.env.HERDR_TAB_ID,
       close: (kind, id) =>
         herdr([kind, "close", id], { timeout: OBSERVATION_TIMEOUT_MS }),
@@ -4612,10 +4627,41 @@ async function sweepMemoryHerdr(roots = [...memoryLiveRoots]) {
   }
 }
 
-/** Snapshots the host workspace before the run's first Lead child spawns. */
+/**
+ * The run's temp roots as real paths. Herdr reports pane cwds resolved, so a
+ * symlinked temp directory (macOS `/var` to `/private/var`) would match none.
+ */
+export async function realMemoryRoots(roots) {
+  return Promise.all(roots.map((root) => realpath(root).catch(() => root)));
+}
+
+/**
+ * Snapshots the host workspace before the run's first Lead child spawns. The
+ * snapshot is taken once: a later one would treat the first child's tabs as
+ * pre-existing, so a failed listing leaves the sweep disabled for the run.
+ */
 async function memoryTopologyBaseline() {
-  memoryLiveTopology ??= await hostHerdrTopology();
+  if (memoryTopologyBaselineTaken) return memoryLiveTopology;
+  memoryTopologyBaselineTaken = true;
+  memoryLiveTopology = await hostHerdrTopology();
   return memoryLiveTopology;
+}
+
+/** Forgets the run's snapshot once its temp roots are gone. */
+function clearMemoryTopology() {
+  memoryTopologyBaselineTaken = false;
+  memoryLiveTopology = undefined;
+}
+
+/**
+ * The one sweep per moment: the SIGINT guard and the runner's `finally` race
+ * after the same child exit and would otherwise close the same tab twice.
+ */
+function sweepMemoryRun(roots = [...memoryLiveRoots]) {
+  memorySweepInFlight ??= sweepMemoryHerdr(roots).finally(() => {
+    memorySweepInFlight = undefined;
+  });
+  return memorySweepInFlight;
 }
 
 /**
@@ -4663,7 +4709,7 @@ export function installMemorySignalHandlers() {
       void cleanupMemoryResources({
         children,
         roots,
-        sweep: () => sweepMemoryHerdr(roots),
+        sweep: () => sweepMemoryRun(roots),
       }).finally(() => process.exit(code));
     });
 }
@@ -4985,7 +5031,10 @@ function memoryPromptBusy(response) {
 export async function sendMemoryPrompt(
   send,
   message,
-  { tries = MEMORY_PROMPT_RETRIES, delayMs = MEMORY_PROMPT_RETRY_DELAY_MS } = {},
+  {
+    tries = MEMORY_PROMPT_RETRIES,
+    delayMs = MEMORY_PROMPT_RETRY_DELAY_MS,
+  } = {},
 ) {
   let response;
   for (let attempt = 0; attempt < tries; attempt += 1) {
@@ -5165,7 +5214,7 @@ async function memoryRpcRun({
     });
     // Every memory scenario's children exit here, so one sweep covers the
     // normal, failed and SIGKILL paths without a copy per scenario.
-    await sweepMemoryHerdr();
+    await sweepMemoryRun();
   }
   return { stderr, errors, killed };
 }
@@ -6031,7 +6080,7 @@ async function runMemoryCacheScenario(args) {
     return { report, reportPath, keepPath };
   } finally {
     memoryLiveRoots.delete(root);
-    memoryLiveTopology = undefined;
+    clearMemoryTopology();
     await rm(root, { recursive: true, force: true });
   }
 }
@@ -6176,7 +6225,7 @@ async function runMemoryScenario(args) {
     return { report, reportPath, keepPath };
   } finally {
     memoryLiveRoots.delete(root);
-    memoryLiveTopology = undefined;
+    clearMemoryTopology();
     await rm(root, { recursive: true, force: true });
   }
 }
@@ -7259,7 +7308,7 @@ async function runMemoryHorizonScenario(args) {
     return { report, reportPath, keepPath };
   } finally {
     memoryLiveRoots.delete(root);
-    memoryLiveTopology = undefined;
+    clearMemoryTopology();
     await rm(root, { recursive: true, force: true });
   }
 }

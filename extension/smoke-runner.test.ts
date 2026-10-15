@@ -4,8 +4,10 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  realpath,
   rm,
   stat,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
@@ -53,6 +55,7 @@ import {
   cleanupMemoryResources,
   sweepMemoryTopology,
   memorySweepTargets,
+  realMemoryRoots,
   copyIfExists,
   installMemorySignalHandlers,
   memoryGateReport,
@@ -1279,12 +1282,18 @@ test("the memory sweep closes only tabs and panes it can prove the run owns", ()
       { pane_id: "w:p1", tab_id: "w:t1", cwd: "/repo" },
     ],
   };
-  const pane = (pane_id: string, tab_id: string, cwd: string) => ({
+  const pane = (pane_id: string, tab_id: string, cwd?: unknown) => ({
     pane_id,
     tab_id,
     cwd,
   });
-  const cases = [
+  const cases: {
+    name: string;
+    tabs: { tab_id: string }[];
+    panes: Record<string, unknown>[];
+    expected: { tabs: string[]; panes: string[] };
+    hostTabId?: undefined;
+  }[] = [
     {
       name: "a new tab whose pane cwd is under the run root is closed",
       tabs: [{ tab_id: "w:t3" }],
@@ -1321,6 +1330,19 @@ test("the memory sweep closes only tabs and panes it can prove the run owns", ()
       panes: [pane("w:p5", "w:t6", "/tmp/pi-herdsman-run/project")],
       expected: { tabs: [], panes: ["w:p5"] },
     },
+    {
+      name: "a sweep with no known harness tab still closes an owned tab",
+      hostTabId: undefined,
+      tabs: [{ tab_id: "w:t3" }],
+      panes: [pane("w:p2", "w:t3", "/tmp/pi-herdsman-run/project-memory")],
+      expected: { tabs: ["w:t3"], panes: [] },
+    },
+    {
+      name: "a pane whose cwd is missing or relative is kept",
+      tabs: [],
+      panes: [pane("w:p7", "w:t1"), pane("w:p8", "w:t1", "project-memory")],
+      expected: { tabs: [], panes: [] },
+    },
   ];
   for (const testCase of cases)
     assert.deepEqual(
@@ -1331,11 +1353,50 @@ test("the memory sweep closes only tabs and panes it can prove the run owns", ()
           panes: [...baseline.panes, ...testCase.panes],
         },
         roots,
-        hostTabId: "w:t6",
+        hostTabId: "hostTabId" in testCase ? testCase.hostTabId : "w:t6",
       }),
       testCase.expected,
       testCase.name,
     );
+});
+
+test("the sweep matches a pane under a symlinked temp root", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-herdsman-symlink-"));
+  const real = join(directory, "real");
+  const link = join(directory, "link");
+  await mkdir(real);
+  await symlink(real, link);
+  const observed = {
+    tabs: [{ tab_id: "w:t3" }],
+    panes: [
+      {
+        pane_id: "w:p2",
+        tab_id: "w:t3",
+        cwd: join(await realpath(real), "project"),
+      },
+    ],
+  };
+  const baseline = { tabs: [], panes: [] };
+  // Herdr reports the resolved cwd, so the raw temp path alone matches nothing.
+  assert.deepEqual(
+    memorySweepTargets({
+      baseline,
+      observed,
+      roots: [link],
+      hostTabId: undefined,
+    }),
+    { tabs: [], panes: [] },
+  );
+  assert.deepEqual(
+    memorySweepTargets({
+      baseline,
+      observed,
+      roots: await realMemoryRoots([link]),
+      hostTabId: undefined,
+    }),
+    { tabs: ["w:t3"], panes: [] },
+  );
+  await rm(directory, { recursive: true, force: true });
 });
 
 test("a failed tab close warns once and does not stop the sweep", async () => {
