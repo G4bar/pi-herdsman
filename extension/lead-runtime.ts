@@ -1705,7 +1705,12 @@ export function createLeadCommandRuntime(host: LeadCommandHost) {
                   ? definition.frontmatter.thinking
                   : undefined;
             const thinkingItems = [
-              { value: "inherit", label: "Inherit current session" },
+              {
+                value: "inherit",
+                label: compactorDefinition
+                  ? "Default (low)"
+                  : "Inherit current session",
+              },
               ...levels.map((level: string) => ({
                 value: level,
                 label: level,

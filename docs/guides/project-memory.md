@@ -12,6 +12,14 @@ Use it when a Lead works in the same project for weeks and its early decisions,
 paths, and session ids must stay recoverable. Leave it off when sessions are
 short or when Pi's native compaction is enough.
 
+## Cost and limits
+
+Compaction is direct model calls, roughly two per logged message, and the
+compactor is the main cost of memory. The store is never pruned, so it grows
+without bound. Summaries keep only part of the exact identifiers they cover, so
+exact values need `zoom`. See
+[Cost and trade-offs](../concepts/memory.md#cost-and-trade-offs).
+
 ## Enable memory for a project
 
 Memory is user-wide only: nothing in a project can enable it, because an
@@ -59,7 +67,7 @@ Choose it in the interactive menu:
 1. Open `/herdsman definitions`.
 2. Select `compactor`.
 3. Select `Model` and pick a model.
-4. Optionally select `Thinking`.
+4. Optionally select `Thinking`; its clear option is `Default (low)`.
 
 The model runs on every logged message, so pick a cheap, fast model. Thinking
 defaults to `low`; an overlay can replace it. Read
@@ -92,7 +100,8 @@ Manager, Chief, and `managed-lead` sessions never use memory.
   `unset · memory off`.
 
 Neither action deletes the stored log or the summary tree; it only stops new
-summaries. Turning it back on re-reads the same store.
+summaries. Turning it back on re-reads the same store. Both actions take effect
+at the next session start.
 
 ## The extension-provider notice
 
@@ -100,8 +109,8 @@ Some providers, such as pi-claude-bridge with Claude Code session reuse, keep
 their own per-session conversation state. Project memory replaces the
 conversation with the view each turn, so such a provider cannot reuse it and may
 re-send the full view every turn. When the Lead's provider is one an extension
-registered, Herdsman prints this notice once per session when memory goes
-active:
+registered, Herdsman prints this notice once per session, on the first turn
+memory prepares:
 
 ```text
 Project memory replaces the conversation with the project view each turn, so a provider that keeps its own per-session conversation state (for example pi-claude-bridge with Claude Code session reuse) cannot reuse it and may re-send the full view every turn.
@@ -130,14 +139,14 @@ project's memory over. The next session backfills the branch it resumes as
 
 ## Troubleshooting
 
-| Symptom                                                                          | Cause                                                    | Fix                                                                                                                                |
-| -------------------------------------------------------------------------------- | -------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `Project memory is off: choose the compactor model …`                            | No compactor model is set                                | Set `compactor` → `Model` in `/herdsman definitions`                                                                               |
-| `Project memory is already open in process <pid>; this session runs without it.` | Another session owns the project                         | Continue in that session, or close it and start a new one                                                                          |
-| `Project memory is inactive: …`                                                  | The compactor model is unavailable or has no credentials | Pick an available model, or configure its provider                                                                                 |
-| `Project memory compaction is failing: …`                                        | Compaction model calls are failing                       | Check the compactor model, its credentials, and provider availability                                                              |
-| `Project memory log damage: N warning(s); first: …`                              | A store line is unreadable                               | The session continues with the records it can read; the damaged message's detail is lost. Delete the store directory to start over |
-| Nothing happens, and no notice appears                                           | The working directory is not exactly a listed path       | Open Pi in the listed absolute directory; check for a symlink or a subdirectory                                                    |
+| Symptom                                                                          | Cause                                                                                                               | Fix                                                                                                                                          |
+| -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Project memory is off: choose the compactor model …`                            | No compactor model is set                                                                                           | Set `compactor` → `Model` in `/herdsman definitions`                                                                                         |
+| `Project memory is already open in process <pid>; this session runs without it.` | Another session owns the project                                                                                    | Continue in that session, or close it and start a new one                                                                                    |
+| `Project memory is inactive: …`                                                  | The compactor model is unavailable or has no credentials                                                            | Pick an available model, or configure its provider                                                                                           |
+| `Project memory compaction is failing: …`                                        | Compaction model calls are failing                                                                                  | Check the compactor model, its credentials, and provider availability                                                                        |
+| `Project memory log damage: N warning(s); first: …`                              | A store line is unreadable                                                                                          | The session continues with the records it can read; the damaged message's detail is lost. Delete the store directory to start over           |
+| Nothing happens, and no notice appears                                           | The working directory is not exactly a listed path, the session is not persisted, or `config.json` fails validation | Open Pi in the listed absolute directory (watch for a symlink or a subdirectory); a config error is reported where the configuration is read |
 
 ## See also
 

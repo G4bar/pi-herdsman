@@ -143,8 +143,10 @@ Selecting the managed Lead or the `compactor` definition opens the same Model,
 Thinking, and Details actions, without `Enabled`. The `compactor` Model picker
 offers `Unset (project memory off)` instead of `Inherit current session`,
 because an unset compactor model means memory is off rather than the Lead's
-model; an unset compactor model row reads `unset · memory off`. Setting the
-model notifies `compactor model set to <token>.` and clearing it notifies
+model; an unset compactor model row reads `unset · memory off`. Its Thinking
+picker labels its clear option `Default (low)`, because clearing thinking
+returns to the bundled `low`. Setting the model notifies
+`compactor model set to <token>.` and clearing it notifies
 `compactor model cleared; project memory is off.`
 
 Selecting either ordinary Lead profile opens `Details` only.

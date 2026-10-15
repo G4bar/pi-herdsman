@@ -36,8 +36,6 @@ Herdsman adopted:
   compressed;
 - `zoom(id, n)` to open a line back down to the original message and `date(id)`
   for its timestamp;
-- a lossy-line marker and a `tool_call` gate, so an identifier seen only in a
-  summary cannot be used without zooming;
 - provider prefix caching, so unchanged view blocks are read from cache across
   turns.
 
@@ -50,6 +48,9 @@ Herdsman changed:
   configuration.
 - **The compactor.** Summaries are written by the reserved `compactor`
   definition as direct model calls, with the user's chosen model.
+- **Exact-identifier safety.** Summaries that drop exact values end with
+  `…[ids]`, and a `tool_call` gate blocks seven actions on identifiers seen only
+  in a summary.
 - **When the tree grows.** A view queues the merges it will need once it is
   within 90% of its bound, so the tree grows where a view asks for it.
 
@@ -155,12 +156,11 @@ after that is rebuilt on the next start.
 
 Memory costs several times more than Pi's native compaction, because the
 compactor spends model calls summarizing every message; a cheap, fast compactor
-model keeps that cost down. In Herdsman's own measurements it showed no recall
-advantage over continuing the same native session and a clear advantage over
-starting a fresh one. Summaries keep only part of the exact identifiers they
-cover, so exact values need `zoom`, and the store grows without bound because
-nothing is deleted. The behavior has been tested with DeepSeek-family models
-only.
+model keeps that cost down. In the maintainers' long-session tests, run with
+DeepSeek-family models only, memory recalled clearly more than a fresh session
+but no more than continuing the same session, at several times the cost.
+Summaries keep only part of the exact identifiers they cover, so exact values
+need `zoom`, and the store grows without bound because nothing is deleted.
 
 ## Roles and storage
 

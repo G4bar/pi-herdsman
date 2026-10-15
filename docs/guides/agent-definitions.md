@@ -293,7 +293,8 @@ order. Each row identifies its contributing source or
 sources as `bundled`, `project`, and/or `global`. Model, thinking, and enabled
 settings can be changed through the menu, but edits always write global
 overrides. `Inherit current session` removes only that field; the `compactor`
-Model picker instead offers `Unset (project memory off)`. Unset model and
+Model picker instead offers `Unset (project memory off)`, and its Thinking
+picker labels its clear option `Default (low)`. Unset model and
 thinking fields inherit the spawning controller for fresh delegation, while
 continuation restores the saved session's settings. Contextual help updates for
 the selected row.

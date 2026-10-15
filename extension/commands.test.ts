@@ -7685,8 +7685,14 @@ test("Definitions configures the reserved compactor after the Lead definitions",
         option.startsWith(visit === 0 ? "model" : "Unset (project memory off)"),
       );
     }
-    if (label === "Thinking")
+    if (label === "Thinking") {
+      assert.ok(options.includes("Default (low)"), JSON.stringify(options));
+      assert.ok(
+        !options.some((option) => option.includes("Inherit current session")),
+        JSON.stringify(options),
+      );
       return options.find((option) => option === "high");
+    }
     return undefined;
   };
   try {
