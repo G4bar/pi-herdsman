@@ -7837,7 +7837,7 @@ test("Definitions contextual help describes compactor model and thinking fallbac
         assert.ok(
           lines().some((line) =>
             line.includes(
-              "Thinking level for project memory compactions. When unset, compactions use the Lead session's thinking level.",
+              "Thinking level for project memory compactions. When unset, compactions use the bundled default, low.",
             ),
           ),
         );
