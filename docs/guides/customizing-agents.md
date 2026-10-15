@@ -129,10 +129,11 @@ thinking: high
 
 The bundled body is prompt text, the bundled definition pins no model and it
 pins `thinking: low`, because the compactor calls run on every message and must
-not inherit an expensive Lead's level by default. An omitted `model` uses the
-owning Lead session's current model, and an overlay's `thinking` replaces the
-bundled `low`. Setting both is what keeps background summarization off the
-Lead's expensive model. A project overlay lives at
+not inherit an expensive Lead's level by default. The compactor model is the
+user's choice: there is no default and it is never inherited, so project memory
+stays off, with one notice, until a model is chosen. An overlay's `thinking`
+replaces the bundled `low`. Setting both is what keeps background summarization
+off the Lead's expensive model. A project overlay lives at
 `<project>/.pi/agents/compactor.md` and applies only when the project is
 trusted; the global override remains `~/.pi/agent/agents/compactor.md`.
 

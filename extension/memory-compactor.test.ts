@@ -11,6 +11,7 @@ import type {
   Model,
 } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import { resolveCompactorDefinition } from "./agent-definitions.ts";
 import { MemoryStore } from "./memory.ts";
 import {
@@ -155,6 +156,8 @@ class FakeRegistry {
   throwSync: string | undefined;
   /** A provider that rejects a request without `options.sessionId`. */
   requireSessionId = false;
+  /** The provider ids Pi reports as registered by extensions. */
+  registeredProviders: string[] = [];
   private readonly models: Model<Api>[];
 
   constructor(models: Model<Api>[]) {
@@ -163,6 +166,10 @@ class FakeRegistry {
 
   getAll(): Model<Api>[] {
     return this.models;
+  }
+
+  getRegisteredProviderIds(): string[] {
+    return this.registeredProviders;
   }
 
   hasConfiguredAuth(): boolean {
@@ -248,6 +255,7 @@ async function withProject<T>(
   run: (project: string, store: MemoryStore) => Promise<T>,
 ): Promise<T> {
   const project = mkdtempSync(join(tmpdir(), "pi-herdsman-compactor-"));
+  writeProjectCompactor(project, "test/lead");
   const store = new MemoryStore(project);
   try {
     return await run(project, store);
@@ -257,11 +265,27 @@ async function withProject<T>(
   }
 }
 
+/**
+ * The project layer `resolveCompactorDefinition` reads. The bundled definition
+ * sets no model, so a test that builds nodes writes one here (ADR 0020).
+ */
+function writeProjectCompactor(project: string, model?: string): void {
+  const directory = join(project, CONFIG_DIR_NAME, "agents");
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(
+    join(directory, "compactor.md"),
+    model === undefined
+      ? "---\nname: compactor\n---\n"
+      : `---\nname: compactor\nmodel: ${model}\n---\n`,
+  );
+}
+
 async function withAgentDir<T>(
   run: (project: string, agentDir: string) => Promise<T>,
 ): Promise<T> {
   const agentDir = mkdtempSync(join(tmpdir(), "pi-herdsman-compactor-agent-"));
   const project = mkdtempSync(join(tmpdir(), "pi-herdsman-compactor-"));
+  writeProjectCompactor(project, "test/lead");
   const previous = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = agentDir;
   try {
@@ -889,6 +913,32 @@ test("the compaction call carries the Pi session id the provider routes by", () 
     assert.equal(store.nodeText([0, 0]), "summary line");
   }));
 
+const sessionIdCases: [string, string, string[], string | undefined][] = [
+  ["a built-in provider", "test/compactor", [], "session-1"],
+  ["an extension-registered provider", "ext/compactor", ["ext"], undefined],
+];
+
+for (const [name, token, registered, expected] of sessionIdCases)
+  test(`the session id is ${expected === undefined ? "omitted for" : "forwarded to"} ${name}`, () =>
+    withProject(async (project, store) => {
+      addMessage(store, longText());
+      writeProjectCompactor(project, token);
+      const registry = new FakeRegistry([
+        makeModel("test", "compactor"),
+        makeModel("ext", "compactor"),
+      ]);
+      registry.registeredProviders = registered;
+      const compactor = start(
+        store,
+        fakeContext(registry, undefined, project, "high", "session-1"),
+      );
+      await compactor.whenSettled(0);
+      compactor.stop();
+
+      assert.equal(registry.calls[0]!.sessionId, expected);
+      assert.equal(store.nodeText([0, 0]), "summary line");
+    }));
+
 // --- model resolution -------------------------------------------------------
 
 test("the definition model overrides the inherited model", () =>
@@ -913,15 +963,15 @@ test("the definition model overrides the inherited model", () =>
     }
   }));
 
-test("the compactor inherits the Lead model when the definition sets none", () =>
+test("the Lead session's model is not a fallback when the definition sets none", () =>
   withProject(async (project, store) => {
-    addMessage(store, longText());
-    const inherited = makeModel("test", "lead");
-    const registry = new FakeRegistry([inherited]);
-    const compactor = start(store, fakeContext(registry, inherited, project));
-    await compactor.whenSettled(0);
-    compactor.stop();
-    assert.equal(registry.requested[0], inherited);
+    writeProjectCompactor(project);
+    const registry = new FakeRegistry([makeModel("test", "lead")]);
+    assert.throws(
+      () =>
+        start(store, fakeContext(registry, makeModel("test", "lead"), project)),
+      /has no model/,
+    );
   }));
 
 test("the bundled thinking level is sent instead of the Lead's", () =>
@@ -989,6 +1039,7 @@ test("an unresolvable definition model makes start throw", () =>
 
 test("a session with no model makes start throw", () =>
   withProject(async (project, store) => {
+    writeProjectCompactor(project);
     const registry = new FakeRegistry([]);
     assert.throws(
       () => start(store, fakeContext(registry, undefined, project)),

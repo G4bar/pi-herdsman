@@ -7758,7 +7758,7 @@ test("Definitions contextual help describes compactor model and thinking fallbac
         assert.ok(
           lines().some((line) =>
             line.includes(
-              "Model for project memory compactions. When unset, compactions use the Lead session's current model.",
+              "Model for project memory compactions. There is no default; project memory stays off until a model is chosen.",
             ),
           ),
         );

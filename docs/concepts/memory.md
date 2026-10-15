@@ -58,10 +58,17 @@ a long existing session costs about two compactor calls per imported message.
 The reserved `compactor` definition builds the tree with direct model calls, not
 as a managed session. It resolves model and thinking level through the normal
 definition layers, so a project or the user can give it a cheaper model. The
-bundled definition pins `thinking: low`: the compactor runs on every message, so
-it starts cheap instead of inheriting an expensive Lead's thinking level. An
-overlay can still replace it. See
+compactor model is the user's choice: there is no default and it is never
+inherited, so project memory stays off, with one notice, until a model is
+chosen in `/herdsman definitions`. The bundled definition pins `thinking: low`:
+the compactor runs on every message, so it starts cheap instead of inheriting an
+expensive Lead's thinking level. An overlay can still replace it. See
 [Customizing bundled Agents](../guides/customizing-agents.md#project-memory-compactor).
+
+Known limitation: memory replaces the conversation with the project view each
+turn, so a provider that keeps its own per-session conversation state (for
+example pi-claude-bridge with Claude Code session reuse) cannot reuse it and may
+re-send the full view every turn.
 
 Compaction costs about two model calls per logged message.
 

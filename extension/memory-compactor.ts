@@ -145,14 +145,16 @@ export function start(
 ): MemoryCompactor {
   const { thinkingLevel, ...callbacks } = options;
   const definition = resolveCompactorDefinition(ctx);
+  // The compactor model is the user's choice: the effective definition alone
+  // decides it, and an unset model never falls back to the Lead's (ADR 0020).
   const model = definition.model
     ? resolveConfiguredModel(ctx, definition.model)
-    : ctx.model;
+    : undefined;
   if (!model) {
     throw new Error(
       definition.model
         ? `project memory compactor model ${JSON.stringify(definition.model)} is not available`
-        : "project memory compactor has no model: the definition sets none and the session has none",
+        : "project memory compactor has no model: the compactor definition sets none",
     );
   }
   if (!ctx.modelRegistry.hasConfiguredAuth(model)) {
@@ -183,6 +185,20 @@ function sessionIdOf(ctx: ExtensionContext): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * True when Pi reports the provider as one an extension registered. Pi's list
+ * never holds a built-in id, and a registry without the method reads as empty,
+ * so a session hint is forwarded as it was before this check existed.
+ */
+function extensionRegisteredProvider(
+  ctx: ExtensionContext,
+  provider: string,
+): boolean {
+  return (ctx.modelRegistry?.getRegisteredProviderIds?.() ?? []).includes(
+    provider,
+  );
 }
 
 class CompactorRunner implements MemoryCompactor {
@@ -535,6 +551,13 @@ class CompactorRunner implements MemoryCompactor {
     const controller = new AbortController();
     this.controllers.add(controller);
     try {
+      // An extension-registered provider keys its own state by the Lead's
+      // session id, so the hint goes only to a provider Pi does not report.
+      const sessionId =
+        this.sessionId &&
+        !extensionRegisteredProvider(this.ctx, this.model.provider)
+          ? this.sessionId
+          : undefined;
       const stream = this.ctx.modelRegistry.streamSimple(
         this.model,
         {
@@ -543,7 +566,7 @@ class CompactorRunner implements MemoryCompactor {
         },
         {
           signal: controller.signal,
-          ...(this.sessionId ? { sessionId: this.sessionId } : {}),
+          ...(sessionId ? { sessionId } : {}),
           ...(this.reasoning && this.reasoning !== "off"
             ? { reasoning: this.reasoning }
             : {}),

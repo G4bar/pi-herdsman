@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -32,16 +33,22 @@ import {
 import type {
   MemoryCompactor,
   MemoryCompactorOptions,
-  MemoryCompactorFactory,
 } from "./memory-compactor.ts";
 import {
   TURN_SETTLE_GRACE_MS,
   ordinaryLeadSession,
   registerMemoryRuntime,
+  type MemoryCompactorFactory,
 } from "./memory-runtime.ts";
-import { fakeContext, fakePi } from "./support.ts";
+import { fakeContext, fakePi, PI_AGENTS_DIR } from "./support.ts";
 
 // --- fixtures ---------------------------------------------------------------
+
+/** The compactor model the runtime resolves; the bundled definition has none. */
+const COMPACTOR_DEFINITION = join(PI_AGENTS_DIR, "compactor.md");
+const COMPACTOR_DEFINITION_TEXT =
+  "---\nname: compactor\nmodel: test/compactor\n---\n";
+writeFileSync(COMPACTOR_DEFINITION, COMPACTOR_DEFINITION_TEXT);
 
 const projects: string[] = [];
 let entryCounter = 0;
@@ -178,6 +185,10 @@ class TestSession {
   systemPrompt = "";
   /** How often the gate read the prompt, so a corpus cache hit is visible. */
   systemPromptCalls = 0;
+  /** The Lead model the context reports, if any. */
+  model: { provider: string; id: string } | undefined;
+  /** The provider ids Pi reports as registered by extensions. */
+  registeredProviders: string[] = [];
 
   constructor(options: {
     cwd: string;
@@ -219,6 +230,10 @@ class TestSession {
     } as unknown as typeof context.sessionManager;
     const extended = context as unknown as ExtensionContext;
     (extended as { signal?: AbortSignal }).signal = this.signal;
+    (extended as { model?: unknown }).model = this.model;
+    extended.modelRegistry = {
+      getRegisteredProviderIds: () => this.registeredProviders,
+    } as unknown as typeof extended.modelRegistry;
     (extended as { getSystemPrompt?: () => string }).getSystemPrompt = () => {
       this.systemPromptCalls += 1;
       return this.systemPrompt;
@@ -558,6 +573,64 @@ test("activation follows the listed project, the role, persistence and the lock"
     await harness.shutdown(session, "quit");
   }
 });
+
+test("no compactor model leaves the session native, with one notice and no lock", async () => {
+  const project = projectDir();
+  withProjects([project]);
+  rmSync(COMPACTOR_DEFINITION, { force: true });
+  try {
+    const session = new TestSession({
+      cwd: project,
+      file: "/sessions/a.jsonl",
+    });
+    const harness = new Harness();
+    await harness.sessionStart(session);
+
+    assert.equal(harness.compactors.length, 0);
+    assert.deepEqual(session.notices, [
+      {
+        message:
+          "Project memory is off: choose the compactor model in /herdsman definitions -> compactor -> Model",
+        type: "warning",
+      },
+    ]);
+    assert.equal(existsSync(join(projectMemoryRoot(project), "lock")), false);
+    assert.equal(await harness.context(session, []), undefined);
+    assert.equal(mainLog(project).length, 0);
+    // `session_start` runs once, so the notice does not repeat per turn.
+    await harness.turnEnd(session);
+    assert.equal(session.notices.length, 1);
+    await harness.shutdown(session, "quit");
+  } finally {
+    writeFileSync(COMPACTOR_DEFINITION, COMPACTOR_DEFINITION_TEXT);
+  }
+});
+
+const providerNoticeCases: [string, string, string[], number][] = [
+  ["an extension-registered Lead provider", "ext", ["ext"], 1],
+  ["a built-in Lead provider", "opencode-go", ["ext"], 0],
+];
+
+for (const [name, provider, registered, expected] of providerNoticeCases)
+  test(`the provider notice fires ${expected} time(s) for ${name}`, async () => {
+    const project = projectDir();
+    withProjects([project]);
+    const session = new TestSession({
+      cwd: project,
+      file: "/sessions/a.jsonl",
+    });
+    session.model = { provider, id: "lead" };
+    session.registeredProviders = registered;
+    const harness = new Harness();
+    await harness.sessionStart(session);
+
+    for (let turn = 0; turn < 3; turn += 1)
+      await harness.context(session, []);
+    const infos = session.notices.filter((notice) => notice.type === "info");
+    assert.equal(infos.length, expected, name);
+    if (expected === 1) assert.match(infos[0]!.message, /cannot reuse it/);
+    await harness.shutdown(session, "quit");
+  });
 
 test("a damaged log is reported once with its first warning", async () => {
   const project = projectDir();

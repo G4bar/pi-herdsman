@@ -1531,7 +1531,7 @@ export function createLeadCommandRuntime(host: LeadCommandHost) {
                       help: managedDefinition
                         ? "Model for future managed Lead launches. Changes do not affect a running Lead."
                         : compactorDefinition
-                          ? "Model for project memory compactions. When unset, compactions use the Lead session's current model."
+                          ? "Model for project memory compactions. There is no default; project memory stays off until a model is chosen."
                           : "Model for future Agent generations. When unset, fresh delegation inherits the spawning controller and continuation restores the saved session model.",
                     },
                   ]

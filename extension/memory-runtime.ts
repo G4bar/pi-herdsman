@@ -24,6 +24,7 @@ import {
 import { Type } from "typebox";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import { readConfig } from "./config.ts";
+import { resolveCompactorDefinition } from "./agent-definitions.ts";
 import { ProcessLockOccupiedError, readProcessLockStatus } from "./lock.ts";
 import {
   MemoryStore,
@@ -76,6 +77,29 @@ const GATE_ASK_AFTER = 3;
 const GATE_ENTRY_TYPE = "pi-herdsman-memory-gate";
 /** The durable usage entry each compaction call appends, for the harness. */
 const USAGE_ENTRY_TYPE = "pi-herdsman-memory-usage";
+/** The one warning a session without a compactor model gets at start. */
+const NO_COMPACTOR_MODEL_NOTICE =
+  "Project memory is off: choose the compactor model in /herdsman definitions -> compactor -> Model";
+/**
+ * The one notice a session whose Lead provider is extension-registered gets
+ * once memory is active. Hedged on purpose: no generic signal says that a
+ * provider keeps per-session state, only that an extension registered it.
+ */
+const PROVIDER_STATE_NOTICE =
+  "Project memory replaces the conversation with the project view each turn, so a provider that keeps its own per-session conversation state (for example pi-claude-bridge with Claude Code session reuse) cannot reuse it and may re-send the full view every turn.";
+
+/**
+ * True when Pi reports the provider as one an extension registered. Pi's list
+ * never holds a built-in id, and a registry without the method reads as empty.
+ */
+function extensionRegisteredProvider(
+  ctx: ExtensionContext,
+  provider: string,
+): boolean {
+  return (ctx.modelRegistry?.getRegisteredProviderIds?.() ?? []).includes(
+    provider,
+  );
+}
 
 export type MemoryCompactorFactory = (
   store: MemoryStore,
@@ -131,6 +155,8 @@ type ActiveMemory = {
   frozen: FrozenTurn | undefined;
   /** True once a compaction failure was reported, so an outage notifies once. */
   reported: boolean;
+  /** True once the extension-registered Lead provider was told, once. */
+  providerNotice: boolean;
   /** This turn's verbatim corpus, cached until the branch grows. */
   corpus: TurnCorpus | undefined;
   /** True once a gated call blocked this turn, so `zoomBefore` stops counting. */
@@ -273,6 +299,14 @@ export function registerMemoryRuntime(
       deactivate();
       return;
     }
+    // The compactor model is the user's choice, never the Lead's: without one
+    // this session runs native, with no lock, view, or tools (ADR 0020).
+    // `session_start` runs once, so this notice is the session's only one.
+    if (resolveCompactorDefinition(ctx).model === undefined) {
+      deactivate();
+      notify(ctx, NO_COMPACTOR_MODEL_NOTICE);
+      return;
+    }
     if (!active) {
       let store: MemoryStore;
       try {
@@ -328,6 +362,7 @@ export function registerMemoryRuntime(
         freezing: false,
         frozen: undefined,
         reported: false,
+        providerNotice: false,
         corpus: undefined,
         gateBlocked: false,
         blockCounts: new Map(),
@@ -553,7 +588,18 @@ export function registerMemoryRuntime(
     await freezeTurn(ctx);
   });
   pi.on("context", (event, ctx: ExtensionContext) => {
-    const frozen = owning()?.frozen;
+    const memory = owning();
+    if (!memory) return;
+    // A provider that keeps its own per-session conversation state cannot
+    // reuse the view; say so once per session, on the first prepared turn.
+    if (!memory.providerNotice) {
+      const provider = ctx.model?.provider;
+      if (provider && extensionRegisteredProvider(ctx, provider)) {
+        memory.providerNotice = true;
+        notify(ctx, PROVIDER_STATE_NOTICE, "info");
+      }
+    }
+    const frozen = memory.frozen;
     if (!frozen || frozen.fallback) return;
     // An empty view is an empty memory: the first turn stays native.
     if (frozen.lines.length === 0) return;

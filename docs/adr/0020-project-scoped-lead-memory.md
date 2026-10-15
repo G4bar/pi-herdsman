@@ -111,8 +111,18 @@ excluded from the Agent roster, cannot be delegated to or referenced from an
 `bundled < project < global`.
 
 It runs as direct model calls, not as a managed session, and it has its own
-system prompt and no tools. Unlike the design's shared-prefix scheme,
-compactions therefore never read the Lead's cache entry.
+system prompt and no tools. A call carries the Lead's Pi session id only to a
+provider Pi does not report as extension-registered, because such a provider
+keys its own state by it; an extension that overrides a built-in provider id
+therefore loses that session hint, which costs only a cache hint. Unlike the
+design's shared-prefix scheme, compactions therefore never read the Lead's
+cache entry.
+
+Herdsman never picks the compactor's model: the effective definition is the
+only source, an unset `model` does not inherit the Lead session's, and project
+memory stays off in every session, with one notice, until the user chooses a
+model in `/herdsman definitions`. The bundled definition pins no model and
+`thinking: low` as the default for whichever model the user picks.
 
 The cost of the separate prefix is accepted and small: every compaction prefix
 is written once per prefix change, at 1.25x for the system prompt (about 1 to 2k

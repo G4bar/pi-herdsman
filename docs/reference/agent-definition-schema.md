@@ -140,7 +140,8 @@ matching overlay. Every other field is rejected rather than ignored, including
 and context-inheritance fields. The bundled definition pins `thinking: low` and
 no model: the compactor is a background caller on every message, so it does not
 inherit an expensive Lead's thinking level unless an overlay asks for it. An
-omitted `model` uses the owning Lead session's model, and an overlay's `model`
+omitted `model` has no default and does not inherit the Lead session's: project
+memory stays off, with one notice, until a model is chosen. An overlay's `model`
 or `thinking` replaces the bundled value.
 
 ## Execution settings
