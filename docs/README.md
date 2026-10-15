@@ -24,8 +24,9 @@ authority, project-scope, and ownership model.
 ## Manage project memory
 
 In opted-in projects, ordinary Lead sessions share one never-ending project
-memory. Read [Project memory](concepts/memory.md) for the view, scope, and cost,
-and the [memory tools reference](reference/memory-tools.md) for `zoom` and
+memory. [Project memory](concepts/memory.md) explains the view, scope, and cost,
+the [project memory guide](guides/project-memory.md) covers enabling it, and the
+[memory tools reference](reference/memory-tools.md) documents `zoom` and
 `date`.
 
 ## Understand Agents

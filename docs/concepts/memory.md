@@ -3,11 +3,55 @@
 [Documentation index](../README.md)
 
 An ordinary Lead session normally carries its own Pi conversation, so a long
-project spreads its history across many session files. In a project listed in
+project spreads its history across many session files. Pi's native threshold
+compaction folds that history into one summary when the context fills, and the
+detail it drops is gone.
+
+Project memory is the alternative. In a project listed in
 [`memoryProjects`](../reference/configuration.md#schema-and-defaults), every
-ordinary Lead session instead shares one append-only project log. The log is
-compressed into a tree of one-line summaries and shown to the Lead as a bounded
-`<chat>` view.
+ordinary Lead session shares one never-ending project log for that project. The
+log survives `/new` and restarts, and nothing is deleted from it. The Lead never
+reads the log directly: the log is compressed into a tree of one-line summaries,
+and the Lead reads a bounded `<chat>` view of that tree.
+
+## The shape of it
+
+```text
+messages ──▶ append-only log ──▶ summary tree ──▶ bounded view ──▶ each request
+             main/*.jsonl         tree/*.jsonl     <chat> 128 → 64 KB
+```
+
+## Inspiration
+
+The design comes from Victor Taelin's
+[UniiChat: one chat that never ends](https://gist.github.com/VictorTaelin/91837951a5ce5b38f341ec1ba1df6449).
+
+Herdsman adopted:
+
+- one append-only log as the source of truth, with the full original messages
+  kept on disk;
+- a binary tree of one-line summaries, each at most 512 bytes, built by model
+  calls;
+- a bounded view that shows recent messages in detail and older ones more
+  compressed;
+- `zoom(id, n)` to open a line back down to the original message and `date(id)`
+  for its timestamp;
+- a lossy-line marker and a `tool_call` gate, so an identifier seen only in a
+  summary cannot be used without zooming;
+- provider prefix caching, so unchanged view blocks are read from cache across
+  turns.
+
+Herdsman changed:
+
+- **Scope.** One memory per project, shared by every ordinary Lead session in
+  it, instead of one chat. The log is keyed by the project's resolved path.
+- **Opt-in.** A project file cannot enable memory, because every enabled project
+  spends model calls on compaction. The user enables it in user-wide
+  configuration.
+- **The compactor.** Summaries are written by the reserved `compactor`
+  definition as direct model calls, with the user's chosen model.
+- **When the tree grows.** A view queues the merges it will need once it is
+  within 90% of its bound, so the tree grows where a view asks for it.
 
 ## The view
 
@@ -28,6 +72,28 @@ The view is sent as 4-line blocks, and cross-turn view caching relies on
 provider prefix caching: on Anthropic, Herdsman adds one cache mark at the last
 fully built block of the view.
 
+## The gate
+
+A Pi `tool_call` gate requires the exact identifiers in seven actions
+(`delegate_agent`, `continue_agent`, `reply_agent`, `steer_agent`,
+`interrupt_agent`, `edit`, `write`) to have been seen verbatim in the current
+turn, not only inside summary lines. A value that appears only in a summary is
+blocked, and the Lead is told which line to zoom. The `…[ids]` marker on a
+summary is what makes the omission visible, so a missing value cannot look like
+a value that was never there.
+
+## Pi's native compaction
+
+Pi's threshold compaction summarizes a session's history into one summary when
+the context fills, and the session continues from that summary. Project memory
+replaces that history with the project view instead: the view is bounded and
+grows only at its end, and its detail stays recoverable through `zoom`.
+
+Threshold compaction is cancelled in the owning session, because the view
+already replaces the history Pi would summarize. Overflow recovery and a manual
+`/compact` stay native, so Pi can still reduce context to make a request
+possible.
+
 ## Opt-in
 
 Memory is off unless the project's directory is listed in the user-wide
@@ -36,7 +102,14 @@ directory must equal a listed directory, so parent and child directories do not
 match. Moving a project directory starts a new memory, because the store is
 keyed by the resolved path.
 
-An empty list leaves every session on Pi's native history.
+An empty list leaves every session on Pi's native history. See the
+[project memory guide](../guides/project-memory.md) for the exact setting, the
+required compactor model, and how to turn memory off again.
+
+A project also needs a compactor model before memory activates. There is no
+default, so the session stays native and prints one notice until a model is
+chosen in `/herdsman definitions` (see the
+[compactor](../guides/customizing-agents.md#project-memory-compactor)).
 
 ## Project scope
 
@@ -68,18 +141,26 @@ expensive Lead's thinking level. An overlay can still replace it. See
 Known limitation: memory replaces the conversation with the project view each
 turn, so a provider that keeps its own per-session conversation state (for
 example pi-claude-bridge with Claude Code session reuse) cannot reuse it and may
-re-send the full view every turn.
+re-send the full view every turn. A session whose Lead provider is
+extension-registered is told this once when memory goes active.
 
 Compaction costs about two model calls per logged message.
 
 Quitting, reloading, or replacing a session waits up to 20 seconds for the
 summaries still in flight, so the work already paid for is written instead of
-repeated; anything unfinished after that is rebuilt on the next start.
+repeated; a session with a UI says it is finishing them. Anything unfinished
+after that is rebuilt on the next start.
 
-Threshold compaction is cancelled in the owning session, because the view
-already replaces the history Pi would summarize. Overflow recovery and a manual
-`/compact` stay native, so Pi can still reduce context to make a request
-possible.
+## Cost and trade-offs
+
+Memory costs several times more than Pi's native compaction, because the
+compactor spends model calls summarizing every message; a cheap, fast compactor
+model keeps that cost down. In Herdsman's own measurements it showed no recall
+advantage over continuing the same native session and a clear advantage over
+starting a fresh one. Summaries keep only part of the exact identifiers they
+cover, so exact values need `zoom`, and the store grows without bound because
+nothing is deleted. The behavior has been tested with DeepSeek-family models
+only.
 
 ## Roles and storage
 

@@ -21,7 +21,6 @@ _Realtime live demo of a manager > lead > agent workflow._
 
 [![Live demo](https://github.com/user-attachments/assets/e1355ace-aaba-418e-a1d0-1246f1840fc6)](https://github.com/user-attachments/assets/d6ee6687-a96d-493e-ae75-429f586be393)
 
-
 ## What Pi Herdsman gives you
 
 - **Background Agents.** Delegate bounded work without blocking the Lead conversation.
@@ -114,15 +113,16 @@ workflow.
 
 ## Choose your next step
 
-| Goal                                       | Start here                                                    |
-| ------------------------------------------ | ------------------------------------------------------------- |
-| Install and delegate your first task       | [Getting started](docs/getting-started.md)                    |
-| Run independent branch-based project work  | [Project orchestration](docs/guides/project-orchestration.md) |
-| Understand roles, ownership, and authority | [Coordination](docs/concepts/coordination.md)                 |
-| Customize Agents                           | [Agent definitions](docs/guides/agent-definitions.md)         |
-| Build against the model-facing tools       | [Coordination API](docs/coordination-api.md)                  |
-| Deploy an SSH-ready environment            | [Container deployment](docs/guides/container-deployment.md)   |
-| Contribute to Pi Herdsman                  | [Documentation index](docs/README.md#develop-pi-herdsman)     |
+| Goal                                                  | Start here                                                    |
+| ----------------------------------------------------- | ------------------------------------------------------------- |
+| Install and delegate your first task                  | [Getting started](docs/getting-started.md)                    |
+| Run independent branch-based project work             | [Project orchestration](docs/guides/project-orchestration.md) |
+| Give an opted-in project one never-ending Lead memory | [Project memory](docs/guides/project-memory.md)               |
+| Understand roles, ownership, and authority            | [Coordination](docs/concepts/coordination.md)                 |
+| Customize Agents                                      | [Agent definitions](docs/guides/agent-definitions.md)         |
+| Build against the model-facing tools                  | [Coordination API](docs/coordination-api.md)                  |
+| Deploy an SSH-ready environment                       | [Container deployment](docs/guides/container-deployment.md)   |
+| Contribute to Pi Herdsman                             | [Documentation index](docs/README.md#develop-pi-herdsman)     |
 
 ## Community
 

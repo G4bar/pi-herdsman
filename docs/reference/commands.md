@@ -140,7 +140,12 @@ value is available. Thinking uses Pi's supported levels when the selected
 model is known.
 
 Selecting the managed Lead or the `compactor` definition opens the same Model,
-Thinking, and Details actions, without `Enabled`.
+Thinking, and Details actions, without `Enabled`. The `compactor` Model picker
+offers `Unset (project memory off)` instead of `Inherit current session`,
+because an unset compactor model means memory is off rather than the Lead's
+model; an unset compactor model row reads `unset · memory off`. Setting the
+model notifies `compactor model set to <token>.` and clearing it notifies
+`compactor model cleared; project memory is off.`
 
 Selecting either ordinary Lead profile opens `Details` only.
 

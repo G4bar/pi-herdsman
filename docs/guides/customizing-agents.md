@@ -360,7 +360,10 @@ Details…
 ```
 
 Model and thinking each offer `Inherit current session` plus their available
-values. Selecting `Inherit current session` removes only that field. The model chooser stores the
+values. The `compactor` Model picker instead offers
+`Unset (project memory off)`, because an unset compactor model means memory is
+off rather than the Lead's model. Selecting `Inherit current session` (or
+`Unset (project memory off)`) removes only that field. The model chooser stores the
 canonical provider/model token; thinking uses the selected model's supported
 levels when available. `Enabled` toggles the definition.
 
