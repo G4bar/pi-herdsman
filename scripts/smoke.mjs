@@ -4570,19 +4570,27 @@ function memorySuiteSource() {
   ].join("\n");
 }
 
+/** The bulk turn's log size: 40 lines of 150 characters, about 7 KB. */
+const HORIZON_BULK_LINES = 40;
+
+/** One bulk log line, the same shape `horizonEmitSource` prints. */
+function horizonLogLine(topic, index) {
+  const token = ((index * 2654435761) % 4294967296)
+    .toString(16)
+    .padStart(8, "0");
+  return `[${topic}] step ${index} ok token ${token} elapsed ${(index * 13) % 997} ms ${".".repeat(120)}`;
+}
+
 /**
- * The horizon scenario's cheap bulk turn: about 7 KB (2k tokens) of
- * deterministic log lines per call, so a turn costs context without a large
- * file read. Facts the probes ask about never live in this file.
+ * The horizon scenario's log file, for the step that asks a scout what
+ * `scripts/emit.mjs` prints. The bulk turns paste the same lines.
  */
 function horizonEmitSource() {
   return [
     'const topic = process.argv[2] ?? "topic";',
     "const lines = Number(process.argv[3] ?? 40);",
-    "for (let i = 0; i < lines; i++) {",
-    '  const token = ((i * 2654435761) % 4294967296).toString(16).padStart(8, "0");',
-    '  console.log(`[${topic}] step ${i} ok token ${token} elapsed ${(i * 13) % 997} ms ${".".repeat(120)}`);',
-    "}",
+    `const horizonLogLine = ${horizonLogLine.toString()};`,
+    "for (let i = 0; i < lines; i++) console.log(horizonLogLine(topic, i));",
     "",
   ].join("\n");
 }
@@ -5394,6 +5402,9 @@ export function horizonScoreTable(probes) {
  * `native-continue` by at least `margin` probes in every paired run and in the
  * mean; `native-continue` is better under the symmetric rule. Anything else is
  * no claim. `native-fresh` measures the floor and never enters the rule.
+ *
+ * The means cover the paired runs only: an unpaired run is already excluded
+ * from the per-run deltas, so it must not move the mean either.
  */
 export function horizonWinRule(totals, margin = MEMORY_HORIZON_WIN_MARGIN) {
   const arm = (name) => totals[name] ?? [];
@@ -5413,8 +5424,8 @@ export function horizonWinRule(totals, margin = MEMORY_HORIZON_WIN_MARGIN) {
       native: arm("native-continue").find((row) => row.run === run)?.total,
     }))
     .filter((pair) => pair.memory !== undefined && pair.native !== undefined);
-  const memoryMean = mean(arm("memory").map((row) => row.total));
-  const nativeMean = mean(arm("native-continue").map((row) => row.total));
+  const memoryMean = mean(pairs.map((pair) => pair.memory));
+  const nativeMean = mean(pairs.map((pair) => pair.native));
   const freshMean = mean(arm("native-fresh").map((row) => row.total));
   const deltas = pairs.map((pair) => pair.memory - pair.native);
   const meanDelta =
@@ -6053,7 +6064,16 @@ const HORIZON_FACTS = {
 /** Thrown by the cost gate; the run stops and reports `incomplete`. */
 class HorizonBudgetExceeded extends Error {}
 
-/** Cheap bulk turns: about 7 KB of `emit.mjs` output each to summarize. */
+/**
+ * Cheap bulk turns: about 7 KB (2k tokens) of log lines each, so a turn costs
+ * context without a large file read, and no fact a probe asks about.
+ *
+ * The lines go in the user's own turn. The phase 15 fixture had the Lead run
+ * `emit.mjs` instead, and the Lead piped it (`| wc -l`, `| tail -n 1`) to answer
+ * the cheap question, so each turn cost about 170 bytes: the phase 16 run ended
+ * with 1 and 0 native compactions against the scenario's minimum of 8, which is
+ * no long-horizon pressure at all. Pasted text cannot be piped away.
+ */
 function horizonBulkSteps(count, offset) {
   const topics = [
     "billing",
@@ -6066,14 +6086,20 @@ function horizonBulkSteps(count, offset) {
     "exports",
   ];
   const asks = [
-    "Reply with the number of lines it printed and its last line.",
-    "Reply with the number of lines it printed, in one line.",
-    "Reply with the step number on its last line.",
-    "Reply with the token on its first line.",
+    "Reply with the number of lines above and the last line, verbatim.",
+    "Reply with the number of lines above, in one line.",
+    "Reply with the step number on the last line above.",
+    "Reply with the token on the first line above.",
   ];
-  return Array.from({ length: count }, (_, index) => ({
-    prompt: `Run \`node scripts/emit.mjs ${topics[(offset + index) % topics.length]} 40\` and read no other file. ${asks[index % asks.length]}`,
-  }));
+  return Array.from({ length: count }, (_, index) => {
+    const topic = topics[(offset + index) % topics.length];
+    const log = Array.from({ length: HORIZON_BULK_LINES }, (_, line) =>
+      horizonLogLine(topic, line),
+    ).join("\n");
+    return {
+      prompt: `Paste of the ${topic} job log from a moment ago:\n\n${log}\n\n${asks[index % asks.length]}`,
+    };
+  });
 }
 
 /**

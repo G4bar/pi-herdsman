@@ -1073,6 +1073,19 @@ test("the horizon win rule needs the margin in every run and in the mean", () =>
   });
   assert.equal(unpaired.claim, "no claim");
   assert.match(unpaired.detail, /no run has both arms/);
+  // An unpaired run cannot skew the mean either: run 2's memory total is
+  // dropped, so the paired run 1 keeps its +3 and the claim holds.
+  const partial = horizonWinRule({
+    memory: [
+      { run: 1, total: 12 },
+      { run: 2, total: 0 },
+    ],
+    "native-continue": [{ run: 1, total: 9 }],
+  });
+  assert.equal(partial.memoryMean, 12);
+  assert.equal(partial.nativeMean, 9);
+  assert.equal(partial.meanDelta, 3);
+  assert.equal(partial.claim, "memory better");
   const informational = horizonWinRule(totals([12, 13], [9, 10], [0, 0]));
   assert.equal(informational.claim, "memory better");
   assert.equal(informational.freshMean, 0);
