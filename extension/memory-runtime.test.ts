@@ -39,13 +39,15 @@ import type {
 import {
   TURN_SETTLE_GRACE_MS,
   ordinaryLeadSession,
-  projectMemoryStatus,
   registerMemoryRuntime,
   type MemoryCompactorFactory,
+} from "./memory-runtime.ts";
+import {
+  projectMemoryStatus,
   type MemoryRuntimeSnapshot,
   type ProjectMemoryRole,
   type ProjectMemoryStatus,
-} from "./memory-runtime.ts";
+} from "./memory-status.ts";
 import { fakeContext, fakePi, PI_AGENTS_DIR } from "./support.ts";
 import { herdsmanConfigPath } from "./storage.ts";
 
@@ -755,7 +757,7 @@ test("project memory status follows activation, role, config and model", async (
     });
     const startError = row.startError;
     const harness = new Harness({
-      isOrdinaryLead: () => (row.role ?? "lead") === "lead",
+      isOrdinaryLead: ordinaryFor(row),
       ...(startError === undefined
         ? {}
         : {
@@ -807,6 +809,35 @@ function reportFields(
   };
 }
 
+/** The report lines of an off, Manager-role row. */
+const managerLines = (project: string): string[] => [
+  "Project memory: off",
+  "Manager sessions do not use project memory.",
+  `Project: ${realpathSync(project)} · enabled`,
+  "Compactor: test/compactor · low",
+  `Store: ${projectMemoryRoot(project)} · not created yet`,
+];
+
+/** The report fields of the Manager row. */
+const managerFields = (project: string) =>
+  reportFields({
+    reason: "Manager sessions do not use project memory.",
+    project: realpathSync(project),
+    model: "test/compactor",
+  });
+
+/** The report fields of a row with no compactor model. */
+const unsetFields = (project: string) =>
+  reportFields({
+    reason: "No compactor model is chosen.",
+    project: realpathSync(project),
+    model: undefined,
+  });
+
+/** The ordinary-Lead predicate of a status row's role. */
+const ordinaryFor = (row: { role?: ProjectMemoryRole }) => (): boolean =>
+  (row.role ?? "lead") === "lead";
+
 test("the status report is the five lines of DESIGN §4.5", async () => {
   const cases: {
     name: string;
@@ -836,29 +867,13 @@ test("the status report is the five lines of DESIGN §4.5", async () => {
         "Compactor: unset",
         `Store: ${projectMemoryRoot(project)} · not created yet`,
       ],
-      fields: (project) =>
-        reportFields({
-          reason: "No compactor model is chosen.",
-          project: realpathSync(project),
-          model: undefined,
-        }),
+      fields: unsetFields,
     },
     {
       name: "model set, session not active",
       role: "manager",
-      lines: (project) => [
-        "Project memory: off",
-        "Manager sessions do not use project memory.",
-        `Project: ${realpathSync(project)} · enabled`,
-        "Compactor: test/compactor · low",
-        `Store: ${projectMemoryRoot(project)} · not created yet`,
-      ],
-      fields: (project) =>
-        reportFields({
-          reason: "Manager sessions do not use project memory.",
-          project: realpathSync(project),
-          model: "test/compactor",
-        }),
+      lines: managerLines,
+      fields: managerFields,
     },
     {
       name: "project not enabled",
@@ -889,12 +904,7 @@ test("the status report is the five lines of DESIGN §4.5", async () => {
         "Compactor: unset",
         `Store: ${projectMemoryRoot(project)}`,
       ],
-      fields: (project) =>
-        reportFields({
-          reason: "No compactor model is chosen.",
-          project: realpathSync(project),
-          model: undefined,
-        }),
+      fields: unsetFields,
     },
     {
       name: "thinking high",
@@ -907,12 +917,7 @@ test("the status report is the five lines of DESIGN §4.5", async () => {
         "Compactor: test/compactor · high",
         `Store: ${projectMemoryRoot(project)} · not created yet`,
       ],
-      fields: (project) =>
-        reportFields({
-          reason: "Manager sessions do not use project memory.",
-          project: realpathSync(project),
-          model: "test/compactor",
-        }),
+      fields: managerFields,
     },
     {
       name: "cwd cannot be resolved",
@@ -937,19 +942,8 @@ test("the status report is the five lines of DESIGN §4.5", async () => {
       name: "cwd is a symlink to the listed project",
       role: "manager",
       symlinkCwd: true,
-      lines: (project) => [
-        "Project memory: off",
-        "Manager sessions do not use project memory.",
-        `Project: ${realpathSync(project)} · enabled`,
-        "Compactor: test/compactor · low",
-        `Store: ${projectMemoryRoot(project)} · not created yet`,
-      ],
-      fields: (project) =>
-        reportFields({
-          reason: "Manager sessions do not use project memory.",
-          project: realpathSync(project),
-          model: "test/compactor",
-        }),
+      lines: managerLines,
+      fields: managerFields,
     },
   ];
 
@@ -974,7 +968,7 @@ test("the status report is the five lines of DESIGN §4.5", async () => {
 
     const session = new TestSession({ cwd, file: "/sessions/report.jsonl" });
     const harness = new Harness({
-      isOrdinaryLead: () => (row.role ?? "lead") === "lead",
+      isOrdinaryLead: ordinaryFor(row),
     });
     await harness.sessionStart(session);
 

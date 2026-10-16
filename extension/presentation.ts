@@ -19,7 +19,6 @@ import {
 } from "@earendil-works/pi-tui";
 import type { Box as TuiBox, Component } from "@earendil-works/pi-tui";
 import { createHash, randomUUID } from "node:crypto";
-import type { LeadExecutionMode } from "./core.ts";
 import {
   chmodSync,
   closeSync,
@@ -118,8 +117,10 @@ export interface StatusAgent {
   inactiveMs?: number;
   parentLabel?: string;
 }
+// Modes we render, declared here to stay off core's import chain; call sites
+// still pass LeadExecutionMode.
 export type StatusExecution =
-  { kind: "managed" } | { kind: "ordinary"; mode: LeadExecutionMode };
+  { kind: "managed" } | { kind: "ordinary"; mode: "flexible" | "orchestrate" };
 export interface StatusSnapshot {
   agents: StatusAgent[];
   stale: boolean;

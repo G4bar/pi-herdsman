@@ -251,8 +251,8 @@ import {
 import {
   ordinaryLeadSession,
   registerMemoryRuntime,
-  type MemoryRuntimeSnapshot,
 } from "./memory-runtime.ts";
+import type { MemoryRuntimeSnapshot } from "./memory-status.ts";
 import { MEMORY_TOOL_NAMES } from "./memory-prompts.ts";
 import {
   MAX_BYTE_LIMIT,

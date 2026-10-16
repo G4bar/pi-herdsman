@@ -102,7 +102,7 @@ import {
   type MemoryRuntimeSnapshot,
   type ProjectMemoryRole,
   type ProjectMemoryStatus,
-} from "./memory-runtime.ts";
+} from "./memory-status.ts";
 
 type LeadIdentityHost = {
   expectedSession(id: string, path?: string): ExpectedSession;
@@ -1307,6 +1307,200 @@ export function createLeadAgentEventRuntime(host: {
   };
 }
 
+type LeadMemoryStatusHost = Pick<
+  LeadCommandHost,
+  "roleActive" | "leadExecutionPresentation" | "memoryRuntimeSnapshot"
+>;
+
+type LeadMemoryMenuHost = LeadMemoryStatusHost &
+  Pick<LeadCommandHost, "selectMenu" | "readConfig" | "updateConfig"> & {
+    chooseDefinitionModel(
+      ctx: ExtensionCommandContext,
+      definition: AgentDefinition,
+    ): Promise<{ cancelled: boolean; value: string | undefined }>;
+    applyDefinitionOverride(
+      ctx: ExtensionCommandContext,
+      definition: AgentDefinition,
+      field: "model" | "thinking" | "enabled",
+      value: string | boolean | undefined,
+      resolveDefinition: (name: string) => Promise<AgentDefinition | undefined>,
+    ): Promise<AgentDefinition>;
+  };
+
+/**
+ * The shared project-memory status (DESIGN §4.4). The root row, the Status
+ * row and the report all derive from it.
+ */
+function leadMemoryStatus(
+  ctx: ExtensionCommandContext,
+  host: LeadMemoryStatusHost,
+): ProjectMemoryStatus {
+  const role: ProjectMemoryRole = host.roleActive("manager")
+    ? "manager"
+    : host.roleActive("chief")
+      ? "chief"
+      : host.leadExecutionPresentation().managed
+        ? "managed-lead"
+        : "lead";
+  return projectMemoryStatus(ctx, {
+    role,
+    runtime: host.memoryRuntimeSnapshot(),
+  });
+}
+
+async function openLeadMemoryMenu(
+  ctx: ExtensionCommandContext,
+  host: LeadMemoryMenuHost,
+): Promise<void> {
+  const compactor = () =>
+    discoverCompactorDefinition(
+      ctx.isProjectTrusted() ? { projectRoot: ctx.cwd } : {},
+    );
+  // The Enable flow and the Compactor model row share one picker and its
+  // notices, so both keep the Definitions wording.
+  const chooseModel = async (): Promise<"set" | "unset" | "cancelled"> => {
+    const definition = compactor();
+    const chosen = await host.chooseDefinitionModel(ctx, definition);
+    if (chosen.cancelled) return "cancelled";
+    await host.applyDefinitionOverride(
+      ctx,
+      definition,
+      "model",
+      chosen.value,
+      // A fresh read, so the write is verified against disk.
+      async (name) => {
+        const current = compactor();
+        return current.name === name ? current : undefined;
+      },
+    );
+    return chosen.value === undefined ? "unset" : "set";
+  };
+  let selectedRow = "status";
+  while (true) {
+    // Re-read on every iteration: the model picker and the enable flow
+    // both change what the rows show.
+    const status = leadMemoryStatus(ctx, host);
+    const rows = [
+      {
+        value: "status",
+        label: "Status",
+        description: status.word,
+        help: status.reason,
+      },
+      // The config is user-wide, so every role and an unsaved session are
+      // offered this too; only an unreadable config or a listed project
+      // hides it (DESIGN §4.6).
+      ...(status.configError === undefined && !status.listed
+        ? [
+            {
+              value: "enable",
+              label: "Enable for this project…",
+              help: "Add this directory to memoryProjects. Compaction costs about two model calls per logged message, and the store is never pruned.",
+            },
+          ]
+        : []),
+      {
+        value: "compactor-model",
+        label: "Compactor model",
+        description: status.model ?? "unset",
+        help: COMPACTOR_MODEL_HELP,
+      },
+    ];
+    // A confirmed enable drops the row, so fall back to Status.
+    if (!rows.some((row) => row.value === selectedRow)) selectedRow = "status";
+    const selected = await host.selectMenu(
+      ctx,
+      "Project memory",
+      rows,
+      selectedRow,
+    );
+    if (!selected) return;
+    selectedRow = selected;
+    if (selected === "status") {
+      ctx.ui.notify(status.report, status.level);
+      continue;
+    }
+    if (selected === "enable") {
+      const next = await enableLeadProjectMemory(ctx, host);
+      if (next === "pick-model") {
+        const outcome = await chooseModel();
+        selectedRow = outcome === "set" ? "status" : "compactor-model";
+      } else if (next) selectedRow = next;
+      continue;
+    }
+    await chooseModel();
+  }
+}
+
+/**
+ * Appends the current project's realpath to memoryProjects (DESIGN §3
+ * flows A–C). Returns the row to preselect next, or undefined when the
+ * flow wrote nothing and stays on `enable`.
+ */
+async function enableLeadProjectMemory(
+  ctx: ExtensionCommandContext,
+  host: LeadMemoryMenuHost,
+): Promise<"status" | "pick-model" | undefined> {
+  let project: string;
+  try {
+    // The realpath is written and shown, so opening the project through a
+    // symlink later still matches: activation compares realpaths.
+    project = realpathSync(ctx.cwd);
+  } catch (error) {
+    ctx.ui.notify(
+      `Could not enable project memory: ${String(error).replace(/^Error: /, "")}`,
+      "error",
+    );
+    return undefined;
+  }
+  const confirmed = await ctx.ui.confirm(
+    "Enable project memory?",
+    [
+      `Ordinary Lead sessions opened in ${project} will share one project memory.`,
+      "Compaction makes about two compactor model calls per logged message, and the store is never pruned.",
+      "It turns on at the next session start.",
+    ].join("\n"),
+  );
+  if (!confirmed) return undefined;
+  try {
+    // shortcut: the list is read before the lock, so a concurrent writer
+    // adding a different project between the read and the locked write is
+    // overwritten. Upgrade by making updateConfig take an updater function
+    // under the lock.
+    if (leadMemoryStatus(ctx, host).listed) {
+      ctx.ui.notify(
+        `Project memory is already enabled for ${project}.`,
+        "info",
+      );
+      return undefined;
+    }
+    host.updateConfig("memoryProjects", [
+      ...host.readConfig().memoryProjects,
+      project,
+    ]);
+  } catch (error) {
+    ctx.ui.notify(
+      `Could not enable project memory: ${String(error).replace(/^Error: /, "")}`,
+      "error",
+    );
+    return undefined;
+  }
+  if (leadMemoryStatus(ctx, host).model !== undefined) {
+    ctx.ui.notify(
+      `Project memory enabled for ${project}. It turns on at the next session start.`,
+      "info",
+    );
+    return "status";
+  }
+  // The write is already applied and reported before the picker runs, so
+  // a malformed agent definition leaves the enable in place.
+  ctx.ui.notify(
+    `Project memory enabled for ${project}. Choose a compactor model to turn it on.`,
+    "info",
+  );
+  return "pick-model";
+}
+
 export function createLeadCommandRuntime(host: LeadCommandHost) {
   return {
     async openPlacementMenu(ctx: ExtensionCommandContext): Promise<void> {
@@ -2051,170 +2245,14 @@ export function createLeadCommandRuntime(host: LeadCommandHost) {
         else if (selected === "stop-all") await this.confirmAndStopAll(ctx);
       }
     },
-    /**
-     * The shared project-memory status (DESIGN §4.4). The root row, the Status
-     * row and the report all derive from it.
-     */
-    memoryStatus(ctx: ExtensionCommandContext): ProjectMemoryStatus {
-      const role: ProjectMemoryRole = host.roleActive("manager")
-        ? "manager"
-        : host.roleActive("chief")
-          ? "chief"
-          : host.leadExecutionPresentation().managed
-            ? "managed-lead"
-            : "lead";
-      return projectMemoryStatus(ctx, {
-        role,
-        runtime: host.memoryRuntimeSnapshot(),
-      });
-    },
     async openMemoryMenu(ctx: ExtensionCommandContext): Promise<void> {
-      const compactor = () =>
-        discoverCompactorDefinition(
-          ctx.isProjectTrusted() ? { projectRoot: ctx.cwd } : {},
-        );
-      // The Enable flow and the Compactor model row share one picker and its
-      // notices, so both keep the Definitions wording.
-      const chooseModel = async (): Promise<"set" | "unset" | "cancelled"> => {
-        const definition = compactor();
-        const chosen = await this.chooseDefinitionModel(ctx, definition);
-        if (chosen.cancelled) return "cancelled";
-        await this.applyDefinitionOverride(
-          ctx,
-          definition,
-          "model",
-          chosen.value,
-          // A fresh read, so the write is verified against disk.
-          async (name) => {
-            const current = compactor();
-            return current.name === name ? current : undefined;
-          },
-        );
-        return chosen.value === undefined ? "unset" : "set";
-      };
-      let selectedRow = "status";
-      while (true) {
-        // Re-read on every iteration: the model picker and the enable flow
-        // both change what the rows show.
-        const status = this.memoryStatus(ctx);
-        const rows = [
-          {
-            value: "status",
-            label: "Status",
-            description: status.word,
-            help: status.reason,
-          },
-          // The config is user-wide, so every role and an unsaved session are
-          // offered this too; only an unreadable config or a listed project
-          // hides it (DESIGN §4.6).
-          ...(status.configError === undefined && !status.listed
-            ? [
-                {
-                  value: "enable",
-                  label: "Enable for this project…",
-                  help: "Add this directory to memoryProjects. Compaction costs about two model calls per logged message, and the store is never pruned.",
-                },
-              ]
-            : []),
-          {
-            value: "compactor-model",
-            label: "Compactor model",
-            description: status.model ?? "unset",
-            help: COMPACTOR_MODEL_HELP,
-          },
-        ];
-        // A confirmed enable drops the row, so fall back to Status.
-        if (!rows.some((row) => row.value === selectedRow))
-          selectedRow = "status";
-        const selected = await host.selectMenu(
-          ctx,
-          "Project memory",
-          rows,
-          selectedRow,
-        );
-        if (!selected) return;
-        selectedRow = selected;
-        if (selected === "status") {
-          ctx.ui.notify(status.report, status.level);
-          continue;
-        }
-        if (selected === "enable") {
-          const next = await this.enableProjectMemory(ctx);
-          if (next === "pick-model") {
-            const outcome = await chooseModel();
-            selectedRow = outcome === "set" ? "status" : "compactor-model";
-          } else if (next) selectedRow = next;
-          continue;
-        }
-        await chooseModel();
-      }
-    },
-    /**
-     * Appends the current project's realpath to memoryProjects (DESIGN §3
-     * flows A–C). Returns the row to preselect next, or undefined when the
-     * flow wrote nothing and stays on `enable`.
-     */
-    async enableProjectMemory(
-      ctx: ExtensionCommandContext,
-    ): Promise<"status" | "pick-model" | undefined> {
-      let project: string;
-      try {
-        // The realpath is written and shown, so opening the project through a
-        // symlink later still matches: activation compares realpaths.
-        project = realpathSync(ctx.cwd);
-      } catch (error) {
-        ctx.ui.notify(
-          `Could not enable project memory: ${String(error).replace(/^Error: /, "")}`,
-          "error",
-        );
-        return undefined;
-      }
-      const confirmed = await ctx.ui.confirm(
-        "Enable project memory?",
-        [
-          `Ordinary Lead sessions opened in ${project} will share one project memory.`,
-          "Compaction makes about two compactor model calls per logged message, and the store is never pruned.",
-          "It turns on at the next session start.",
-        ].join("\n"),
-      );
-      if (!confirmed) return undefined;
-      try {
-        // shortcut: the list is read before the lock, so a concurrent writer
-        // adding a different project between the read and the locked write is
-        // overwritten. Upgrade by making updateConfig take an updater function
-        // under the lock.
-        if (this.memoryStatus(ctx).listed) {
-          ctx.ui.notify(
-            `Project memory is already enabled for ${project}.`,
-            "info",
-          );
-          return undefined;
-        }
-        host.updateConfig("memoryProjects", [
-          ...host.readConfig().memoryProjects,
-          project,
-        ]);
-      } catch (error) {
-        ctx.ui.notify(
-          `Could not enable project memory: ${String(error).replace(/^Error: /, "")}`,
-          "error",
-        );
-        return undefined;
-      }
-      if (this.memoryStatus(ctx).model !== undefined) {
-        ctx.ui.notify(
-          `Project memory enabled for ${project}. It turns on at the next session start.`,
-          "info",
-        );
-        return "status";
-      }
-      // The write is already applied and reported before the picker runs, so
-      // a malformed agent definition leaves the enable in place.
-      ctx.ui.notify(
-        `Project memory enabled for ${project}. Choose a compactor model to turn it on.`,
-        "info",
-      );
-      return "pick-model";
+      await openLeadMemoryMenu(ctx, {
+        ...host,
+        chooseDefinitionModel: (ctx, definition) =>
+          this.chooseDefinitionModel(ctx, definition),
+        applyDefinitionOverride: (ctx, definition, field, value, resolve) =>
+          this.applyDefinitionOverride(ctx, definition, field, value, resolve),
+      });
     },
     async openHerdsmanMenu(ctx: ExtensionCommandContext): Promise<void> {
       let selectedSection = "execution";
@@ -2250,7 +2288,7 @@ export function createLeadCommandRuntime(host: LeadCommandHost) {
             {
               value: "memory",
               label: "Project memory",
-              description: this.memoryStatus(ctx).word,
+              description: leadMemoryStatus(ctx, host).word,
               help: "See whether this session uses project memory, and enable it for this project.",
             },
             {
