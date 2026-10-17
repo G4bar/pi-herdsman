@@ -30,6 +30,7 @@ import {
   entryHash,
   extractIdentifiers,
   lineLabel,
+  markViewCache,
   mostDuePair,
   nodeAt,
   nodeStart,
@@ -1699,4 +1700,40 @@ test("the compaction view merges down to its own target", () => {
       store.close();
     }
   });
+});
+
+test("the view cache mark never lands on the last-exchange block", () => {
+  // The exchange block happens to be four lines, so only the `<chat>` bound
+  // keeps `markViewCache` from marking it instead of a built view block.
+  const block = [0, 1, 2, 3]
+    .map((row) => `${row}+1|summary ${row}`)
+    .join("\n");
+  const payload = {
+    model: "claude-haiku-4-5",
+    messages: [
+      {
+        role: "user",
+        content: [
+          ...viewParts([block]),
+          {
+            type: "text",
+            text: "<last_exchange>\nuser: a\nlead: b\n</last_exchange>\n",
+          },
+        ],
+      },
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "next", cache_control: { type: "ephemeral" } },
+        ],
+      },
+    ],
+  };
+  const result = markViewCache(payload) as any;
+  assert.ok(result);
+  // 0 `<chat>`, 1 the built block, 2 `</chat>`, 3 the exchange.
+  assert.deepEqual(result.messages[0].content[1].cache_control, {
+    type: "ephemeral",
+  });
+  assert.equal(result.messages[0].content[3].cache_control, undefined);
 });

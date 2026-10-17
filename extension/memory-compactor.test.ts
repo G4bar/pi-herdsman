@@ -468,19 +468,107 @@ test("the usage callback labels the node and sums attempts and reasoning", () =>
     await compactor.whenSettled(0);
     compactor.stop();
 
-    assert.deepEqual(usages, [
-      {
-        line: [0, 0],
-        kind: "leaf",
-        input: 2,
-        output: 16,
-        reasoning: 9,
-        cacheRead: 6,
-        cacheWrite: 8,
-        attempts: 2,
-        retries: 1,
-      },
-    ]);
+    const [{ ms, ...usage }] = usages;
+    assert.equal(typeof ms, "number");
+    assert.ok(ms >= 0);
+    assert.deepEqual(usage, {
+      line: [0, 0],
+      kind: "leaf",
+      input: 2,
+      output: 16,
+      reasoning: 9,
+      cacheRead: 6,
+      cacheWrite: 8,
+      attempts: 2,
+      retries: 1,
+    });
+  }));
+
+test("the stats window is the last 100 builds", () =>
+  withProject(async (project, store) => {
+    // Each build reports its index, so the surviving window is visible.
+    for (let index = 0; index < 101; index += 1) addMessage(store, longText());
+    const registry = new FakeRegistry([makeModel("test", "lead")]);
+    registry.responder = (call, index) =>
+      call.respond("line", { input: index, cacheRead: 0, cacheWrite: 0 });
+    const compactor = start(store, fakeContext(registry, undefined, project));
+    await compactor.whenSettled(100);
+    compactor.stop();
+
+    const stats = compactor.stats();
+    assert.equal(stats.calls, 100);
+    // Inputs 1..100 survive; build 0 rolled out of the ring.
+    assert.equal(stats.input, 5050);
+    assert.equal(stats.cacheRead, 0);
+    assert.equal(stats.retries, 0);
+  }));
+
+test("stats records the first line of the last failure", () =>
+  withProject(async (project, store) => {
+    addMessage(store, longText());
+    const registry = new FakeRegistry([makeModel("test", "lead")]);
+    registry.responder = (call) => call.fail("429 rate limited\nmore detail");
+    const compactor = start(store, fakeContext(registry, undefined, project));
+    await compactor.whenSettled(0);
+    const stats = compactor.stats();
+    compactor.stop();
+
+    assert.equal(stats.failing, 1);
+    assert.equal(stats.lastError?.message, "429 rate limited");
+    assert.equal(typeof stats.lastError?.at, "number");
+  }));
+
+test("unbuilt counts the nodes standing between the view and settled", () =>
+  withProject(async (project, store) => {
+    addMessage(store, longText());
+    const registry = new FakeRegistry([makeModel("test", "lead")]);
+    // Hold the reply, so the node is unbuilt when it is counted.
+    registry.responder = () => {};
+    const compactor = start(store, fakeContext(registry, undefined, project));
+    await waitFor(() => registry.calls.length === 1);
+    assert.equal(compactor.unbuilt(0), 1);
+
+    registry.calls[0]!.respond("line");
+    await compactor.whenSettled(0);
+    assert.equal(compactor.unbuilt(0), 0);
+    compactor.stop();
+  }));
+
+test("unbuilt skips a built node in the frontier", () =>
+  withProject(async (project, store) => {
+    for (let index = 0; index < 3; index += 1) addMessage(store, longText());
+    // The frontier over messages 0..2 is the pair [1,0], [0,2], and the later
+    // node is built by hand while the earlier one stays unbuilt.
+    store.appendNode([0, 2], "built");
+    const registry = new FakeRegistry([makeModel("test", "lead")]);
+    registry.responder = () => {};
+    const compactor = start(store, fakeContext(registry, undefined, project));
+    assert.equal(compactor.unbuilt(2), 1);
+    compactor.stop();
+  }));
+
+test("stats uses the first non-empty line of a failure", () =>
+  withProject(async (project, store) => {
+    addMessage(store, longText());
+    const registry = new FakeRegistry([makeModel("test", "lead")]);
+    registry.responder = (call) => call.fail("\n   \nreal error");
+    const compactor = start(store, fakeContext(registry, undefined, project));
+    await compactor.whenSettled(0);
+    const stats = compactor.stats();
+    compactor.stop();
+    assert.equal(stats.lastError?.message, "real error");
+  }));
+
+test("stats falls back to a placeholder for a blank failure", () =>
+  withProject(async (project, store) => {
+    addMessage(store, longText());
+    const registry = new FakeRegistry([makeModel("test", "lead")]);
+    registry.responder = (call) => call.fail("\n \n");
+    const compactor = start(store, fakeContext(registry, undefined, project));
+    await compactor.whenSettled(0);
+    const stats = compactor.stats();
+    compactor.stop();
+    assert.equal(stats.lastError?.message, "unknown error");
   }));
 
 test("a provider without a reasoning report leaves the total null", () =>

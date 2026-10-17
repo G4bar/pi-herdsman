@@ -83,9 +83,10 @@ native and prints one notice:
 Project memory is off: choose the compactor model in /herdsman definitions -> compactor -> Model
 ```
 
-The `Compactor model` row in `/herdsman memory` opens the same picker as
-`Definitions` → `compactor` → `Model`, so either route works. Enabling a project
-without a model opens the picker immediately after the confirmation.
+The `Compactor model` and `Compactor thinking` rows in `/herdsman memory` open
+the same pickers as `Definitions` → `compactor` → `Model` and `Thinking`, so
+either route works. Enabling a project without a model opens the model picker
+immediately after the confirmation.
 
 Choose it in the interactive menu:
 

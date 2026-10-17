@@ -6194,6 +6194,7 @@ test("/herdsman memory opens the Project memory submenu and reports status", asy
       "Status  off",
       "Enable for this project…",
       "Compactor model  new/model",
+      "Compactor thinking  low",
     ]);
     assert.deepEqual(notices, [
       {
@@ -6240,7 +6241,7 @@ test("/herdsman memory reports an invalid config.json as a warning", async () =>
   };
   try {
     await command.handler("memory", context);
-    assert.deepEqual(rows[0], ["Status  off", "Compactor model  unset"]);
+    assert.deepEqual(rows[0], ["Status  off", "Compactor model  unset", "Compactor thinking  low"]);
     assert.equal(notices.length, 1);
     assert.equal(notices[0]?.level, "warning");
     // The reason is both the Status help line and report line 2.
@@ -6299,6 +6300,60 @@ test("/herdsman memory sets the compactor model from its Compactor model row", a
       "Status  off",
       "Enable for this project…",
       "Compactor model  new/model",
+      "Compactor thinking  low",
+    ]);
+  } finally {
+    realFs.rmSync(overridePath, { force: true });
+    await pi.events.get("session_shutdown")?.[0]();
+  }
+});
+
+test("/herdsman memory sets the compactor thinking from its Compactor thinking row", async () => {
+  setLeadEnvironment();
+  const overridePath = join(PI_AGENTS_DIR, "compactor.md");
+  const pi = fakePi();
+  registerExtension!(pi.pi as never);
+  const command = pi.commandOptions.get("herdsman");
+  const context = fakeContext() as any;
+  context.hasUI = true;
+  context.mode = "rpc";
+  context.modelRegistry = fakeModelRegistry();
+  const prompts: { label: string; options: string[] }[] = [];
+  const { notices, notify } = messageRecorder();
+  context.ui.notify = notify;
+  const visits = new Map<string, number>();
+  context.ui.select = async (label: string, options: string[]) => {
+    prompts.push({ label, options });
+    const visit = visits.get(label) ?? 0;
+    visits.set(label, visit + 1);
+    if (label === "Project memory")
+      return visit === 0
+        ? options.find(optionStartsWith("Compactor thinking"))
+        : undefined;
+    if (label === "Thinking") return options.find(optionStartsWith("medium"));
+    return undefined;
+  };
+  try {
+    await command.handler("memory", context);
+    const picker = prompts.find(rowIs("Thinking"));
+    assert.ok(picker, JSON.stringify(prompts.map(rowLabel)));
+    // The compactor inherits the bundled default, not the session's level.
+    assert.equal(picker.options[0], "Default (low)");
+    assert.ok(
+      picker.options.some(optionStartsWith("medium")),
+      JSON.stringify(picker.options),
+    );
+    assert.ok(
+      notices.includes("compactor thinking set to medium."),
+      JSON.stringify(notices),
+    );
+    // The submenu re-renders from the re-read status after the write.
+    const renders = prompts.filter(rowIs("Project memory"));
+    assert.deepEqual(renders[1]?.options, [
+      "Status  off",
+      "Enable for this project…",
+      "Compactor model  unset",
+      "Compactor thinking  medium",
     ]);
   } finally {
     realFs.rmSync(overridePath, { force: true });
@@ -6444,6 +6499,7 @@ test("/herdsman memory enables the project for the next session start", async ()
       "Status  off",
       "Enable for this project…",
       "Compactor model  new/model",
+      "Compactor thinking  low",
     ]);
     assert.deepEqual(confirms, [
       { title: ENABLE_CONFIRM_TITLE, message: enableConfirmMessage(real) },
@@ -6463,6 +6519,7 @@ test("/herdsman memory enables the project for the next session start", async ()
     assert.deepEqual(rows[1], [
       "Status  next session",
       "Compactor model  new/model",
+      "Compactor thinking  low",
     ]);
   } finally {
     realFs.rmSync(project, { recursive: true, force: true });
@@ -6527,6 +6584,7 @@ test("/herdsman memory offers the compactor picker when no model is set", async 
         assert.deepEqual(rows[1], [
           "Status  next session",
           "Compactor model  new/model",
+          "Compactor thinking  low",
         ]);
       } else {
         // Esc adds no notice; the unset row reports the model is already off.
@@ -6546,7 +6604,7 @@ test("/herdsman memory offers the compactor picker when no model is set", async 
           variant.pick === "unset" ? 3 : 2,
           variant.name,
         );
-        assert.deepEqual(rows[1], ["Status  off", "Compactor model  unset"]);
+        assert.deepEqual(rows[1], ["Status  off", "Compactor model  unset", "Compactor thinking  low"]);
       }
     } finally {
       realFs.rmSync(project, { recursive: true, force: true });
@@ -6790,7 +6848,7 @@ test("/herdsman memory hides Enable for an invalid config or a listed project", 
     });
     assert.deepEqual(
       rows[0],
-      [variant.status, "Compactor model  new/model"],
+      [variant.status, "Compactor model  new/model", "Compactor thinking  low"],
       variant.name,
     );
   }
@@ -6828,6 +6886,7 @@ test("/herdsman memory reports a project enabled by another process", async () =
     assert.deepEqual(rows[1], [
       "Status  next session",
       "Compactor model  new/model",
+      "Compactor thinking  low",
     ]);
   } finally {
     realFs.rmSync(project, { recursive: true, force: true });
@@ -6986,6 +7045,7 @@ test("a malformed agent definition does not break the Herdsman menus", async () 
       "Status  off",
       "Enable for this project…",
       "Compactor model  unset",
+      "Compactor thinking  low",
     ]);
     assert.equal(notices.length, 1);
     assert.equal(notices[0]?.level, "warning");

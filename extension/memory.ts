@@ -311,15 +311,31 @@ function pages(kind: MemoryKind, text: string, images: boolean): MessagePart[] {
   return parts;
 }
 
-/** A tool result keeps its head and tail, 30,000 characters in all. */
-export function clipEcho(text: string): string {
-  if (text.length <= ECHO_CHARS) return text;
-  const side = Math.floor(ECHO_CHARS / 2) - 64;
+/**
+ * Head-and-tail clip: a tool result keeps 30,000 characters in all by
+ * default. The previous exchange reuses it with its own smaller bound.
+ */
+export function clipEcho(text: string, chars = ECHO_CHARS): string {
+  if (text.length <= chars) return text;
+  const side = Math.floor(chars / 2) - 64;
   const head = safeCut(text, side);
   const tail = safeCut(text, text.length - side);
   const omitted = tail - head;
   const marker = `\n[... ${omitted} characters omitted ...]\n`;
   return `${text.slice(0, head)}${marker}${text.slice(tail)}`;
+}
+
+/** The marker `clipEcho` leaves where it dropped text. */
+const CLIP_OMISSION = /\[\.\.\. [0-9]+ characters omitted \.\.\.\]/;
+
+/**
+ * The head of a `clipEcho` result: the text before its omission marker, or the
+ * whole text when nothing was dropped. A caller that must not include the tail
+ * uses this to stay inside what the clip kept.
+ */
+export function clipHead(text: string): string {
+  const at = text.search(CLIP_OMISSION);
+  return at === -1 ? text : text.slice(0, at);
 }
 
 /** Moves a cut back when it would split a surrogate pair. */
@@ -480,6 +496,13 @@ function isViewMessage(message: unknown): boolean {
   return typeof text === "string" && text.replace(/\n$/, "") === VIEW_OPEN;
 }
 
+/** The part that closes the injected `<chat>` view. */
+function isViewClose(block: unknown): boolean {
+  if (!isRecord(block) || block.type !== "text") return false;
+  const text = block.text;
+  return typeof text === "string" && text.replace(/\n$/, "") === VIEW_CLOSE;
+}
+
 /** A whole 4-line block with every line built: a stable cache breakpoint. */
 function isBuiltViewBlock(block: unknown): boolean {
   if (!isRecord(block) || block.type !== "text") return false;
@@ -531,8 +554,13 @@ export function markViewCache(payload: unknown): ProviderPayload | undefined {
   if (mark === undefined) return undefined;
   const view = messages[viewIndex] as Record<string, unknown>;
   if (!Array.isArray(view.content)) return undefined;
+  // Only `<chat>` blocks are view blocks: a trailing block outside the tags,
+  // such as the previous exchange, must never take the mark. The close tag is
+  // scanned for first, so a well-formed view is bounded by it either way.
+  const closeAt = view.content.findIndex(isViewClose);
+  if (closeAt <= 0) return undefined;
   let at = -1;
-  for (let index = view.content.length - 1; index >= 0; index -= 1)
+  for (let index = closeAt - 1; index >= 0; index -= 1)
     if (isBuiltViewBlock(view.content[index])) {
       at = index;
       break;

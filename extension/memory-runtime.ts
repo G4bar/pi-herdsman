@@ -21,6 +21,7 @@ import {
   convertToLlm,
   parseSessionEntries,
 } from "@earendil-works/pi-coding-agent";
+import { matchesKey } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import { readConfig } from "./config.ts";
@@ -28,9 +29,12 @@ import { resolveCompactorDefinition } from "./agent-definitions.ts";
 import { ProcessLockOccupiedError, readProcessLockStatus } from "./lock.ts";
 import {
   MemoryStore,
+  UNBUILT_LINE,
   VIEW_BLOCK_LINES,
   VIEW_CLOSE,
   VIEW_OPEN,
+  clipEcho,
+  clipHead,
   deriveMessages,
   extractIdentifiers,
   lineLabel,
@@ -49,6 +53,7 @@ import {
   reason,
   type MemoryActivationOutcome,
   type MemoryRuntimeSnapshot,
+  type MemoryTurnRecord,
 } from "./memory-status.ts";
 import {
   SHUTDOWN_DRAIN_MS,
@@ -60,7 +65,14 @@ import {
 } from "./memory-compactor.ts";
 
 /** The per-turn settle grace: after this the view freezes with placeholders. */
-export const TURN_SETTLE_GRACE_MS = 30_000;
+export const TURN_SETTLE_GRACE_MS = 3_000;
+/** How long the wait runs before the widget appears, and how often it refreshes. */
+const WAIT_WIDGET_DELAY_MS = 500;
+const WAIT_WIDGET_REFRESH_MS = 1_000;
+/** The wait widget and the placeholder footer status share this key. */
+const MEMORY_UI_KEY = "pi-herdsman-memory";
+/** How much of the previous exchange the view carries, head and tail together. */
+const LAST_EXCHANGE_CHARS = 16 * 1024;
 /** At most this many images, and this many bytes in all, come back per zoom. */
 const ZOOM_IMAGE_LIMIT = 4;
 const ZOOM_IMAGE_BYTES = 5 * 1024 * 1024;
@@ -84,6 +96,8 @@ const GATE_ASK_AFTER = 3;
 const GATE_ENTRY_TYPE = "pi-herdsman-memory-gate";
 /** The durable usage entry each compaction call appends, for the harness. */
 const USAGE_ENTRY_TYPE = "pi-herdsman-memory-usage";
+/** The durable turn entry each `freezeTurn` appends, for the status report. */
+const TURN_ENTRY_TYPE = "pi-herdsman-memory-turn";
 /** The one warning a session without a compactor model gets at start. */
 const NO_COMPACTOR_MODEL_NOTICE =
   "Project memory is off: choose the compactor model in /herdsman definitions -> compactor -> Model";
@@ -117,6 +131,20 @@ export type MemoryRuntimeOptions = {
 
 type ContextMessage = ContextEvent["messages"][number];
 
+/** The wait widget's lifecycle: shown after a delay, cleared as one unit. */
+type WaitWidget = { stop(): void };
+
+/** The previous exchange the view carries after `<chat>`, verbatim. */
+type LastExchange = {
+  /**
+   * The user's words as injected: clipped with the block, so an omitted middle
+   * is never counted as seen by the gate.
+   */
+  user: string;
+  /** The clipped block body; `viewMessage` supplies the tag. */
+  text: string;
+};
+
 /** One turn's frozen view: what the request injects until the next prompt. */
 type FrozenTurn = {
   /** The rendered 4-line blocks, in order. */
@@ -125,6 +153,8 @@ type FrozenTurn = {
   lines: ViewLine[];
   /** The last context-producing entry before the prompt, or none when fresh. */
   anchor: string | null;
+  /** The previous exchange, or none on the first turn. */
+  exchange: LastExchange | undefined;
   /** Fixed with the freeze, so every call in the turn injects the same message. */
   timestamp: number;
   /** Set when the tail cannot be mapped: the rest of the turn stays native. */
@@ -219,6 +249,8 @@ export function registerMemoryRuntime(
    * rebuilds that record, cannot repeat the notice.
    */
   let providerNoticeSent = false;
+  /** The latest frozen turn, for the status report. */
+  let lastTurn: MemoryTurnRecord | undefined;
 
   function notify(
     ctx: ExtensionContext,
@@ -239,6 +271,15 @@ export function registerMemoryRuntime(
     const memory = active;
     if (!memory) return;
     active = undefined;
+    lastTurn = undefined;
+    // A role change or project switch can deactivate outside shutdown, so a
+    // widget or footer owned by this session must not outlive ownership. A
+    // stale ctx must never block the lock release below.
+    try {
+      clearMemoryUi(memory.ctx);
+    } catch {
+      // Teardown is best-effort; stopping and closing still must run.
+    }
     try {
       memory.compactor.stop();
     } catch {
@@ -366,6 +407,7 @@ export function registerMemoryRuntime(
               cacheWrite: usage.cacheWrite,
               attempts: usage.attempts,
               retries: usage.retries,
+              ms: usage.ms,
             });
           },
         });
@@ -480,6 +522,8 @@ export function registerMemoryRuntime(
       // The anchor is read before the wait: whatever lands while waiting is
       // part of the turn's tail, never only of the view.
       const anchor = anchorOf(ctx);
+      // The exchange is read with the anchor, so a late message cannot change it.
+      const exchange = lastExchange(ctx, anchor);
       // The store appends each logged leaf and completes the batches the built
       // nodes unblock, so the 128 KB bound and `view.json` are already current;
       // the freeze below is the turn boundary the request depends on.
@@ -491,27 +535,83 @@ export function registerMemoryRuntime(
       // one is still being summarized.
       const grace = new AbortController();
       const timer = setTimeout(() => grace.abort(), settleGraceMs);
+      // The pending count is read before the wait; `ms` brackets the wait only.
+      const pending = memory.compactor.unbuilt(memory.store.view.T - 1);
+      const started = Date.now();
+      let skipped = false;
+      let widget: WaitWidget | undefined;
       try {
+        if (ctx.mode === "tui" && ctx.hasUI)
+          widget = startWaitWidget(
+            ctx,
+            started,
+            () => memory.compactor.unbuilt(memory.store.view.T - 1),
+            () => {
+              skipped = true;
+              grace.abort();
+            },
+          );
+        // Keep the `AbortSignal.any`: a real turn signal would abort the wait,
+        // even though `before_agent_start` has no run for Esc to abort today.
         const signal = ctx.signal
           ? AbortSignal.any([ctx.signal, grace.signal])
           : grace.signal;
         await memory.compactor.whenSettled(memory.store.view.T - 1, signal);
       } finally {
         clearTimeout(timer);
+        // Unblock the turn even if widget teardown throws.
         memory.freezing = false;
+        widget?.stop();
       }
       // Every line the wait built is in the view; a line the grace gave up on
       // renders as a placeholder.
+      const blocks = memory.store.renderChatBlocks();
+      const placeholders = countPlaceholders(blocks);
       memory.frozen = {
-        blocks: memory.store.renderChatBlocks(),
+        blocks,
         lines: memory.store.view.chat,
         anchor,
+        exchange,
         timestamp: Date.now(),
         fallback: false,
       };
+      // The footer keeps the placeholder count for the turn; the next freeze
+      // that has none clears it. A session torn down mid-wait stops here.
+      if (owning() === memory) setPlaceholderStatus(ctx, placeholders);
+      // `settled` also covers `whenSettled` giving up because every pending
+      // node failed: `placeholders` is the cross-check for that case. A skip is
+      // the user's Esc; an expiry is the grace giving up.
+      recordTurn(memory, {
+        ms: Date.now() - started,
+        outcome: skipped
+          ? "aborted"
+          : ctx.signal?.aborted
+            ? "aborted"
+            : grace.signal.aborted
+              ? "expired"
+              : "settled",
+        pending,
+        placeholders,
+        viewBytes: frozenViewBytes(blocks),
+      });
     } catch {
       // A store or compactor failure must not fail the turn.
       memory.frozen = undefined;
+    }
+  }
+
+  /**
+   * Records one frozen turn: the in-memory copy feeds the status report, and
+   * the session custom entry is the durable ledger the report script reads. It
+   * carries no prompt or view text.
+   */
+  function recordTurn(memory: ActiveMemory, record: MemoryTurnRecord): void {
+    if (owning() !== memory) return;
+    lastTurn = record;
+    try {
+      pi.appendEntry(TURN_ENTRY_TYPE, record);
+    } catch {
+      // A session being torn down does not get a ledger entry.
     }
   }
 
@@ -680,12 +780,18 @@ export function registerMemoryRuntime(
       // ones a bare `stop()` would throw away and redo on the next start.
       try {
         await memory.compactor.drain(SHUTDOWN_DRAIN_MS, () => {
-          if (ctx?.hasUI)
-            notify(
-              ctx,
-              `finishing in-flight summaries (up to ${SHUTDOWN_DRAIN_MS / 1000} s)`,
-              "info",
-            );
+          if (!ctx?.hasUI) return;
+          let inFlight = 0;
+          try {
+            inFlight = memory.compactor.stats().inFlight;
+          } catch {
+            // A compactor whose counters cannot be read still drained.
+          }
+          notify(
+            ctx,
+            `Project memory: finishing ${inFlight} in-flight summar${inFlight === 1 ? "y" : "ies"} (up to ${SHUTDOWN_DRAIN_MS / 1000} s)`,
+            "info",
+          );
         });
       } catch {
         // A drain that fails still has to release the lock below.
@@ -703,6 +809,11 @@ export function registerMemoryRuntime(
       active: memory !== undefined,
       failing: failures.at(-1),
       outcome: activationOutcome,
+      turn: memory ? lastTurn : undefined,
+      stats: memory?.compactor.stats(),
+      viewBytes: memory
+        ? Buffer.byteLength(memory.store.renderChat(), "utf8")
+        : undefined,
     };
   }
 
@@ -724,6 +835,190 @@ function listedProject(cwd: string): string | undefined {
   if (projects.length === 0) return undefined;
   const match = matchProject(cwd, projects);
   return match.listed ? match.project : undefined;
+}
+
+/** The frozen chat view's rendered byte length, wrappers included. */
+function frozenViewBytes(blocks: readonly string[]): number {
+  return Buffer.byteLength(
+    [VIEW_OPEN, ...blocks, VIEW_CLOSE].join("\n"),
+    "utf8",
+  );
+}
+
+/** Placeholder lines in the frozen view, one per line that is still unbuilt. */
+function countPlaceholders(blocks: readonly string[]): number {
+  let count = 0;
+  for (const block of blocks)
+    for (const line of block.split("\n"))
+      if (line.includes(UNBUILT_LINE)) count += 1;
+  return count;
+}
+
+/**
+ * The wait widget: nothing for the first 500 ms, then one line refreshed every
+ * second, with a bare Esc consumed to skip the wait. `stop()` clears the
+ * widget, its timers and its key listener together, so Esc is native again the
+ * moment the wait ends and a throwing freeze still removes the listener.
+ */
+function startWaitWidget(
+  ctx: ExtensionContext,
+  started: number,
+  pending: () => number,
+  onSkip: () => void,
+): WaitWidget {
+  let shown = false;
+  let refresh: ReturnType<typeof setInterval> | undefined;
+  let stopInput: (() => void) | undefined;
+  // shortcut: a plain string[] gets no terminal width, so DESIGN §7's
+  // responsive shortening is left to Pi's own wrap; upgrade to a component
+  // factory if the extension UI ever exposes the width.
+  let count = 0;
+  const render = () => {
+    try {
+      count = pending();
+    } catch {
+      // A store that cannot be read keeps the last count on screen.
+    }
+    const seconds = Math.floor((Date.now() - started) / 1000);
+    const line = `Memory: waiting for ${count} summar${count === 1 ? "y" : "ies"} from the last turn · ${seconds} s · Esc to skip`;
+    try {
+      ctx.ui.setWidget(MEMORY_UI_KEY, [line]);
+      shown = true;
+    } catch {
+      // A UI that cannot take a widget must not fail the turn.
+    }
+  };
+  const delay = setTimeout(() => {
+    render();
+    refresh = setInterval(render, WAIT_WIDGET_REFRESH_MS);
+    try {
+      stopInput = ctx.ui.onTerminalInput((data) => {
+        // Kitty and modifyOtherKeys send Esc as `\x1b[27u` / `\x1b[27;1u`;
+        // `matchesKey` accepts those and a bare `\x1b`, and nothing else.
+        if (!matchesKey(data, "escape")) return undefined;
+        onSkip();
+        return { consume: true };
+      });
+    } catch {
+      stopInput = undefined;
+    }
+  }, WAIT_WIDGET_DELAY_MS);
+  return {
+    stop() {
+      clearTimeout(delay);
+      if (refresh !== undefined) clearInterval(refresh);
+      if (shown) {
+        try {
+          ctx.ui.setWidget(MEMORY_UI_KEY, undefined);
+        } catch {
+          // Widget teardown is best-effort during UI failure or shutdown.
+        }
+      }
+      try {
+        stopInput?.();
+      } catch {
+        // A listener that cannot be removed must not fail the turn.
+      }
+    },
+  };
+}
+
+/** The footer's placeholder line, or its removal when the turn has none. */
+function setPlaceholderStatus(
+  ctx: ExtensionContext,
+  placeholders: number,
+): void {
+  if (ctx.mode !== "tui" || !ctx.hasUI) return;
+  try {
+    ctx.ui.setStatus(
+      MEMORY_UI_KEY,
+      placeholders === 0
+        ? undefined
+        : `memory: ${placeholders} placeholder${placeholders === 1 ? "" : "s"}`,
+    );
+  } catch {
+    // A UI that cannot take a status must not fail the turn.
+  }
+}
+
+/** Removes both memory surfaces; safe when neither was ever shown. */
+function clearMemoryUi(ctx: ExtensionContext): void {
+  try {
+    if (ctx.mode !== "tui" || !ctx.hasUI) return;
+    try {
+      ctx.ui.setWidget(MEMORY_UI_KEY, undefined);
+    } catch {
+      // Best-effort teardown.
+    }
+    try {
+      ctx.ui.setStatus(MEMORY_UI_KEY, undefined);
+    } catch {
+      // Best-effort teardown.
+    }
+  } catch {
+    // A stale or disposed context cannot accept teardown; nothing to clear.
+  }
+}
+
+/**
+ * The previous user message and the Lead's reply, read from the branch up to
+ * the anchor. The reply is the text parts of the last assistant message only:
+ * never thinking, never a tool call. The block is clipped head and tail like a
+ * tool result, so a huge exchange cannot grow the request without bound.
+ */
+function lastExchange(
+  ctx: ExtensionContext,
+  anchor: string | null,
+): LastExchange | undefined {
+  if (anchor === null) return undefined;
+  const branch = ctx.sessionManager.getBranch();
+  const end = branch.findIndex((entry) => entry.id === anchor);
+  if (end === -1) return undefined;
+  let userAt = -1;
+  for (let index = end; index >= 0; index -= 1)
+    if (messageRole(branch[index]) === "user") {
+      userAt = index;
+      break;
+    }
+  if (userAt === -1) return undefined;
+  const user = messageText(branch[userAt]);
+  if (user === "") return undefined;
+  let lead: string | undefined;
+  for (let index = end; index > userAt; index -= 1) {
+    if (messageRole(branch[index]) !== "assistant") continue;
+    const text = messageText(branch[index]);
+    lead = text === "" ? undefined : text;
+    break;
+  }
+  const body =
+    lead === undefined ? `user: ${user}` : `user: ${user}\nlead: ${lead}`;
+  const text = clipEcho(body, LAST_EXCHANGE_CHARS);
+  return { user: exchangeUserPortion(text, lead !== undefined), text };
+}
+
+/**
+ * The user's words as they appear in the injected block. A reply adds its own
+ * clipped text to the block, and the corpus must not carry that; when the
+ * combined clip dropped the separator, only the head the clip kept is the
+ * user's.
+ */
+function exchangeUserPortion(text: string, hasLead: boolean): string {
+  const body = text.startsWith("user: ") ? text.slice("user: ".length) : text;
+  if (!hasLead) return body;
+  const leadAt = body.indexOf("\nlead: ");
+  return leadAt >= 0 ? body.slice(0, leadAt) : clipHead(body);
+}
+
+/** The role of a message entry, or undefined for any other entry. */
+function messageRole(entry: SessionEntry): string | undefined {
+  if (entry.type !== "message") return undefined;
+  return (entry.message as { role?: string }).role;
+}
+
+/** The concatenated text blocks of a message entry; thinking and calls out. */
+function messageText(entry: SessionEntry): string {
+  if (entry.type !== "message") return "";
+  return contentBlocksText((entry.message as { content?: unknown }).content);
 }
 
 /** A backfilled message keeps its original kind as a text prefix. */
@@ -815,13 +1110,20 @@ function tailCount(
   return after ? count : undefined;
 }
 
-/** The view as one synthetic user message: the wrappers and the blocks. */
+/**
+ * The view as one synthetic user message: the wrappers, the blocks and the
+ * previous exchange. The exchange sits after `</chat>`, so `markViewCache`
+ * keeps its mark on a built view block and never on text that changes each
+ * turn.
+ */
 function viewMessage(frozen: FrozenTurn): ContextMessage {
-  return {
-    role: "user",
-    content: viewParts(frozen.blocks),
-    timestamp: frozen.timestamp,
-  };
+  const content = viewParts(frozen.blocks);
+  if (frozen.exchange !== undefined)
+    content.push({
+      type: "text",
+      text: `<last_exchange>\n${frozen.exchange.text}\n</last_exchange>\n`,
+    });
+  return { role: "user", content, timestamp: frozen.timestamp };
 }
 
 function closeQuietly(store: MemoryStore): void {
@@ -1028,7 +1330,13 @@ function turnCorpus(
     else toolEntries.push(raw);
   }
   const zoom = zoomEntries.join("\n");
-  const user = userEntries.join("\n");
+  // The previous exchange rides in the view message verbatim, so values the
+  // user typed last turn count as seen; the Lead's own reply stays out.
+  const previous = frozen.exchange?.user ?? "";
+  const user =
+    previous === ""
+      ? userEntries.join("\n")
+      : [previous, ...userEntries].join("\n");
   const tool = toolEntries.join("\n");
   const system = systemPromptOf(ctx);
   const text = `${system}\n${zoom}\n${user}\n${tool}`;
@@ -1344,7 +1652,8 @@ function boundedImages(images: readonly ImageContent[]): {
 }
 
 function imageBlocks(entry: SessionEntry | FileEntry): ImageContent[] {
-  if (entry.type === "message") return imageContent(entry.message.content);
+  if (entry.type === "message")
+    return imageContent((entry.message as { content?: unknown }).content);
   if (entry.type === "custom_message") return imageContent(entry.content);
   return [];
 }

@@ -560,7 +560,7 @@ mock.module("typebox", {
           ...(options as object),
         };
       },
-      Optional: (value: object) =>
+      Optional: (value: Record<string, unknown>) =>
         Object.defineProperty({ ...value }, "~optional", { value: true }),
       String: (options: unknown = {}) => ({ type: "string", ...options }),
       Boolean: (options: unknown = {}) => ({ type: "boolean", ...options }),
@@ -642,6 +642,10 @@ export type Context = {
     notify: () => void;
     select: () => Promise<string>;
     setWidget?: (key: string, content: WidgetContent) => void;
+    setStatus?: (key: string, text: string | undefined) => void;
+    onTerminalInput?: (
+      handler: (data: string) => { consume?: boolean; data?: string } | undefined,
+    ) => () => void;
     custom?: (...args: unknown[]) => Promise<unknown>;
   };
 };
@@ -754,6 +758,8 @@ export function fakeContext(
       confirm: async () => true,
       setWidget: (_key: string, content: WidgetContent) =>
         assertWidgetContent(content),
+      setStatus: () => undefined,
+      onTerminalInput: () => () => undefined,
       custom: async () => undefined,
     },
   };

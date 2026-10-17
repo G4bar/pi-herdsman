@@ -623,14 +623,15 @@ function armLine(label, row) {
     `(reasoning ${row.tokens.reasoning}), $${row.tokens.cost.toFixed(4)}, ` +
     `over-512 ${percent(row.overLeafShare)}, lossy ${percent(row.lossyShare)}, ` +
     `retention ${row.retention.share.toFixed(3)} (${row.retention.kept}/${row.retention.total}), ` +
+    `mean ${Math.round(row.meanNodeBytes)} B/line, ` +
     `mean ${Math.round(row.meanCallMs)}ms/call`
   );
 }
 
 function markdownTable(rows) {
   const header =
-    "| arm | sent | calls | leaf/merge | attempts/call | output | reasoning | USD | over-512 | lossy | retention | uuid | ref | number | path | code | mean latency |\n" +
-    "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |";
+    "| arm | sent | calls | leaf/merge | attempts/call | output | reasoning | USD | over-512 | lossy | bytes/line | retention | uuid | ref | number | path | code | mean latency |\n" +
+    "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |";
   const lines = rows.map(({ arm, sent, row, leaf, merge }) =>
     [
       arm,
@@ -643,6 +644,7 @@ function markdownTable(rows) {
       row.tokens.cost.toFixed(4),
       percent(row.overLeafShare),
       percent(row.lossyShare),
+      Math.round(row.meanNodeBytes),
       `${row.retention.share.toFixed(3)} (${row.retention.kept}/${row.retention.total})`,
       `${row.byClass.uuid.share.toFixed(3)} (${row.byClass.uuid.kept}/${row.byClass.uuid.total})`,
       `${row.byClass.ref.share.toFixed(3)} (${row.byClass.ref.kept}/${row.byClass.ref.total})`,

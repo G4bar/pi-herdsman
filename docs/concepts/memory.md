@@ -69,6 +69,15 @@ for one line is split over several messages in a row. A summary that dropped
 exact values ends with the `…[ids]` marker, so the Lead knows to zoom before
 using them.
 
+Before a turn starts, Herdsman waits briefly for the previous turn's summaries,
+up to 3 seconds. A terminal shows `Memory: waiting for N summaries from the
+last turn · N s · Esc to skip` after half a second; Esc skips the wait, and the
+turn runs with the placeholder for every line not built yet, with the count in
+the footer row `memory: N placeholders`. The message also carries the previous
+exchange verbatim, after the view, in `<last_exchange>` tags: the user's
+message and the Lead's reply, so the last turn costs little while its lines are
+still placeholders.
+
 The view is sent as 4-line blocks, and cross-turn view caching relies on
 provider prefix caching: on Anthropic, Herdsman adds one cache mark at the last
 fully built block of the view.
@@ -147,10 +156,10 @@ extension-registered is told this once when memory goes active.
 
 Compaction costs about two model calls per logged message.
 
-Quitting, reloading, or replacing a session waits up to 20 seconds for the
+Quitting, reloading, or replacing a session waits up to 5 seconds for the
 summaries still in flight, so the work already paid for is written instead of
-repeated; a session with a UI says it is finishing them. Anything unfinished
-after that is rebuilt on the next start.
+repeated; a session with a UI says how many it is finishing. Anything
+unfinished after that is rebuilt on the next start.
 
 ## Cost and trade-offs
 
@@ -161,6 +170,13 @@ DeepSeek-family models only, memory recalled clearly more than a fresh session
 but no more than continuing the same session, at several times the cost.
 Summaries keep only part of the exact identifiers they cover, so exact values
 need `zoom`, and the store grows without bound because nothing is deleted.
+
+Each session also writes a measurement ledger that never reaches the model:
+`pi-herdsman-memory-usage` for every compaction build and
+`pi-herdsman-memory-turn` for every turn freeze.
+`node scripts/memory-report.mjs <session.jsonl>` sums them into wait
+percentiles, placeholder and retry rates, and the Lead's and the compactor's
+cache-read shares.
 
 ## Roles and storage
 

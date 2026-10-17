@@ -76,7 +76,9 @@ export const MEMORY_LEAD_PROMPT = `${MEMORY_VIEW_DESCRIPTION}
    will matter later.
 5. Never wait for background work (no sleep, no polling). Continue, or end the
    turn and say what is running.
-6. Never make anything look further along than it was.`;
+6. Never make anything look further along than it was.
+7. A <last_exchange> block after the view repeats the previous user message and
+   your reply to it, verbatim.`;
 
 /** The leaf task: compress one whole message into a line. */
 export function compressTask(input: {

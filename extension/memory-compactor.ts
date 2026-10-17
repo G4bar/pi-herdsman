@@ -53,7 +53,9 @@ export const FAILED_RETRY_INTERVAL = 8;
  * How long shutdown waits for the calls already in flight, before `stop()`
  * aborts the rest and their results are dropped. Not configurable.
  */
-export const SHUTDOWN_DRAIN_MS = 20_000;
+export const SHUTDOWN_DRAIN_MS = 5_000;
+/** How many builds `stats()` sums over: a ring buffer, never node text. */
+export const USAGE_WINDOW = 100;
 
 export type MemoryCompactorUsage = {
   line: ViewLine;
@@ -68,6 +70,28 @@ export type MemoryCompactorUsage = {
   /** One build attempt plus every over-length retry. */
   attempts: number;
   retries: number;
+  /** Wall time from launch to the final attempt, in ms. */
+  ms: number;
+};
+
+/** The compactor's live counters and its last-100-builds window. */
+export type MemoryCompactorStats = {
+  /** Built summary lines in the current view. */
+  built: number;
+  /** Nodes covering the view that still need a build. */
+  pending: number;
+  /** Nodes that failed since their last build. */
+  failing: number;
+  /** Builds in flight right now. */
+  inFlight: number;
+  /** Builds in the window. */
+  calls: number;
+  input: number;
+  cacheRead: number;
+  cacheWrite: number;
+  retries: number;
+  /** The latest failure's time (epoch ms) and first message line. */
+  lastError: { at: number; message: string } | undefined;
 };
 
 export type MemoryCompactorFailure = {
@@ -134,6 +158,10 @@ export type MemoryCompactor = {
   drain(timeoutMs?: number, onWait?: () => void): Promise<void>;
   /** Aborts every call in flight. Nothing partial is appended. */
   stop(): void;
+  /** The live counters and the last-100-builds window. */
+  stats(): MemoryCompactorStats;
+  /** How many nodes covering messages 0..upToIndex are still unbuilt. */
+  unbuilt(upToIndex: number): number;
 };
 
 class CompactionFailure extends Error {}
@@ -233,6 +261,11 @@ class CompactorRunner implements MemoryCompactor {
   private pumping = false;
   private repump = false;
   private onMessages = 0;
+  /** The last `USAGE_WINDOW` usage records, as a ring buffer. */
+  private readonly usage: MemoryCompactorUsage[] = [];
+  private usageAt = 0;
+  private usageCount = 0;
+  private lastError: { at: number; message: string } | undefined;
   private warmKey: string | undefined;
   private warmGate: Promise<void> | undefined;
   private warmRelease: (() => void) | undefined;
@@ -441,6 +474,7 @@ class CompactorRunner implements MemoryCompactor {
   }
 
   private async run(job: MemoryJob): Promise<void> {
+    const started = Date.now();
     const line = jobLine(job);
     const inputs = this.store.nodeInputs(line);
     if (!inputs) {
@@ -481,13 +515,16 @@ class CompactorRunner implements MemoryCompactor {
     // failed model call or requeue the node.
     try {
       this.callbacks.onNodeBuilt?.(line, text);
-      this.callbacks.onUsage?.({
+      const record: MemoryCompactorUsage = {
         line,
         ...usage,
         kind: inputs.kind === "message" ? "leaf" : "merge",
         attempts: built.retries + 1,
         retries: built.retries,
-      });
+        ms: Date.now() - started,
+      };
+      this.recordUsage(record);
+      this.callbacks.onUsage?.(record);
     } catch {
       // Swallowed on purpose: the build already happened.
     }
@@ -595,8 +632,53 @@ class CompactorRunner implements MemoryCompactor {
     }
   }
 
+  private recordUsage(usage: MemoryCompactorUsage): void {
+    this.usage[this.usageAt] = usage;
+    this.usageAt = (this.usageAt + 1) % USAGE_WINDOW;
+    if (this.usageCount < USAGE_WINDOW) this.usageCount += 1;
+  }
+
+  stats(): MemoryCompactorStats {
+    const totals = { input: 0, cacheRead: 0, cacheWrite: 0, retries: 0 };
+    for (let index = 0; index < this.usageCount; index += 1) {
+      const entry = this.usage[index]!;
+      totals.input += entry.input;
+      totals.cacheRead += entry.cacheRead;
+      totals.cacheWrite += entry.cacheWrite;
+      totals.retries += entry.retries;
+    }
+    const view = this.store.view;
+    let built = 0;
+    for (const line of view.chat)
+      if (this.store.nodeText(line) !== undefined) built += 1;
+    return {
+      built,
+      pending: this.unbuilt(view.T - 1),
+      failing: this.failures.size,
+      inFlight: this.slots,
+      calls: this.usageCount,
+      ...totals,
+      lastError: this.lastError,
+    };
+  }
+
+  /**
+   * How many nodes covering messages 0..upToIndex are still unbuilt, using the
+   * same predicate as `isSettled`. The wait widget shows this count.
+   */
+  unbuilt(upToIndex: number): number {
+    if (upToIndex < 0) return 0;
+    const from = this.builtThrough();
+    if (from > upToIndex) return 0;
+    let count = 0;
+    for (const node of frontier(from, upToIndex + 1))
+      if (this.store.nodeText(node) === undefined) count += 1;
+    return count;
+  }
+
   private fail(job: MemoryJob, error: string): void {
     const key = jobKey(job);
+    this.lastError = { at: Date.now(), message: firstLine(error) };
     const failures = (this.failures.get(key) ?? 0) + 1;
     this.failures.set(key, failures);
     this.retry.push(job);
@@ -652,6 +734,13 @@ function jobLine(job: MemoryJob): ViewLine {
 
 function jobKey(job: MemoryJob): string {
   return nodeJobKey(jobLine(job));
+}
+
+/** The first non-empty line of an error, as `Last error` shows it. */
+function firstLine(message: string): string {
+  return (
+    message.split("\n").find((line) => line.trim() !== "") ?? "unknown error"
+  );
 }
 
 /** Matches `MemoryStore`'s internal job key for a node. */

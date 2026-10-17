@@ -285,6 +285,10 @@ type LeadRuntimeOptions = {
   queueLeadPresentation(ctx: ExtensionContext, name: string): void;
 };
 
+/** The compactor Thinking row help, shared by Definitions and Project memory. */
+const COMPACTOR_THINKING_HELP =
+  "Thinking level for project memory compactions. When unset, compactions use the bundled default, low.";
+
 /** The compactor Model row help, shared by Definitions and Project memory. */
 const COMPACTOR_MODEL_HELP =
   "Model for project memory compactions. There is no default; project memory stays off until a model is chosen.";
@@ -1318,6 +1322,10 @@ type LeadMemoryMenuHost = LeadMemoryStatusHost &
       ctx: ExtensionCommandContext,
       definition: AgentDefinition,
     ): Promise<{ cancelled: boolean; value: string | undefined }>;
+    chooseDefinitionThinking(
+      ctx: ExtensionCommandContext,
+      definition: AgentDefinition,
+    ): Promise<{ cancelled: boolean; value: string | undefined }>;
     applyDefinitionOverride(
       ctx: ExtensionCommandContext,
       definition: AgentDefinition,
@@ -1375,6 +1383,21 @@ async function openLeadMemoryMenu(
     );
     return chosen.value === undefined ? "unset" : "set";
   };
+  const chooseThinking = async (): Promise<void> => {
+    const definition = compactor();
+    const chosen = await host.chooseDefinitionThinking(ctx, definition);
+    if (chosen.cancelled) return;
+    await host.applyDefinitionOverride(
+      ctx,
+      definition,
+      "thinking",
+      chosen.value,
+      async (name) => {
+        const current = compactor();
+        return current.name === name ? current : undefined;
+      },
+    );
+  };
   let selectedRow = "status";
   while (true) {
     // Re-read on every iteration: the model picker and the enable flow
@@ -1405,6 +1428,12 @@ async function openLeadMemoryMenu(
         description: status.model ?? "unset",
         help: COMPACTOR_MODEL_HELP,
       },
+      {
+        value: "compactor-thinking",
+        label: "Compactor thinking",
+        description: status.thinking ?? "low",
+        help: COMPACTOR_THINKING_HELP,
+      },
     ];
     // A confirmed enable drops the row, so fall back to Status.
     if (!rows.some((row) => row.value === selectedRow)) selectedRow = "status";
@@ -1428,7 +1457,8 @@ async function openLeadMemoryMenu(
       } else if (next) selectedRow = next;
       continue;
     }
-    await chooseModel();
+    if (selected === "compactor-thinking") await chooseThinking();
+    else await chooseModel();
   }
 }
 
@@ -1752,7 +1782,7 @@ export function createLeadCommandRuntime(host: LeadCommandHost) {
                       help: managedDefinition
                         ? "Thinking level for future managed Lead launches. Changes do not affect a running Lead."
                         : compactorDefinition
-                          ? "Thinking level for project memory compactions. When unset, compactions use the bundled default, low."
+                          ? COMPACTOR_THINKING_HELP
                           : "Thinking level for future Agent generations. When unset, fresh delegation inherits the spawning controller and continuation restores the saved session level.",
                     },
                   ]
@@ -1820,49 +1850,12 @@ export function createLeadCommandRuntime(host: LeadCommandHost) {
             value = chosen.value;
           } else if (action === "thinking") {
             field = "thinking";
-            await ctx.modelRegistry.refresh();
-            const configured =
-              typeof definition.frontmatter.model === "string"
-                ? definition.frontmatter.model
-                : undefined;
-            const model = configured
-              ? resolveConfiguredModel(ctx, configured)
-              : ctx.model;
-            const levels = model
-              ? getSupportedThinkingLevels(model)
-              : [...host.validThinkingLevels];
-            const configuredThinking =
-              definition.frontmatter.thinking === false
-                ? "off"
-                : typeof definition.frontmatter.thinking === "string"
-                  ? definition.frontmatter.thinking
-                  : undefined;
-            const thinkingItems = [
-              {
-                value: "inherit",
-                label: compactorDefinition
-                  ? "Default (low)"
-                  : "Inherit current session",
-              },
-              ...levels.map((level: string) => ({
-                value: level,
-                label: level,
-              })),
-            ];
-            if (configuredThinking && !levels.includes(configuredThinking))
-              thinkingItems.push({
-                value: configuredThinking,
-                label: configuredThinking,
-              });
-            const selectedThinking = await host.selectMenu(
+            const chosen = await this.chooseDefinitionThinking(
               ctx,
-              "Thinking",
-              thinkingItems,
-              configuredThinking ?? "inherit",
+              definition,
             );
-            if (!selectedThinking) continue;
-            value =
-              selectedThinking === "inherit" ? undefined : selectedThinking;
+            if (chosen.cancelled) continue;
+            value = chosen.value;
           } else if (action === "enabled") {
             field = "enabled";
             value = !host.agentDefinitionEnabled(definition);
@@ -1956,6 +1949,55 @@ export function createLeadCommandRuntime(host: LeadCommandHost) {
           selectedModel === "inherit" || selectedModel === "unset"
             ? undefined
             : selectedModel,
+      };
+    },
+    /** The shared Thinking picker, used by Definitions and Project memory. */
+    async chooseDefinitionThinking(
+      ctx: ExtensionCommandContext,
+      definition: AgentDefinition,
+    ): Promise<{ cancelled: boolean; value: string | undefined }> {
+      await ctx.modelRegistry.refresh();
+      const configured =
+        typeof definition.frontmatter.model === "string"
+          ? definition.frontmatter.model
+          : undefined;
+      const model = configured
+        ? resolveConfiguredModel(ctx, configured)
+        : ctx.model;
+      const levels = model
+        ? getSupportedThinkingLevels(model)
+        : [...host.validThinkingLevels];
+      const configuredThinking =
+        definition.frontmatter.thinking === false
+          ? "off"
+          : typeof definition.frontmatter.thinking === "string"
+            ? definition.frontmatter.thinking
+            : undefined;
+      const thinkingItems = [
+        {
+          value: "inherit",
+          label:
+            definition.name === COMPACTOR_DEFINITION_NAME
+              ? "Default (low)"
+              : "Inherit current session",
+        },
+        ...levels.map((level: string) => ({ value: level, label: level })),
+      ];
+      if (configuredThinking && !levels.includes(configuredThinking))
+        thinkingItems.push({
+          value: configuredThinking,
+          label: configuredThinking,
+        });
+      const selected = await host.selectMenu(
+        ctx,
+        "Thinking",
+        thinkingItems,
+        configuredThinking ?? "inherit",
+      );
+      if (!selected) return { cancelled: true, value: undefined };
+      return {
+        cancelled: false,
+        value: selected === "inherit" ? undefined : selected,
       };
     },
     /**
@@ -2250,6 +2292,8 @@ export function createLeadCommandRuntime(host: LeadCommandHost) {
         ...host,
         chooseDefinitionModel: (ctx, definition) =>
           this.chooseDefinitionModel(ctx, definition),
+        chooseDefinitionThinking: (ctx, definition) =>
+          this.chooseDefinitionThinking(ctx, definition),
         applyDefinitionOverride: (ctx, definition, field, value, resolve) =>
           this.applyDefinitionOverride(ctx, definition, field, value, resolve),
       });

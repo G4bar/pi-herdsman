@@ -35,6 +35,7 @@ import {
 import type {
   MemoryCompactor,
   MemoryCompactorOptions,
+  MemoryCompactorStats,
 } from "./memory-compactor.ts";
 import {
   TURN_SETTLE_GRACE_MS,
@@ -45,10 +46,17 @@ import {
 import {
   projectMemoryStatus,
   type MemoryRuntimeSnapshot,
+  type MemoryTurnRecord,
   type ProjectMemoryRole,
   type ProjectMemoryStatus,
 } from "./memory-status.ts";
-import { fakeContext, fakePi, PI_AGENTS_DIR } from "./support.ts";
+import {
+  fakeContext,
+  fakePi,
+  PI_AGENTS_DIR,
+  type Context as FakeContext,
+  type WidgetContent,
+} from "./support.ts";
 import { herdsmanConfigPath } from "./storage.ts";
 
 // --- fixtures ---------------------------------------------------------------
@@ -77,6 +85,14 @@ test.after(() => {
 function withProjects(paths: string[]): void {
   updateConfig("memoryProjects", paths);
 }
+
+/** Real-time wait, for the widget's delayed appearance. */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** The wait widget and the placeholder footer share this key. */
+const MEMORY_UI_KEY = "pi-herdsman-memory";
 
 function entryBase(parentId: string | null) {
   entryCounter += 1;
@@ -131,10 +147,38 @@ class FakeCompactor implements MemoryCompactor {
   signals: (AbortSignal | undefined)[] = [];
   messages = 0;
   stopped = false;
+  /** The active `whenSettled` waiters, woken by `stop` like the real one. */
+  private readonly waiters = new Set<() => void>();
   /** When true, `whenSettled` only ends with the signal. */
   hang = false;
   /** Runs at the start of `whenSettled`, so a test can build during the wait. */
   duringSettle: (() => void) | undefined;
+  /** The count `unbuilt` reports, for the wait-widget path. */
+  pendingNodes = 0;
+  /** When true, `unbuilt` throws, as a read of a closed store would. */
+  unbuiltThrows = false;
+  /** The counters `stats()` reports; the default is an empty window. */
+  statsValue: MemoryCompactorStats = {
+    built: 0,
+    pending: 0,
+    failing: 0,
+    inFlight: 0,
+    calls: 0,
+    input: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    retries: 0,
+    lastError: undefined,
+  };
+
+  stats(): MemoryCompactorStats {
+    return this.statsValue;
+  }
+
+  unbuilt(_upToIndex: number): number {
+    if (this.unbuiltThrows) throw new Error("the store is closed");
+    return this.pendingNodes;
+  }
 
   constructor(store: MemoryStore, options: MemoryCompactorOptions) {
     this.store = store;
@@ -167,16 +211,24 @@ class FakeCompactor implements MemoryCompactor {
     this.duringSettle?.();
     if (!this.hang) return;
     await new Promise<void>((resolve) => {
-      if (signal?.aborted) {
+      const wake = () => {
+        this.waiters.delete(wake);
+        signal?.removeEventListener("abort", wake);
         resolve();
+      };
+      if (signal?.aborted || this.stopped) {
+        wake();
         return;
       }
-      signal?.addEventListener("abort", () => resolve(), { once: true });
+      this.waiters.add(wake);
+      signal?.addEventListener("abort", wake, { once: true });
     });
   }
 
   stop(): void {
     this.stopped = true;
+    // The real compactor wakes every waiter on stop, so shutdown ends a hang.
+    for (const wake of [...this.waiters]) wake();
   }
 }
 
@@ -190,6 +242,16 @@ class TestSession {
   signal: AbortSignal | undefined;
   /** Whether the context claims a UI, which gates the user-visible notices. */
   hasUI = false;
+  /** When true, the context's `mode` getter throws, as a stale Pi ctx does. */
+  throwingMode = false;
+  /** The widget content last set per key, for the wait widget. */
+  readonly widgets = new Map<string, string[] | undefined>();
+  /** The footer status last set per key, for the placeholder count. */
+  readonly statuses = new Map<string, string | undefined>();
+  /** The live terminal input handlers, in registration order. */
+  readonly inputHandlers: ((
+    data: string,
+  ) => { consume?: boolean; data?: string } | undefined)[] = [];
   /** The final system prompt the gate may count as seen. */
   systemPrompt = "";
   /** How often the gate read the prompt, so a corpus cache hit is visible. */
@@ -223,6 +285,23 @@ class TestSession {
           type: args[1] as string | undefined,
         });
       },
+      setWidget: (key: string, content: WidgetContent) => {
+        this.widgets.set(key, Array.isArray(content) ? content : undefined);
+      },
+      setStatus: (key: string, text: string | undefined) => {
+        this.statuses.set(key, text);
+      },
+      onTerminalInput: (
+        handler: (
+          data: string,
+        ) => { consume?: boolean; data?: string } | undefined,
+      ) => {
+        this.inputHandlers.push(handler);
+        return () => {
+          const at = this.inputHandlers.indexOf(handler);
+          if (at >= 0) this.inputHandlers.splice(at, 1);
+        };
+      },
     };
     context.sessionManager = {
       getSessionId: () => "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -238,6 +317,12 @@ class TestSession {
         ),
     } as unknown as typeof context.sessionManager;
     const extended = context as unknown as ExtensionContext;
+    if (this.throwingMode)
+      Object.defineProperty(extended, "mode", {
+        get() {
+          throw new Error("stale context");
+        },
+      });
     (extended as { signal?: AbortSignal }).signal = this.signal;
     (extended as { model?: unknown }).model = this.model;
     extended.modelRegistry = {
@@ -298,7 +383,7 @@ class Harness {
   ): Promise<unknown[]> {
     const results: unknown[] = [];
     for (const handler of this.pi.events.get(name) ?? [])
-      results.push(await handler(event, ctx));
+      results.push(await handler(event, ctx as unknown as FakeContext));
     return results;
   }
 
@@ -452,13 +537,14 @@ function built(line: ViewLine) {
     cacheWrite: 0,
     attempts: 1,
     retries: 0,
+    ms: 0,
   };
 }
 
 // --- tests ------------------------------------------------------------------
 
-test("the settle grace is 30 seconds", () => {
-  assert.equal(TURN_SETTLE_GRACE_MS, 30_000);
+test("the settle grace is 3 seconds", () => {
+  assert.equal(TURN_SETTLE_GRACE_MS, 3_000);
 });
 
 test("memory applies to an ordinary Lead only", () => {
@@ -992,6 +1078,102 @@ test("the status report is the five lines of DESIGN §4.5", async () => {
   }
 });
 
+test("the status report adds the ledger lines only when active", () => {
+  const project = projectDir();
+  withProjects([project]);
+  const session = new TestSession({
+    cwd: project,
+    file: "/sessions/report-lines.jsonl",
+  });
+  const ctx = session.context();
+
+  // Inactive keeps the five lines of DESIGN §4.5.
+  const inactive = projectMemoryStatus(ctx, {
+    role: "lead",
+    runtime: { active: false, failing: undefined, outcome: undefined },
+  });
+  assert.equal(inactive.report.split("\n").length, 5);
+
+  // Active with no turn yet and no builds: the empty states of §4.3.
+  const empty = projectMemoryStatus(ctx, {
+    role: "lead",
+    runtime: { active: true, failing: undefined, outcome: undefined },
+  });
+  assert.deepEqual(empty.report.split("\n").slice(5), [
+    "Last turn: none yet",
+    "View: 0 KB of 128 KB",
+    "Summaries: 0 built",
+    "Compactor: no calls yet",
+  ]);
+
+  const full = projectMemoryStatus(ctx, {
+    role: "lead",
+    runtime: {
+      active: true,
+      failing: undefined,
+      outcome: undefined,
+      turn: {
+        ms: 4200,
+        outcome: "settled",
+        pending: 2,
+        placeholders: 2,
+        viewBytes: 58_000,
+      },
+      stats: {
+        built: 1204,
+        pending: 3,
+        failing: 1,
+        inFlight: 1,
+        calls: 100,
+        input: 1000,
+        cacheRead: 470,
+        cacheWrite: 0,
+        retries: 3,
+        lastError: {
+          at: new Date(2026, 0, 1, 14, 2).getTime(),
+          message: "429 rate limited",
+        },
+      },
+      viewBytes: 58_000,
+    },
+  });
+  assert.deepEqual(full.report.split("\n").slice(5), [
+    "Last turn: waited 4.2 s · 2 placeholders",
+    "View: 58 KB of 128 KB",
+    "Summaries: 1,204 built · 3 pending · 1 failing",
+    "Compactor, last 100 calls: 32% cache read · 3 retried",
+    "Last error: 14:02 · 429 rate limited",
+  ]);
+
+  // Zero pending and failing are omitted; no error drops the last line.
+  const quiet = projectMemoryStatus(ctx, {
+    role: "lead",
+    runtime: {
+      active: true,
+      failing: undefined,
+      outcome: undefined,
+      stats: {
+        built: 5,
+        pending: 0,
+        failing: 0,
+        inFlight: 0,
+        calls: 5,
+        input: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        retries: 0,
+        lastError: undefined,
+      },
+    },
+  });
+  assert.deepEqual(quiet.report.split("\n").slice(5), [
+    "Last turn: none yet",
+    "View: 0 KB of 128 KB",
+    "Summaries: 5 built",
+    "Compactor, last 100 calls: cache read n/a",
+  ]);
+});
+
 test("no compactor model leaves the session native, with one notice and no lock", async () => {
   const project = projectDir();
   withProjects([project]);
@@ -1200,16 +1382,18 @@ test("a drain that waits notifies once, and only with a UI", async () => {
     session.hasUI = hasUI;
     const harness = new Harness();
     await harness.sessionStart(session);
-    harness.compactors[0]!.drainWaits = true;
+    const compactor = harness.compactors[0]!;
+    compactor.drainWaits = true;
+    compactor.statsValue = { ...compactor.statsValue, inFlight: 2 };
 
     await harness.shutdown(session, "quit");
 
     assert.equal(session.notices.length, hasUI ? 1 : 0, `hasUI=${hasUI}`);
     if (hasUI) {
       assert.equal(session.notices[0]!.type, "info");
-      assert.match(
+      assert.equal(
         session.notices[0]!.message,
-        /^finishing in-flight summaries/,
+        `Project memory: finishing 2 in-flight summaries (up to 5 s)`,
       );
     }
   }
@@ -1399,7 +1583,12 @@ test("the view replaces history and the tail follows the anchor", async () => {
   const view = injected.messages[0];
   assert.equal(view.role, "user");
   assert.equal(view.content[0].text, "<chat>\n");
-  assert.equal(view.content[view.content.length - 1].text, "</chat>\n");
+  // The close tag, then the previous exchange the turn carries verbatim.
+  assert.equal(view.content[view.content.length - 2].text, "</chat>\n");
+  assert.equal(
+    view.content[view.content.length - 1].text,
+    "<last_exchange>\nuser: first message\n</last_exchange>\n",
+  );
   assert.ok(
     view.content
       .slice(1, -1)
@@ -1564,6 +1753,86 @@ test("a node built during the grace is in the frozen view", async () => {
   await harness.shutdown(session, "quit");
 });
 
+test("a settled turn appends a ledger entry with its counts", async () => {
+  const project = projectDir();
+  withProjects([project]);
+  const long = userEntry("x".repeat(600));
+  const session = new TestSession({
+    cwd: project,
+    file: "/sessions/ledger.jsonl",
+    entries: [long],
+  });
+  session.branch = [long];
+  const harness = new Harness();
+  await harness.sessionStart(session);
+  const compactor = harness.compactors[0];
+  compactor.pendingNodes = 2;
+  compactor.duringSettle = () =>
+    compactor.store.appendNode([0, 0], "built summary");
+
+  await harness.beforeAgentStart(session);
+
+  const entry = harness.pi.entries.find(
+    (candidate: any) => candidate.customType === "pi-herdsman-memory-turn",
+  ) as { data: MemoryTurnRecord } | undefined;
+  assert.ok(entry);
+  assert.equal(entry.data.outcome, "settled");
+  assert.equal(entry.data.pending, 2);
+  assert.equal(entry.data.placeholders, 0);
+  assert.ok(entry.data.ms >= 0);
+  assert.ok(entry.data.viewBytes > 0);
+  // The in-memory copy is what the status report reads.
+  assert.deepEqual(harness.runtime.snapshot().turn, entry.data);
+  await harness.shutdown(session, "quit");
+});
+
+test("an aborted turn records its outcome", async () => {
+  const project = projectDir();
+  withProjects([project]);
+  const prompt = userEntry("first message");
+  const session = new TestSession({
+    cwd: project,
+    file: "/sessions/aborted.jsonl",
+    entries: [prompt],
+  });
+  session.branch = [prompt];
+  const harness = new Harness({ hang: true, settleGraceMs: 20 });
+  await harness.sessionStart(session);
+
+  const controller = new AbortController();
+  session.signal = controller.signal;
+  const waiting = harness.beforeAgentStart(session);
+  controller.abort();
+  await waiting;
+
+  const turn = harness.runtime.snapshot().turn;
+  assert.ok(turn);
+  assert.equal(turn.outcome, "aborted");
+  await harness.shutdown(session, "quit");
+});
+
+test("an expired turn records its placeholders and outcome", async () => {
+  const project = projectDir();
+  withProjects([project]);
+  const long = userEntry("x".repeat(600));
+  const session = new TestSession({
+    cwd: project,
+    file: "/sessions/expired.jsonl",
+    entries: [long],
+  });
+  session.branch = [long];
+  const harness = new Harness({ hang: true, settleGraceMs: 20 });
+  await harness.sessionStart(session);
+
+  await harness.beforeAgentStart(session);
+
+  const turn = harness.runtime.snapshot().turn;
+  assert.ok(turn);
+  assert.equal(turn.outcome, "expired");
+  assert.equal(turn.placeholders, 1);
+  await harness.shutdown(session, "quit");
+});
+
 test("a batch whose parent is unbuilt waits out the grace with placeholders", async () => {
   const project = projectDir();
   withProjects([project]);
@@ -1603,6 +1872,277 @@ test("a batch whose parent is unbuilt waits out the grace with placeholders", as
     .join("\n");
   assert.match(view, /0\+1\|note: user: mmm/);
   assert.match(view, /255\+1\|\(not summarized yet: zoom it\)/);
+  await harness.shutdown(session, "quit");
+});
+
+test("the wait widget appears after 500 ms and clears when the wait ends", async () => {
+  const project = projectDir();
+  withProjects([project]);
+  const prompt = userEntry("first message");
+  const session = new TestSession({
+    cwd: project,
+    file: "/sessions/widget.jsonl",
+    entries: [prompt],
+  });
+  session.branch = [prompt];
+  session.hasUI = true;
+  const harness = new Harness({ hang: true, settleGraceMs: 700 });
+  await harness.sessionStart(session);
+
+  const waiting = harness.beforeAgentStart(session);
+  await sleep(50);
+  assert.equal(session.widgets.get(MEMORY_UI_KEY), undefined);
+  assert.equal(session.inputHandlers.length, 0);
+  await sleep(550);
+  const shown = session.widgets.get(MEMORY_UI_KEY);
+  assert.ok(shown);
+  assert.equal(shown.length, 1);
+  assert.match(
+    shown[0],
+    /^Memory: waiting for \d+ summar(y|ies) from the last turn · \d+ s · Esc to skip$/,
+  );
+  await waiting;
+  assert.equal(session.widgets.get(MEMORY_UI_KEY), undefined);
+  await harness.shutdown(session, "quit");
+});
+
+test("Esc skips the wait and is consumed only while the widget is up", async () => {
+  // A bare Esc and the Kitty / modifyOtherKeys spellings all skip.
+  for (const esc of ["\x1b", "\x1b[27u", "\x1b[27;1u"]) {
+    const project = projectDir();
+    withProjects([project]);
+    const prompt = userEntry("first message");
+    const session = new TestSession({
+      cwd: project,
+      file: "/sessions/esc.jsonl",
+      entries: [prompt],
+    });
+    session.branch = [prompt];
+    session.hasUI = true;
+    const harness = new Harness({ hang: true, settleGraceMs: 5_000 });
+    await harness.sessionStart(session);
+
+    const waiting = harness.beforeAgentStart(session);
+    await sleep(550);
+    assert.equal(session.inputHandlers.length, 1);
+    // Only Esc skips; every other key passes through.
+    assert.equal(session.inputHandlers[0]("a"), undefined);
+    assert.equal(session.inputHandlers[0]("\x1b[A"), undefined);
+    assert.deepEqual(session.inputHandlers[0](esc), { consume: true });
+    await waiting;
+    // The listener leaves with the widget, so Esc is native again.
+    assert.equal(session.widgets.get(MEMORY_UI_KEY), undefined);
+    assert.equal(session.inputHandlers.length, 0);
+    const turn = harness.runtime.snapshot().turn;
+    assert.ok(turn);
+    assert.equal(turn.outcome, "aborted");
+    assert.ok(turn.ms < 5_000, `Esc ended the wait after ${turn.ms}ms`);
+    await harness.shutdown(session, "quit");
+  }
+});
+
+test("a pending count that throws does not crash the wait widget", async () => {
+  const project = projectDir();
+  withProjects([project]);
+  const prompt = userEntry("first message");
+  const session = new TestSession({
+    cwd: project,
+    file: "/sessions/widget-throw.jsonl",
+    entries: [prompt],
+  });
+  session.branch = [prompt];
+  session.hasUI = true;
+  const harness = new Harness({ hang: true, settleGraceMs: 700 });
+  await harness.sessionStart(session);
+  const compactor = harness.compactors[0];
+  // The initial count succeeds; only the timer's refresh reads a closed store.
+  compactor.duringSettle = () => {
+    compactor.unbuiltThrows = true;
+  };
+
+  const waiting = harness.beforeAgentStart(session);
+  await sleep(600);
+  // The refresh threw internally; the widget is still up and the wait ends.
+  assert.ok(session.widgets.get(MEMORY_UI_KEY));
+  await waiting;
+  assert.equal(session.widgets.get(MEMORY_UI_KEY), undefined);
+  await harness.shutdown(session, "quit");
+});
+
+test("a role change clears the footer placeholder status", async () => {
+  const project = projectDir();
+  withProjects([project]);
+  const long = userEntry("x".repeat(600));
+  const session = new TestSession({
+    cwd: project,
+    file: "/sessions/role.jsonl",
+    entries: [long],
+  });
+  session.branch = [long];
+  session.hasUI = true;
+  let ordinary = true;
+  const harness = new Harness({ isOrdinaryLead: () => ordinary });
+  await harness.sessionStart(session);
+  await harness.beforeAgentStart(session);
+  assert.equal(session.statuses.get(MEMORY_UI_KEY), "memory: 1 placeholder");
+
+  ordinary = false;
+  assert.equal(harness.runtime.isActive(), false);
+  assert.equal(session.statuses.get(MEMORY_UI_KEY), undefined);
+});
+
+test("a stale context does not block lock release on deactivate", async () => {
+  const project = projectDir();
+  withProjects([project]);
+  const session = new TestSession({
+    cwd: project,
+    file: "/sessions/stale-ctx.jsonl",
+  });
+  session.throwingMode = true;
+  let ordinary = true;
+  const harness = new Harness({ isOrdinaryLead: () => ordinary });
+  await harness.sessionStart(session);
+  const compactor = harness.compactors[0];
+
+  // Reading the stale ctx's `mode` throws, but teardown must still run.
+  ordinary = false;
+  assert.equal(harness.runtime.isActive(), false);
+  assert.equal(compactor.stopped, true);
+  // The store closed, so its lock is free again.
+  const reopened = new MemoryStore(project);
+  reopened.close();
+});
+
+test("a shutdown during the wait clears the widget and the status", async () => {
+  const project = projectDir();
+  withProjects([project]);
+  const long = userEntry("x".repeat(600));
+  const session = new TestSession({
+    cwd: project,
+    file: "/sessions/shutdown-wait.jsonl",
+    entries: [long],
+  });
+  session.branch = [long];
+  session.hasUI = true;
+  const harness = new Harness({ hang: true, settleGraceMs: 5_000 });
+  await harness.sessionStart(session);
+
+  const waiting = harness.beforeAgentStart(session);
+  await sleep(550);
+  assert.ok(session.widgets.get(MEMORY_UI_KEY));
+
+  await harness.shutdown(session, "quit");
+  await waiting;
+  assert.equal(session.widgets.get(MEMORY_UI_KEY), undefined);
+  assert.equal(session.statuses.get(MEMORY_UI_KEY), undefined);
+  assert.equal(session.inputHandlers.length, 0);
+});
+
+test("the footer status carries the placeholder count and clears at the next freeze", async () => {
+  const project = projectDir();
+  withProjects([project]);
+  const long = userEntry("x".repeat(600));
+  const session = new TestSession({
+    cwd: project,
+    file: "/sessions/status.jsonl",
+    entries: [long],
+  });
+  session.branch = [long];
+  session.hasUI = true;
+  const harness = new Harness();
+  await harness.sessionStart(session);
+
+  await harness.beforeAgentStart(session);
+  assert.equal(session.statuses.get(MEMORY_UI_KEY), "memory: 1 placeholder");
+
+  const compactor = harness.compactors[0];
+  compactor.duringSettle = () =>
+    compactor.store.appendNode([0, 0], "built summary");
+  await harness.beforeAgentStart(session);
+  assert.equal(session.statuses.get(MEMORY_UI_KEY), undefined);
+  await harness.shutdown(session, "quit");
+});
+
+test("the previous exchange rides after the view and is absent without a user message", async () => {
+  const project = projectDir();
+  withProjects([project]);
+  const user = userEntry("hello there");
+  const reply = assistantEntry("hi back", user.id);
+  const session = new TestSession({
+    cwd: project,
+    file: "/sessions/exchange.jsonl",
+    entries: [user, reply],
+  });
+  session.branch = [user, reply];
+  const harness = new Harness();
+  await harness.sessionStart(session);
+  await harness.beforeAgentStart(session);
+
+  const injected = await harness.context(session, []);
+  assert.ok(injected);
+  const content = injected.messages[0].content;
+  const closeAt = content.findIndex((block: any) => block.text === "</chat>\n");
+  assert.ok(closeAt > 0);
+  assert.equal(content.length, closeAt + 2);
+  assert.equal(
+    content[content.length - 1].text,
+    "<last_exchange>\nuser: hello there\nlead: hi back\n</last_exchange>\n",
+  );
+  await harness.shutdown(session, "quit");
+
+  // A turn with no previous user message carries no exchange block.
+  const workProject = projectDir();
+  withProjects([workProject]);
+  const work = {
+    ...entryBase(null),
+    type: "custom_message",
+    customType: "team-report",
+    content: [{ type: "text", text: "a work report" }],
+    display: false,
+  } as unknown as SessionEntry;
+  const workSession = new TestSession({
+    cwd: workProject,
+    file: "/sessions/work.jsonl",
+    entries: [work],
+  });
+  workSession.branch = [work];
+  const workHarness = new Harness();
+  await workHarness.sessionStart(workSession);
+  await workHarness.beforeAgentStart(workSession);
+  const workInjected = await workHarness.context(workSession, []);
+  assert.ok(workInjected);
+  assert.ok(
+    workInjected.messages[0].content.every(
+      (block: any) => !String(block.text).includes("<last_exchange>"),
+    ),
+  );
+  await workHarness.shutdown(workSession, "quit");
+});
+
+test("the previous exchange is clipped head and tail", async () => {
+  const project = projectDir();
+  withProjects([project]);
+  const user = userEntry("hello");
+  const reply = assistantEntry("y".repeat(20_000), user.id);
+  const session = new TestSession({
+    cwd: project,
+    file: "/sessions/clip.jsonl",
+    entries: [user, reply],
+  });
+  session.branch = [user, reply];
+  const harness = new Harness();
+  await harness.sessionStart(session);
+  await harness.beforeAgentStart(session);
+
+  const injected = await harness.context(session, []);
+  assert.ok(injected);
+  const content = injected.messages[0].content;
+  const exchange = content[content.length - 1].text as string;
+  assert.match(exchange, /characters omitted/);
+  assert.ok(
+    exchange.length <= 16 * 1024 + 64,
+    `the exchange is ${exchange.length} characters`,
+  );
   await harness.shutdown(session, "quit");
 });
 
@@ -2481,7 +3021,12 @@ function viewLabel(harness: Harness, value: string): string {
 }
 
 test("the gate blocks a strict UUID that only the view holds", async () => {
-  const { session, harness } = await gateSession([`session ${GATE_UUID}`]);
+  // The UUID is in an older view line, not in the last exchange, so the
+  // previous user text cannot carry it.
+  const { session, harness } = await gateSession([
+    `session ${GATE_UUID}`,
+    "next question",
+  ]);
   const result = await harness.toolCall(session, "continue_agent", {
     session: GATE_UUID,
     task: "continue",
@@ -2522,6 +3067,92 @@ test("a UUID the user typed this turn passes, whatever its case", async () => {
   await harness.shutdown(session, "quit");
 });
 
+test("a value in the omitted middle of the previous user text is not corpus text", async () => {
+  const project = projectDir();
+  withProjects([project]);
+  // The UUID sits in the middle `clipEcho` drops from the exchange block.
+  const user = userEntry(
+    `${"x".repeat(20_000)}${GATE_UUID}${"y".repeat(20_000)}`,
+  );
+  const reply = assistantEntry("ok", user.id);
+  const session = new TestSession({
+    cwd: project,
+    file: "/sessions/gate-clip.jsonl",
+    entries: [user, reply],
+  });
+  session.branch = [user, reply];
+  const harness = new Harness();
+  await harness.sessionStart(session);
+  await harness.beforeAgentStart(session);
+
+  const blocked = await harness.toolCall(session, "continue_agent", {
+    session: GATE_UUID,
+    task: "continue",
+  });
+  assert.equal(blocked.block, true);
+  await harness.shutdown(session, "quit");
+});
+
+test("the gate sees only the user text the combined clip kept", async () => {
+  const project = projectDir();
+  withProjects([project]);
+  // The user is under the limit, but the long reply clips the combined block
+  // through the middle of the user text; the UUID there was never injected.
+  const user = userEntry(
+    `${"u".repeat(9_000)}${GATE_UUID}${"u".repeat(1_000)}`,
+  );
+  const reply = assistantEntry("l".repeat(40_000), user.id);
+  const session = new TestSession({
+    cwd: project,
+    file: "/sessions/gate-combined-clip.jsonl",
+    entries: [user, reply],
+  });
+  session.branch = [user, reply];
+  const harness = new Harness();
+  await harness.sessionStart(session);
+  await harness.beforeAgentStart(session);
+
+  const blocked = await harness.toolCall(session, "continue_agent", {
+    session: GATE_UUID,
+    task: "continue",
+  });
+  assert.equal(blocked.block, true);
+  await harness.shutdown(session, "quit");
+});
+
+test("the gate accepts the previous user text but not the previous assistant text", async () => {
+  const project = projectDir();
+  withProjects([project]);
+  const user = userEntry(`user holds ${GATE_UUID}`);
+  const reply = assistantEntry(`assistant invented ${OTHER_UUID}`, user.id);
+  const session = new TestSession({
+    cwd: project,
+    file: "/sessions/gate-exchange.jsonl",
+    entries: [user, reply],
+  });
+  session.branch = [user, reply];
+  const harness = new Harness();
+  await harness.sessionStart(session);
+  await harness.beforeAgentStart(session);
+
+  // The previous user text rides in `<last_exchange>`, so its UUID passes.
+  assert.equal(
+    await harness.toolCall(session, "continue_agent", {
+      session: GATE_UUID,
+      task: "continue",
+    }),
+    undefined,
+  );
+  // The Lead's own reply is not corpus text, so its UUID is blocked.
+  const blocked = await harness.toolCall(session, "continue_agent", {
+    session: OTHER_UUID,
+    task: "continue",
+  });
+  assert.equal(blocked.block, true);
+  assert.match(blocked.reason, /not seen verbatim this turn/);
+  await harness.shutdown(session, "quit");
+});
+
 test("a ref the user typed this turn is allowed", async () => {
   const { session, harness } = await gateSession(["opening"]);
   pushEntry(session, userEntry("use result:researcher#1", lastId(session)));
@@ -2551,6 +3182,7 @@ test("a ref that appears nowhere is blocked as not in the view", async () => {
 test("an edit path only the view holds is blocked until a read shows it", async () => {
   const { project, session, harness } = await gateSession([
     "see docs/notes.md",
+    "what next?",
   ]);
   const relativePath = "docs/notes.md";
   const absolutePath = join(project, relativePath);
@@ -2580,6 +3212,7 @@ test("an edit path only the view holds is blocked until a read shows it", async 
 test("write creates a new file but is blocked on an existing one held by the view", async () => {
   const { project, session, harness } = await gateSession([
     "overwrite existing.md",
+    "ok",
   ]);
   assert.equal(
     await harness.toolCall(session, "write", { path: "new.md", content: "x" }),
@@ -2801,7 +3434,7 @@ test("a value past the echo clip is still in the corpus", async () => {
 
 test("the view lookup for a UUID ignores case", async () => {
   const upper = LETTER_UUID.toUpperCase();
-  const { session, harness } = await gateSession([`session ${upper}`]);
+  const { session, harness } = await gateSession([`session ${upper}`, "next"]);
   const result = await harness.toolCall(session, "continue_agent", {
     session: LETTER_UUID,
     task: "continue",
@@ -3039,6 +3672,7 @@ test("usage entries are appended per compaction", async () => {
     cacheWrite: 4,
     attempts: 2,
     retries: 1,
+    ms: 25,
   });
   assert.deepEqual(
     harness.pi.entries.filter(
@@ -3058,6 +3692,7 @@ test("usage entries are appended per compaction", async () => {
           cacheWrite: 4,
           attempts: 2,
           retries: 1,
+          ms: 25,
         },
       },
     ],

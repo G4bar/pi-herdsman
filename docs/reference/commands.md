@@ -193,8 +193,9 @@ compaction cost, and that the change takes effect at the next session start,
 then adds the resolved path to `memoryProjects`. When no compactor model is
 chosen, the compactor Model picker opens immediately after.
 
-`Compactor model` shows the configured model (or `unset`) and opens the same
-picker as `Definitions` → `compactor` → `Model`.
+`Compactor model` shows the configured model (or `unset`) and `Compactor
+thinking` shows the configured thinking level (or `low`); each opens the same
+picker as the matching field under `Definitions` → `compactor`.
 
 See [Project memory](../guides/project-memory.md).
 
