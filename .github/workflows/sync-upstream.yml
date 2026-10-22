@@ -30,6 +30,8 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/boadij/pi-herdsman.git
+          git remote add fork git@github.com:G4bar/pi-herdsman.git
           git fetch upstream main
+          git fetch fork '+refs/heads/main:refs/remotes/fork/main'
           git rebase upstream/main
-          git push git@github.com:G4bar/pi-herdsman.git HEAD:main
+          git push --force-with-lease fork HEAD:main
