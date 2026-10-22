@@ -1,5 +1,6 @@
-# Fork maintenance: keep main rebased on the upstream project. Rewrites the fork's
-# history (force-with-lease) whenever this fork carries its own commits.
+# Fork maintenance: keep main a fast-forward mirror of the upstream project.
+# Uses GitHub's merge-upstream API because GITHUB_TOKEN cannot push workflow-file
+# changes. Fails (visible notification) if this fork ever carries its own commit on main.
 name: sync-upstream
 on:
   schedule:
@@ -11,19 +12,10 @@ concurrency:
   group: sync-upstream
   cancel-in-progress: false
 jobs:
-  rebase:
+  sync:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: main
-          fetch-depth: 0
-      - name: Rebase main onto upstream and push
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git remote add upstream https://github.com/boadij/pi-herdsman.git
-          git fetch upstream main
-          git rebase upstream/main
-          git push --force-with-lease origin HEAD:main
+      - name: Fast-forward main from upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X POST "repos/${{ github.repository }}/merge-upstream" -f branch=main --jq '.message'
