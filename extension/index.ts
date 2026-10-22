@@ -54,6 +54,8 @@ import {
   parseControlMarker,
   readRequest,
   readAgentState,
+  readPendingAsk,
+  readResult,
   scanAgentStates,
   removeRequest,
   removeAsk,
@@ -173,7 +175,20 @@ import {
   validateIdentity,
   validateAssignmentRequest,
   visibleAgentCapabilities,
+  parsePresentationTokens,
 } from "./agent-controller.ts";
+import {
+  HERDSMAN_COMMAND_ACTIONS,
+  HERDSMAN_SNAPSHOT_VERSION,
+  HERDSMAN_STATUS_KEY,
+  createHerdsmanStatusFeed,
+  herdsmanRpcAgent,
+  registerHerdsmanCommand,
+  type HerdsmanCommandAction,
+  type HerdsmanRpcAgent,
+  type HerdsmanRpcAgentSource,
+  type HerdsmanRpcSnapshot,
+} from "./rpc-state.ts";
 import {
   acquireProcessLock,
   claimAssignmentLock as claimManagedAssignmentLock,
@@ -664,6 +679,66 @@ type StopReportCallbacks = {
   onCleanupFailure?: (label: string, message: string) => void;
 };
 
+function herdsmanPendingAsk(
+  mailbox: string,
+  state: ManagedAgentState,
+): HerdsmanRpcAgentSource["pendingAsk"] {
+  if (!state.pendingAskId) return undefined;
+  try {
+    const ask = readPendingAsk(mailbox, state);
+    return ask
+      ? {
+          question: ask.question,
+          files: (ask.resultBindings ?? []).map((binding) => binding.ref),
+        }
+      : undefined;
+  } catch {
+    // Malformed ask evidence must not break the state feed.
+    return undefined;
+  }
+}
+
+function herdsmanAgentResult(
+  mailbox: string,
+  state: ManagedAgentState,
+): HerdsmanRpcAgentSource["result"] {
+  const requestId = state.completedRequestId;
+  if (!requestId) return undefined;
+  try {
+    const result = readResult(mailbox, requestId);
+    if (!result) return undefined;
+    return {
+      status: result.status,
+      ...(result.text ? { text: result.text } : {}),
+      ...(result.error ? { error: result.error.message } : {}),
+      completedAt: result.completedAt,
+      resultRef: resultRef(requestId),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/** `/hm` drives the same controller operations the agent tools drive. */
+function herdsmanCommandParams(
+  action: HerdsmanCommandAction,
+  params: { agent: string; message?: string },
+  controller: NonNullable<ReturnType<typeof registerLeadRuntime>["controller"]>,
+): Params {
+  if (action === "close") return { action: "close", agent: params.agent };
+  if (action === "continue") {
+    // continue_agent resumes an exact saved session, so the label is resolved first.
+    const session = controller
+      .listAgentStates()
+      .find(({ state }) => state.agentLabel === params.agent)
+      ?.state.piSessionFile;
+    if (!session)
+      throw new Error(`Agent ${params.agent} has no resumable Pi session`);
+    return { action: "continue", session, task: params.message! };
+  }
+  return { action, agent: params.agent, message: params.message! };
+}
+
 export default function (pi: ExtensionAPI): void {
   let leadRuntimes!: ReturnType<typeof registerLeadRuntime>;
   let leadStatusRuntime: ReturnType<
@@ -672,6 +747,7 @@ export default function (pi: ExtensionAPI): void {
   let leadHerdRunRuntime!: NonNullable<
     ReturnType<typeof registerLeadRuntime>["herdRunRuntime"]
   >;
+  let herdsmanFeed: ReturnType<typeof createHerdsmanStatusFeed> | undefined;
 
   const agentEnvError =
     process.env.PI_HERDSMAN_MAILBOX !== undefined
@@ -890,7 +966,10 @@ export default function (pi: ExtensionAPI): void {
         }
       })(),
     appendError: (ctx, kind, error) => appendDurableError(pi, ctx, kind, error),
-    onChanged: () => leadStatusRuntime.requestRefresh(),
+    onChanged: () => {
+      leadStatusRuntime.requestRefresh();
+      herdsmanFeed?.request();
+    },
     reportWatcherError: (ctx, error) => {
       if (
         error instanceof OperationError &&
@@ -2189,6 +2268,80 @@ export default function (pi: ExtensionAPI): void {
       leadRuntimes.controller!.registerTools(
         controllerScope.kind === "root" ? leadHerdRunRuntime.begin : undefined,
       );
+      const herdsmanController = leadRuntimes.controller!;
+      const herdsmanCapabilities = [...HERDSMAN_COMMAND_ACTIONS];
+      const loadHerdsmanSnapshot = async (
+        ctx: ExtensionContext,
+      ): Promise<HerdsmanRpcSnapshot> => {
+        const view = await herdsmanController.agentSnapshotView(
+          ctx,
+          { kind: "root" },
+          herdsmanController.sessionSignal(),
+          false,
+          true,
+        );
+        const starting = new Set(
+          herdsmanController.pendingStartEntries().map(({ label }) => label),
+        );
+        const agents: HerdsmanRpcAgent[] = view.visible.map((snapshot) => {
+          const state = snapshot.state;
+          const mailbox = agentMailboxPath(state.workspaceId, state.agentLabel);
+          const runtime = herdsmanController.runtimeForLabel(state.agentLabel);
+          const presentation = parsePresentationTokens(snapshot.listed.tokens);
+          return herdsmanRpcAgent({
+            label: state.agentLabel,
+            definition: snapshot.agentDefinition,
+            parentLabel: snapshot.parentLabel,
+            projection: starting.has(state.agentLabel)
+              ? "starting"
+              : String(snapshot.listed.state),
+            stale: snapshot.listed.stale === true,
+            pendingAsk: herdsmanPendingAsk(mailbox, state),
+            result: herdsmanAgentResult(mailbox, state),
+            task: presentation.task ?? runtime?.task,
+            startedAt: presentation.startedAt ?? runtime?.startedAt,
+            resumable: controllerPersistedTranscriptReady(state, (path) => {
+              const file = statSync(path, { throwIfNoEntry: false });
+              return !!file?.isFile() && file.size > 0;
+            }),
+          });
+        });
+        return {
+          v: HERDSMAN_SNAPSHOT_VERSION,
+          capabilities: herdsmanCapabilities,
+          agents,
+        };
+      };
+      // TUI mode keeps its own surface: the footer would show the raw JSON and
+      // `/hm` exists for the RPC client, which drives the same controller ops.
+      pi.on("session_start", (_event: unknown, ctx: ExtensionContext) => {
+        herdsmanFeed?.dispose();
+        herdsmanFeed = undefined;
+        if (ctx.mode !== "rpc" || !ctx.hasUI) return;
+        registerHerdsmanCommand({
+          registerCommand: (name, command) => pi.registerCommand(name, command),
+          capabilities: () => herdsmanCapabilities,
+          notify: (target, message, type) => target.ui.notify(message, type),
+          run: async (action, params, target) => {
+            await herdsmanController.action(
+              target,
+              herdsmanCommandParams(action, params, herdsmanController),
+              herdsmanController.sessionSignal(),
+            );
+          },
+        });
+        const feed = createHerdsmanStatusFeed({
+          load: () => loadHerdsmanSnapshot(ctx),
+          publish: (snapshot) =>
+            ctx.ui.setStatus(HERDSMAN_STATUS_KEY, snapshot),
+        });
+        herdsmanFeed = feed;
+        feed.request();
+      });
+      pi.on("session_shutdown", () => {
+        herdsmanFeed?.dispose();
+        herdsmanFeed = undefined;
+      });
       if (controllerScope.kind === "root") {
         pi.registerTool({
           ...supervisorTool,
