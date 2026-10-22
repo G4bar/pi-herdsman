@@ -1,21 +1,35 @@
-# Fork maintenance: keep main a fast-forward mirror of the upstream project.
-# Uses GitHub's merge-upstream API because GITHUB_TOKEN cannot push workflow-file
-# changes. Fails (visible notification) if this fork ever carries its own commit on main.
+# Fork maintenance: keep main rebased on the upstream project. Pushes with a
+# repo-scoped deploy key because GITHUB_TOKEN is refused for workflow-file changes.
 name: sync-upstream
 on:
   schedule:
     - cron: "17 4 * * *"
   workflow_dispatch:
 permissions:
-  contents: write
+  contents: read
 concurrency:
   group: sync-upstream
   cancel-in-progress: false
 jobs:
-  sync:
+  rebase:
     runs-on: ubuntu-latest
     steps:
-      - name: Fast-forward main from upstream
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Rebase main onto upstream and push
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh api -X POST "repos/${{ github.repository }}/merge-upstream" -f branch=main --jq '.message'
+          SYNC_KEY: ${{ secrets.SYNC_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SYNC_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/boadij/pi-herdsman.git
+          git fetch upstream main
+          git rebase upstream/main
+          git push git@github.com:G4bar/pi-herdsman.git HEAD:main
