@@ -6,9 +6,12 @@
  * as an `extension_ui_request`. TUI mode publishes nothing: there the footer
  * would show the raw JSON.
  *
- * `toolCalls` and `tokens` are not part of the snapshot: Herdsman keeps no
- * per-agent usage counters in mailbox state, and reading every agent transcript
- * on each publish would cost far more than the feed is worth.
+ * Three fields of the design are omitted because Herdsman keeps no source for
+ * them: `toolCalls` and `tokens` (no per-agent usage counters in mailbox state,
+ * and reading every agent transcript on each publish would cost far more than
+ * the feed is worth) and `activity` (only the current request is kept; recent
+ * work rows only exist inside the agent pane, which would cost one herdr
+ * inspect call per agent per publish).
  */
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 
@@ -146,13 +149,18 @@ export function herdsmanRpcAgent(
   };
 }
 
-function snapshotBytes(snapshot: HerdsmanRpcSnapshot): number {
-  return Buffer.byteLength(JSON.stringify(snapshot), "utf8");
-}
+type AgentTrim = (agent: HerdsmanRpcAgent) => HerdsmanRpcAgent;
+
+const withoutActivity: AgentTrim = ({ activity: _activity, ...agent }) => agent;
+const withoutText: AgentTrim = ({ answer: _answer, question, ...agent }) => ({
+  ...agent,
+  ...(question ? { question: { text: "", files: question.files } } : {}),
+});
+const withoutTask: AgentTrim = ({ task: _task, ...agent }) => agent;
 
 /**
- * Serializes within the size budget by trimming activity first, then answer and
- * question text. shortcut: an extreme number of agents still needs the agent cap.
+ * Serializes within the size budget by trimming activity, then answer and
+ * question text, then tasks, then the tail of the agent list.
  */
 export function serializeHerdsmanRpcSnapshot(
   snapshot: HerdsmanRpcSnapshot,
@@ -162,23 +170,22 @@ export function serializeHerdsmanRpcSnapshot(
     ...snapshot,
     agents: snapshot.agents.slice(0, AGENT_LIMIT),
   };
-  if (snapshotBytes(bounded) <= limitBytes) return JSON.stringify(bounded);
-  const withoutActivity = {
-    ...bounded,
-    agents: bounded.agents.map(({ activity: _activity, ...agent }) => agent),
-  };
-  if (snapshotBytes(withoutActivity) <= limitBytes)
-    return JSON.stringify(withoutActivity);
-  const withoutText = {
-    ...withoutActivity,
-    agents: withoutActivity.agents.map(
-      ({ answer: _answer, question, ...agent }) => ({
-        ...agent,
-        ...(question ? { question: { text: "", files: question.files } } : {}),
-      }),
-    ),
-  };
-  return JSON.stringify(withoutText);
+  const render = (agents: HerdsmanRpcAgent[]): string =>
+    JSON.stringify({ ...bounded, agents });
+  const fits = (text: string): boolean =>
+    Buffer.byteLength(text, "utf8") <= limitBytes;
+  let agents = bounded.agents;
+  for (const trim of [withoutActivity, withoutText, withoutTask]) {
+    agents = agents.map(trim);
+    const text = render(agents);
+    if (fits(text)) return text;
+  }
+  while (agents.length) {
+    agents = agents.slice(0, -1);
+    const text = render(agents);
+    if (fits(text)) return text;
+  }
+  return render(agents);
 }
 
 /** Opaque timer handle; only the injected timers interpret it. */

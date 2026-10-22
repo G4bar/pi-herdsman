@@ -7,6 +7,7 @@ import {
   setLeadEnvironment,
 } from "./support.ts";
 import {
+  HERDSMAN_SNAPSHOT_LIMIT_BYTES,
   HERDSMAN_STATUS_KEY,
   createHerdsmanStatusFeed,
   herdsmanAgentState,
@@ -191,6 +192,39 @@ test("serializing trims activity and then text to stay inside the limit", () => 
   assert.equal(bounded.agents[0]!.answer, undefined);
   assert.equal(bounded.agents[0]!.resultRef, "result:abc");
   assert.ok(Buffer.byteLength(JSON.stringify(bounded)) <= textLimit);
+});
+
+test("serializing drops tasks and then agents to stay inside the limit", () => {
+  const snapshot = snapshotOf(
+    Array.from({ length: 100 }, (_, index) =>
+      herdsmanRpcAgent({
+        label: `impl_${index}`,
+        projection: "working",
+        task: "t".repeat(500),
+        startedAt: index,
+        activity: Array.from({ length: 20 }, () => "x".repeat(200)),
+      }),
+    ),
+  );
+  const size = (text: string) => Buffer.byteLength(text, "utf8");
+
+  const capped = serializeHerdsmanRpcSnapshot(snapshot);
+  assert.ok(
+    size(capped) <= HERDSMAN_SNAPSHOT_LIMIT_BYTES,
+    `snapshot is ${size(capped)} bytes`,
+  );
+
+  const tightLimit = 4 * 1024;
+  const tight = serializeHerdsmanRpcSnapshot(snapshot, tightLimit);
+  assert.ok(size(tight) <= tightLimit, `snapshot is ${size(tight)} bytes`);
+  const parsed = JSON.parse(tight) as HerdsmanRpcSnapshot;
+  assert.ok(parsed.agents.length > 0);
+  assert.ok(parsed.agents.length < 100);
+  for (const agent of parsed.agents) {
+    assert.equal(agent.task, undefined);
+    assert.equal(agent.activity, undefined);
+  }
+  assert.equal(parsed.agents[0]!.label, "impl_0");
 });
 
 test("the status feed publishes once per throttle window and coalesces", async () => {
