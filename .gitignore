@@ -14,3 +14,4 @@ dist/
 *.pfx
 /video/
 .local
+plans/
