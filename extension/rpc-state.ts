@@ -6,14 +6,15 @@
  * as an `extension_ui_request`. TUI mode publishes nothing: there the footer
  * would show the raw JSON.
  *
- * Three fields of the design are omitted because Herdsman keeps no source for
- * them: `toolCalls` and `tokens` (no per-agent usage counters in mailbox state,
- * and reading every agent transcript on each publish would cost far more than
- * the feed is worth) and `activity` (only the current request is kept; recent
- * work rows only exist inside the agent pane, which would cost one herdr
- * inspect call per agent per publish).
+ * `activity`, `toolCalls` and `tokens` are not kept in mailbox state: they come
+ * from each agent's own Pi session file, which Pi already persists, through
+ * `herdsmanAgentWork`. The caller reads that file; this module only projects
+ * the entries it parsed.
  */
-import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionCommandContext,
+  SessionEntry,
+} from "@earendil-works/pi-coding-agent";
 
 export const HERDSMAN_STATUS_KEY = "herdsman";
 export const HERDSMAN_SNAPSHOT_VERSION = 1;
@@ -47,6 +48,8 @@ export type HerdsmanRpcAgent = {
   state: HerdsmanAgentState;
   task?: string;
   activity?: string[];
+  toolCalls?: number;
+  tokens?: number;
   startedAt?: number;
   endedAt?: number;
   question?: { text: string; files: string[] };
@@ -79,6 +82,8 @@ export type HerdsmanRpcAgentSource = {
   task?: string;
   startedAt?: number;
   activity?: readonly string[];
+  toolCalls?: number;
+  tokens?: number;
   resumable?: boolean;
 };
 
@@ -133,6 +138,8 @@ export function herdsmanRpcAgent(
     state,
     ...(source.task ? { task: boundText(source.task, TASK_LIMIT_CHARS) } : {}),
     ...(state === "running" && activity.length ? { activity } : {}),
+    ...(source.toolCalls !== undefined ? { toolCalls: source.toolCalls } : {}),
+    ...(source.tokens !== undefined ? { tokens: source.tokens } : {}),
     ...(source.startedAt !== undefined ? { startedAt: source.startedAt } : {}),
     ...(source.result ? { endedAt: source.result.completedAt } : {}),
     ...(source.pendingAsk
@@ -147,6 +154,53 @@ export function herdsmanRpcAgent(
     ...(source.result?.resultRef ? { resultRef: source.result.resultRef } : {}),
     ...(source.resumable ? { resumable: true } : {}),
   };
+}
+
+function toolCallRow(name: string, args: unknown): string {
+  const values =
+    args && typeof args === "object"
+      ? Object.values(args as Record<string, unknown>)
+      : [];
+  const summary = values.find(
+    (value): value is string => typeof value === "string" && !!value.trim(),
+  );
+  const text = summary?.replace(/\s+/gu, " ").trim().slice(0, 80);
+  return text ? `${name} ${text}` : name;
+}
+
+/**
+ * Work rows and counters from an agent's own Pi session entries: its tool calls
+ * and the token usage Pi persisted alongside them.
+ */
+export function herdsmanAgentWork(entries: readonly SessionEntry[]): {
+  activity: string[];
+  toolCalls: number;
+  tokens: number;
+} {
+  const activity: string[] = [];
+  let toolCalls = 0;
+  let tokens = 0;
+  const addTokens = (usage: { totalTokens?: number } | undefined): void => {
+    const total = usage?.totalTokens;
+    if (typeof total === "number" && Number.isFinite(total)) tokens += total;
+  };
+  for (const entry of entries) {
+    if (entry.type === "usage") {
+      addTokens(entry.usage);
+      continue;
+    }
+    if (entry.type !== "message") continue;
+    const message = entry.message;
+    if (message.role === "assistant") {
+      addTokens(message.usage);
+      for (const part of message.content ?? [])
+        if (part.type === "toolCall") {
+          toolCalls += 1;
+          activity.push(toolCallRow(part.name, part.arguments));
+        }
+    } else if (message.role === "toolResult") addTokens(message.usage);
+  }
+  return { activity: activityRows(activity), toolCalls, tokens };
 }
 
 type AgentTrim = (agent: HerdsmanRpcAgent) => HerdsmanRpcAgent;

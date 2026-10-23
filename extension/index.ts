@@ -182,6 +182,7 @@ import {
   HERDSMAN_SNAPSHOT_VERSION,
   HERDSMAN_STATUS_KEY,
   createHerdsmanStatusFeed,
+  herdsmanAgentWork,
   herdsmanRpcAgent,
   registerHerdsmanCommand,
   type HerdsmanCommandAction,
@@ -715,6 +716,40 @@ function herdsmanAgentResult(
       resultRef: resultRef(requestId),
     };
   } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Work rows and counters live in the agent's own Pi session file, so the feed
+ * re-reads it only when the file changed. Pruned per publish to the visible
+ * agents by `loadHerdsmanSnapshot`.
+ */
+const agentWorkCache = new Map<
+  string,
+  { stamp: string; work: ReturnType<typeof herdsmanAgentWork> }
+>();
+
+function readAgentWork(
+  state: ManagedAgentState,
+): ReturnType<typeof herdsmanAgentWork> | undefined {
+  const path = state.piSessionFile;
+  if (!path) return undefined;
+  const file = statSync(path, { throwIfNoEntry: false });
+  if (!file?.isFile()) return undefined;
+  const stamp = `${file.mtimeMs}:${file.size}`;
+  const cached = agentWorkCache.get(path);
+  if (cached?.stamp === stamp) return cached.work;
+  try {
+    // shortcut: one whole-file read per changed transcript, so a very long agent
+    // session costs more per publish; upgrade to tail parsing past a few MB.
+    const work = herdsmanAgentWork(
+      parseSessionEntries(readFileSync(path, "utf8")),
+    );
+    agentWorkCache.set(path, { stamp, work });
+    return work;
+  } catch {
+    // An unreadable transcript must not break the state feed.
     return undefined;
   }
 }
@@ -2285,6 +2320,7 @@ export default function (pi: ExtensionAPI): void {
         );
         const agents: HerdsmanRpcAgent[] = view.visible.map((snapshot) => {
           const state = snapshot.state;
+          const work = readAgentWork(state);
           const mailbox = agentMailboxPath(state.workspaceId, state.agentLabel);
           const runtime = herdsmanController.runtimeForLabel(state.agentLabel);
           const presentation = parsePresentationTokens(snapshot.listed.tokens);
@@ -2300,12 +2336,17 @@ export default function (pi: ExtensionAPI): void {
             result: herdsmanAgentResult(mailbox, state),
             task: presentation.task ?? runtime?.task,
             startedAt: presentation.startedAt ?? runtime?.startedAt,
+            activity: work?.activity,
+            ...(work ? { toolCalls: work.toolCalls, tokens: work.tokens } : {}),
             resumable: controllerPersistedTranscriptReady(state, (path) => {
               const file = statSync(path, { throwIfNoEntry: false });
               return !!file?.isFile() && file.size > 0;
             }),
           });
         });
+        for (const path of agentWorkCache.keys())
+          if (!view.visible.some((agent) => agent.state.piSessionFile === path))
+            agentWorkCache.delete(path);
         return {
           v: HERDSMAN_SNAPSHOT_VERSION,
           capabilities: herdsmanCapabilities,

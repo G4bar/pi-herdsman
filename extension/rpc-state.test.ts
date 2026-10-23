@@ -11,6 +11,7 @@ import {
   HERDSMAN_STATUS_KEY,
   createHerdsmanStatusFeed,
   herdsmanAgentState,
+  herdsmanAgentWork,
   herdsmanRpcAgent,
   parseHerdsmanCommand,
   registerHerdsmanCommand,
@@ -19,6 +20,7 @@ import {
   type HerdsmanRpcAgent,
   type HerdsmanRpcSnapshot,
 } from "./rpc-state.ts";
+import { parseSessionEntries } from "@earendil-works/pi-coding-agent";
 
 function snapshotOf(agents: HerdsmanRpcAgent[]): HerdsmanRpcSnapshot {
   return { v: 1, capabilities: ["steer"], agents };
@@ -151,6 +153,83 @@ test("agent snapshot bounds task, activity, question and answer", () => {
   assert.equal(finished.resumable, true);
 });
 
+test("agent work rows and counters come from the Pi session entries", () => {
+  const lines: string[] = [];
+  for (let index = 0; index < 25; index++)
+    lines.push(
+      JSON.stringify({
+        type: "message",
+        id: `m${index}`,
+        timestamp: index,
+        message: {
+          role: "assistant",
+          content: [
+            { type: "text", text: "working" },
+            {
+              type: "toolCall",
+              id: `c${index}`,
+              name: "read",
+              arguments: { path: `src/file-${index}.ts\nsecond line` },
+            },
+          ],
+          usage: {
+            input: 1,
+            output: 2,
+            cacheRead: 3,
+            cacheWrite: 4,
+            totalTokens: 10,
+          },
+        },
+      }),
+    );
+  lines.push(
+    JSON.stringify({
+      type: "usage",
+      id: "u1",
+      timestamp: 30,
+      provider: "anthropic",
+      model: "claude",
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 7,
+      },
+    }),
+  );
+  const work = herdsmanAgentWork(parseSessionEntries(lines.join("\n")));
+  assert.equal(work.toolCalls, 25);
+  assert.equal(work.tokens, 257);
+  assert.equal(work.activity.length, 20);
+  assert.equal(work.activity[0], "read src/file-5.ts second line");
+  assert.equal(work.activity[19], "read src/file-24.ts second line");
+});
+
+test("agent snapshot carries work rows and counters", () => {
+  const agent = herdsmanRpcAgent({
+    label: "impl_one",
+    projection: "working",
+    activity: ["read src/app.ts"],
+    toolCalls: 14,
+    tokens: 38_000,
+  });
+  assert.deepEqual(agent.activity, ["read src/app.ts"]);
+  assert.equal(agent.toolCalls, 14);
+  assert.equal(agent.tokens, 38_000);
+
+  const finished = herdsmanRpcAgent({
+    label: "impl_two",
+    projection: "settling",
+    result: { status: "completed", completedAt: 2 },
+    toolCalls: 3,
+    tokens: 900,
+  });
+  assert.equal(finished.activity, undefined);
+  assert.equal(finished.toolCalls, 3);
+  assert.equal(finished.tokens, 900);
+});
+
 test("serializing trims activity and then text to stay inside the limit", () => {
   const activitySnapshot = snapshotOf(
     Array.from({ length: 4 }, (_, index) =>
@@ -202,6 +281,8 @@ test("serializing drops tasks and then agents to stay inside the limit", () => {
         projection: "working",
         task: "t".repeat(500),
         startedAt: index,
+        toolCalls: index,
+        tokens: index * 1000,
         activity: Array.from({ length: 20 }, () => "x".repeat(200)),
       }),
     ),
@@ -212,6 +293,15 @@ test("serializing drops tasks and then agents to stay inside the limit", () => {
   assert.ok(
     size(capped) <= HERDSMAN_SNAPSHOT_LIMIT_BYTES,
     `snapshot is ${size(capped)} bytes`,
+  );
+  const cappedFirst = (JSON.parse(capped) as HerdsmanRpcSnapshot).agents;
+  assert.deepEqual(
+    cappedFirst.map((agent) => agent.toolCalls),
+    cappedFirst.map((_agent, index) => index),
+  );
+  assert.deepEqual(
+    cappedFirst.map((agent) => agent.tokens),
+    cappedFirst.map((_agent, index) => index * 1000),
   );
 
   const tightLimit = 4 * 1024;
@@ -225,6 +315,10 @@ test("serializing drops tasks and then agents to stay inside the limit", () => {
     assert.equal(agent.activity, undefined);
   }
   assert.equal(parsed.agents[0]!.label, "impl_0");
+  assert.deepEqual(
+    parsed.agents.map((agent) => agent.toolCalls),
+    parsed.agents.map((_agent, index) => index),
+  );
 });
 
 test("the status feed publishes once per throttle window and coalesces", async () => {
