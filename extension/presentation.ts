@@ -3187,6 +3187,13 @@ function savePrivateOutput(
     return undefined;
   }
 }
+function utf8Head(text: string, maxBytes: number): string {
+  const bytes = Buffer.from(text, "utf8");
+  if (bytes.length <= maxBytes) return text;
+  let end = Math.max(0, maxBytes);
+  while (end > 0 && (bytes[end] & 0xc0) === 0x80) end--;
+  return bytes.subarray(0, end).toString("utf8");
+}
 export function truncateModelText(
   text: string,
   options: {
@@ -3196,6 +3203,8 @@ export function truncateModelText(
     persist?: "completion";
     persistText?: string;
     requestId?: string;
+    /** Optional inline cap, never above the default model limit. */
+    maxBytes?: number;
   },
 ) {
   const completion = options.persist === "completion";
@@ -3209,15 +3218,31 @@ export function truncateModelText(
     : undefined;
   const ref = path ? resultRef(options.requestId ?? options.key) : undefined;
   const persistenceError = completion && !path;
+  // An inline cap must never cost text that has no persisted copy to name.
+  const maxBytes = persistenceError
+    ? DEFAULT_MAX_BYTES
+    : Math.min(DEFAULT_MAX_BYTES, options.maxBytes ?? DEFAULT_MAX_BYTES);
   const displayText =
     completion && persistenceError
       ? `Result file could not be saved.\n\n${text}`
       : text;
   const truncate = options.keep === "tail" ? truncateTail : truncateHead;
-  let result = truncate(displayText, {
-    maxBytes: DEFAULT_MAX_BYTES,
-    maxLines: DEFAULT_MAX_LINES,
-  });
+  // A head-truncated value whose first line alone exceeds the limit fits no
+  // whole line; keep a UTF-8-safe prefix instead of returning nothing.
+  const truncateBounded = (
+    content: string,
+    limit: number,
+    maxLines: number,
+  ) => {
+    const next = truncate(content, { maxBytes: limit, maxLines });
+    return truncate === truncateHead &&
+      next.truncated &&
+      next.content.length === 0 &&
+      content.length > 0
+      ? { ...next, content: utf8Head(content, limit), outputLines: 1 }
+      : next;
+  };
+  let result = truncateBounded(displayText, maxBytes, DEFAULT_MAX_LINES);
   if (!result.truncated) {
     return {
       content: displayText,
@@ -3234,20 +3259,28 @@ export function truncateModelText(
   const total = result.totalLines;
   const suffixFor = (content: string) => {
     const shown = result.outputLines;
-    return `[Output truncated: ${shown}/${total} lines, ${formatSize(Buffer.byteLength(content))}/${formatSize(Buffer.byteLength(displayText))}.${overflowPath ? ` Full output: ${overflowPath}` : completion ? "" : " Full output could not be saved."}]`;
+    const remainder = overflowPath
+      ? ` Full output: ${overflowPath}`
+      : completion
+        ? path && ref
+          ? ` Full result: ${ref} at ${path}`
+          : ""
+        : " Full output could not be saved.";
+    return `[Output truncated: ${shown}/${total} lines, ${formatSize(Buffer.byteLength(content))}/${formatSize(Buffer.byteLength(displayText))}.${remainder}]`;
   };
   let suffix = suffixFor(result.content);
   for (let attempt = 0; attempt < 4; attempt++) {
     const suffixBytes = Buffer.byteLength(suffix) + 1;
     if (
       result.outputLines + 1 <= DEFAULT_MAX_LINES &&
-      Buffer.byteLength(result.content) + suffixBytes <= DEFAULT_MAX_BYTES
+      Buffer.byteLength(result.content) + suffixBytes <= maxBytes
     )
       break;
-    result = truncate(displayText, {
-      maxBytes: Math.max(1, DEFAULT_MAX_BYTES - suffixBytes),
-      maxLines: Math.max(1, DEFAULT_MAX_LINES - 1),
-    });
+    result = truncateBounded(
+      displayText,
+      Math.max(1, maxBytes - suffixBytes),
+      Math.max(1, DEFAULT_MAX_LINES - 1),
+    );
     suffix = suffixFor(result.content);
   }
   // The notice includes the retained byte and line counts, so reserve again
@@ -3255,16 +3288,15 @@ export function truncateModelText(
   suffix = suffixFor(result.content);
   while (
     (Buffer.byteLength(result.content) + Buffer.byteLength(suffix) + 1 >
-      DEFAULT_MAX_BYTES ||
+      maxBytes ||
       result.outputLines + 1 > DEFAULT_MAX_LINES) &&
     result.content.length > 0
   ) {
-    const maxBytes = Math.max(
-      1,
-      DEFAULT_MAX_BYTES - Buffer.byteLength(suffix) - 1,
+    const next = truncateBounded(
+      result.content,
+      Math.max(1, maxBytes - Buffer.byteLength(suffix) - 1),
+      Math.max(1, DEFAULT_MAX_LINES - 1),
     );
-    const maxLines = Math.max(1, DEFAULT_MAX_LINES - 1);
-    const next = truncate(result.content, { maxBytes, maxLines });
     if (next.content === result.content) break;
     result = next;
     suffix = suffixFor(result.content);

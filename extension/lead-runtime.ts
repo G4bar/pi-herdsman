@@ -3,7 +3,10 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { getSelectListTheme } from "@earendil-works/pi-coding-agent";
+import {
+  buildSessionProjection,
+  getSelectListTheme,
+} from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
 import { visibleWidth, type SelectItem } from "@earendil-works/pi-tui";
 import type {
@@ -143,6 +146,7 @@ type LeadTransitionHost = {
   chiefTools: readonly string[];
   managerTools: readonly string[];
   executionTools?(): string[];
+  executionToolsFrom?(baseline: readonly string[]): string[];
   restoreLeadExecution?(ctx: ExtensionContext): Promise<void>;
   invalidateLeadCoordinationState: typeof import("./supervision.ts").invalidateLeadCoordinationState;
   enterChief(
@@ -3049,8 +3053,7 @@ export function registerLeadRuntime(
     enterChiefRole(leadRuntime, leadEntryEffects, ctx, lease, generation);
   const enterSuspended = (ctx?: ExtensionContext): void =>
     enterSuspendedRole(leadRuntime, leadEntryEffects, ctx);
-  const executionTools = (): string[] => {
-    const baseline = leadToolState.getLeadTools() ?? [];
+  const executionToolsFrom = (baseline: readonly string[]): string[] => {
     if (leadExecutionPending) return leadToolState.normalizeLeadTools([]);
     if (!leadExecution) return leadToolState.normalizeLeadTools(baseline);
     if (leadExecution.managed)
@@ -3058,6 +3061,8 @@ export function registerLeadRuntime(
     if (!leadExecution.valid) return leadToolState.normalizeLeadTools([]);
     return leadToolState.projectLeadTools(baseline, leadExecution.definition);
   };
+  const executionTools = (): string[] =>
+    executionToolsFrom(leadToolState.getLeadTools() ?? []);
   const activationGuard = (
     _sessionId: string,
     _role: "Chief" | "Manager",
@@ -3083,6 +3088,7 @@ export function registerLeadRuntime(
     appendRegisteredTools: leadToolState.appendRegisteredTools,
     normalizeLeadTools: leadToolState.normalizeLeadTools,
     executionTools,
+    executionToolsFrom,
     restoreLeadExecution: (ctx: ExtensionContext) => restoreLeadExecution(ctx),
     ownedTools: () => leadToolState.ownedTools,
     getLeadTools: () => leadToolState.getLeadTools(),
@@ -3210,6 +3216,11 @@ export function registerLeadRuntime(
   const controller = createAgentController(pi, {
     ...options.controllerServices,
     scope: { kind: "root" },
+    resultInlineLimitBytes: () =>
+      leadResultInlineLimitBytes(
+        activeLeadRole(options.leadRuntime),
+        options.commandHost.readConfig().resultInlineLimitBytes,
+      ),
     rootDelegationPolicy,
     rootDelegationGeneration,
     build: options.build,
@@ -3964,7 +3975,32 @@ export function registerLeadRuntime(
     leadInboxRuntime: inboxRuntime,
     herdRun: herdRunRuntime,
   });
-  pi.on("turn_start", () => controller.resetAssignmentGuidance());
+  // A steer sent during a turn is persisted only after the next turn_start, so
+  // the Lead keeps the flag until the guidance has landed and left the context.
+  let delegationGuidanceLive = false;
+  pi.on("message_end", (event: any) => {
+    if (event?.message?.customType === DELEGATION_GUIDANCE_ENTRY)
+      delegationGuidanceLive = true;
+  });
+  pi.on("turn_start", (_event: unknown, ctx: ExtensionContext) => {
+    const role = activeLeadRole(leadRuntime);
+    const branch = role === "lead" ? ctx.sessionManager.getBranch() : undefined;
+    // The raw scan is cheap; the projection is what honors compaction and edits.
+    const visible =
+      branch !== undefined &&
+      delegationGuidanceEntryPresent(branch) &&
+      delegationGuidanceVisible(buildSessionProjection(branch).entries);
+    if (visible) delegationGuidanceLive = true;
+    if (!shouldResetDelegationGuidance(role, delegationGuidanceLive, visible))
+      return;
+    delegationGuidanceLive = false;
+    controller.resetAssignmentGuidance();
+  });
+  pi.on("agent_end", () => {
+    // A steer dropped by an aborted turn never lands, so re-arm the guidance.
+    if (activeLeadRole(leadRuntime) === "lead" && !delegationGuidanceLive)
+      controller.resetAssignmentGuidance();
+  });
   pi.on("before_agent_start", (event: any, ctx: ExtensionContext) =>
     agentEvents.beforeAgentStart(event, ctx),
   );
@@ -3984,9 +4020,21 @@ export function registerLeadRuntime(
   pi.on("tool_call", (event: any, ctx: ExtensionContext) =>
     agentEvents.toolCall(event, ctx),
   );
-  pi.on("session_start", (_event: unknown, ctx: ExtensionContext) =>
-    sessionStart.sessionStart(ctx),
-  );
+  pi.on("cache_warming_decision", (_event: unknown, ctx: ExtensionContext) => {
+    try {
+      const action = leadCacheWarmingAction(
+        activeLeadRole(leadRuntime),
+        controller.hasUnresolvedDirectAgents(ctx),
+      );
+      return action ? { action } : undefined;
+    } catch {
+      return undefined;
+    }
+  });
+  pi.on("session_start", (_event: unknown, ctx: ExtensionContext) => {
+    delegationGuidanceLive = false;
+    return sessionStart.sessionStart(ctx);
+  });
   pi.on("session_info_changed", (event: any, ctx: ExtensionContext) => {
     if (!roleTransitions.chiefModeInactive()) return;
     if (!options.hasPane()) return;
@@ -9167,6 +9215,48 @@ export function createLeadCoordinationRuntime(host: LeadCoordinationHost) {
 export const activeLeadRole = (state: LeadRuntimeState): SessionRole =>
   state.chiefMode === "inactive" ? state.controllerRole : "chief";
 
+const DELEGATION_GUIDANCE_ENTRY = "pi-herdsman-delegation-guidance";
+
+/** True while the delegation guidance steer is still visible to the model. */
+export const delegationGuidanceVisible = (
+  entries: readonly unknown[],
+): boolean =>
+  entries.some(
+    ({ sourceEntry, messages }: any) =>
+      sourceEntry.type === "custom_message" &&
+      sourceEntry.customType === DELEGATION_GUIDANCE_ENTRY &&
+      messages.length > 0,
+  );
+
+/** Cheap pre-scan: only a present entry can project into visible context. */
+export const delegationGuidanceEntryPresent = (
+  entries: readonly unknown[],
+): boolean =>
+  entries.some(
+    (entry: any) =>
+      entry?.type === "custom_message" &&
+      entry.customType === DELEGATION_GUIDANCE_ENTRY,
+  );
+
+/** Manager, Chief, and managed agents reset every turn; the Lead only once sent and retired. */
+export const shouldResetDelegationGuidance = (
+  role: SessionRole,
+  guidanceLive: boolean,
+  guidanceVisible: boolean,
+): boolean => role !== "lead" || (guidanceLive && !guidanceVisible);
+
+/** Keep the Lead prompt cache warm while its direct agents are unresolved. */
+export const leadCacheWarmingAction = (
+  role: SessionRole,
+  hasUnresolvedDirectAgents: boolean,
+): "warm" | undefined =>
+  role === "lead" && hasUnresolvedDirectAgents ? "warm" : undefined;
+
+export const leadResultInlineLimitBytes = (
+  role: SessionRole,
+  limit: number,
+): number | undefined => (role === "lead" ? limit : undefined);
+
 function projectAssignmentInstruction(
   assignment: Pick<ProjectAssignment, "text">,
 ): string {
@@ -11755,6 +11845,31 @@ export function createLeadRoleTransitions(
     if (state.chiefMode !== "inactive") await deactivateChief(ctx);
     else host.reconcileRoleTools();
   };
+  // Re-writing the same tool list, or the same names in a new order, still
+  // invalidates the provider prompt cache, so write only real changes.
+  const applyRoleTools = (next: readonly string[]): void => {
+    const current = host.pi.getActiveTools();
+    const unchanged =
+      current.length === next.length &&
+      current.every((name, index) => name === next[index]);
+    if (!unchanged) host.pi.setActiveTools([...next]);
+  };
+  const sameToolNames = (
+    current: readonly string[],
+    next: readonly string[],
+  ): boolean => {
+    const names = new Set(next);
+    return current.length === names.size && current.every((n) => names.has(n));
+  };
+  // The plain Lead loadout only needs re-applying when the role, the session or
+  // the execution projection really changed; otherwise another extension's tool
+  // edits survive, as long as the Lead definition still allows them.
+  let lastLeadProjection: string | undefined;
+  let leadProjectionKnown = false;
+  const forgetLeadProjection = (): void => {
+    lastLeadProjection = undefined;
+    leadProjectionKnown = false;
+  };
   const reconcileRoleTools = (): void => {
     if (host.controllerScope?.kind !== "root") return;
     if (state.controllerRole === "manager" && !state.roleSuspended) {
@@ -11770,7 +11885,9 @@ export function createLeadRoleTransitions(
           !!descriptor &&
           !!state.managerLease &&
           host.sameManagerDescriptor(descriptor, state.managerLease.descriptor);
-      } catch {}
+      } catch {
+        // An unreadable descriptor leaves the lease unverified.
+      }
       if (!held) {
         state.roleSuspended = true;
         host.advancePeerPresenceGeneration();
@@ -11790,11 +11907,13 @@ export function createLeadRoleTransitions(
       const management = state.leadContext
         ? host.ownedAgentManagementTools(state.leadContext)
         : [];
-      host.pi.setActiveTools([...new Set([...baseline, ...management])]);
+      forgetLeadProjection();
+      applyRoleTools([...new Set([...baseline, ...management])]);
       return;
     }
     if (activeLeadRole(state) === "chief") {
-      host.pi.setActiveTools(
+      forgetLeadProjection();
+      applyRoleTools(
         (state.leadContext &&
           host.supervisoryTools(state.leadContext, "chief")) ?? [
           ...host.chiefTools,
@@ -11803,17 +11922,31 @@ export function createLeadRoleTransitions(
       return;
     }
     const current = host.pi.getActiveTools();
-    const source = host.getLeadTools()
-      ? [...host.getLeadTools()!]
-      : host.normalizeBaseTools(current);
-    host.pi.setActiveTools(
-      activeLeadRole(state) === "manager"
-        ? ((state.leadContext &&
-            host.supervisoryTools(state.leadContext, "manager")) ?? [
-            ...host.managerTools,
-          ])
-        : (host.executionTools?.() ?? host.normalizeLeadTools(source)),
-    );
+    if (activeLeadRole(state) === "manager") {
+      forgetLeadProjection();
+      applyRoleTools(
+        (state.leadContext &&
+          host.supervisoryTools(state.leadContext, "manager")) ?? [
+          ...host.managerTools,
+        ],
+      );
+      return;
+    }
+    const projection = host.executionTools?.();
+    const projectionKey = JSON.stringify([state.sessionGeneration, projection]);
+    const stable = leadProjectionKnown && projectionKey === lastLeadProjection;
+    lastLeadProjection = projectionKey;
+    leadProjectionKnown = true;
+    const next = stable
+      ? (host.executionToolsFrom?.(current) ?? host.normalizeLeadTools(current))
+      : (projection ??
+        host.normalizeLeadTools(
+          host.getLeadTools()
+            ? [...host.getLeadTools()!]
+            : host.normalizeBaseTools(current),
+        ));
+    if (sameToolNames(current, next)) return;
+    applyRoleTools(next);
   };
   const resolveControllerRole = (
     ctx: ExtensionContext,

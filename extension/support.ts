@@ -282,7 +282,16 @@ mock.module("@earendil-works/pi-coding-agent", {
     ) => {
       const lines = text.split("\n");
       const maxLines = options.maxLines ?? lines.length;
-      const content = lines.slice(0, maxLines).join("\n");
+      const maxBytes = options.maxBytes ?? Number.POSITIVE_INFINITY;
+      const kept: string[] = [];
+      let keptBytes = 0;
+      for (const line of lines.slice(0, maxLines)) {
+        const bytes = Buffer.byteLength(line) + (kept.length > 0 ? 1 : 0);
+        if (keptBytes + bytes > maxBytes) break;
+        kept.push(line);
+        keptBytes += bytes;
+      }
+      const content = kept.join("\n");
       return {
         content,
         truncated: content !== text,

@@ -79,6 +79,8 @@ const {
   statusBreadcrumb,
   visibleAgentSnapshots,
 } = await import("./agent-controller.ts");
+const { leadCacheWarmingAction, leadResultInlineLimitBytes } =
+  await import("./lead-runtime.ts");
 
 test("root status breadcrumb uses only the supplied verified role", () => {
   assert.deepEqual(rootStatusBreadcrumb("manager"), [{ text: "manager" }]);
@@ -2407,6 +2409,118 @@ test("parent settlement waits for agent delivery and ignores result cleanup lag"
   }
 });
 
+test("a Lead inlines a capped agent result and names its persisted file", async () => {
+  setLeadEnvironment();
+  process.env.PI_HERDSMAN_AGENT_DEFINITION = "parent";
+  const parent = {
+    ...managedState("capped-parent"),
+    piSessionId: randomUUID(),
+  };
+  const largeLabel = `capped-large-${randomUUID().slice(0, 8)}`;
+  const smallLabel = `capped-small-${randomUUID().slice(0, 8)}`;
+  const largeRequestId = randomUUID();
+  const smallRequestId = randomUUID();
+  const largeChild = {
+    ...managedState(largeLabel, largeRequestId, recoveryIdentity(largeLabel)),
+    ownerSessionId: parent.piSessionId,
+    piSessionId: randomUUID(),
+  };
+  const smallChild = {
+    ...managedState(smallLabel, smallRequestId, recoveryIdentity(smallLabel)),
+    ownerSessionId: parent.piSessionId,
+    piSessionId: randomUUID(),
+  };
+  const largeMailbox = agentMailboxPath(WORKSPACE, largeLabel);
+  const smallMailbox = agentMailboxPath(WORKSPACE, smallLabel);
+  resetAgentMailbox(largeMailbox);
+  resetAgentMailbox(smallMailbox);
+  writeAgentState(largeMailbox, largeChild);
+  writeAgentState(smallMailbox, smallChild);
+  const entries: unknown[] = [];
+  const pi = fakePi({
+    entries,
+    exec: agentControllerExecutor(parent, [largeChild, smallChild]),
+  });
+  registerExtension!(pi.pi as never);
+  const context = fakeContext(entries);
+  context.sessionManager = {
+    ...context.sessionManager,
+    getSessionId: () => parent.piSessionId,
+  };
+  const deliver = (
+    child: typeof largeChild,
+    mailbox: string,
+    requestId: string,
+    text: string,
+  ): void => {
+    writeAgentState(mailbox, child);
+    writeResult(mailbox, {
+      version: 5,
+      runId: child.runId,
+      requestId,
+      ownerSessionId: child.ownerSessionId,
+      workspaceId: child.workspaceId,
+      agentLabel: child.agentLabel,
+      paneId: child.paneId,
+      status: "completed",
+      text,
+      completedAt: Date.now(),
+    });
+    writeAgentState(mailbox, {
+      ...child,
+      activeRequestId: undefined,
+      completedRequestId: requestId,
+      updatedAt: Date.now(),
+    });
+    emitMailboxChange(mailbox, `result-${requestId}.json`);
+  };
+  try {
+    for (const handler of pi.events.get("session_start") ?? [])
+      await handler(undefined, context);
+    const largeText = "capped result line\n".repeat(2000);
+    deliver(largeChild, largeMailbox, largeRequestId, largeText);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const large = pi.sentMessageCalls[0]?.message as any;
+    assert.equal(large.customType, "pi-herdsman-agent-result");
+    assert.equal(large.details.requestId, largeRequestId);
+    assert.equal(large.details.truncated, true);
+    assert.match(large.content, /Result ref: result:/);
+    assert.match(large.content, /^Agent result /);
+    assert.match(large.content, /\[Output truncated: \d+\/\d+ lines, /);
+    assert.ok(
+      large.content.includes(
+        `Full result: ${large.details.resultRef} at ${resultPath(largeRequestId)}`,
+      ),
+    );
+    // 6144-byte completion cap plus fixed header, status, and guidance.
+    assert.ok(Buffer.byteLength(large.content) < 10_240);
+    assert.ok(large.content.length < largeText.length);
+    assert.ok(
+      readFileSync(resultPath(largeRequestId), "utf8").includes(largeText),
+    );
+
+    deliver(smallChild, smallMailbox, smallRequestId, "small result");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const small = pi.sentMessageCalls[1]?.message as any;
+    assert.equal(small.customType, "pi-herdsman-agent-result");
+    assert.equal(small.details.requestId, smallRequestId);
+    assert.equal(small.details.truncated, false);
+    assert.ok(small.content.includes("small result"));
+    assert.doesNotMatch(small.content, /Output truncated/);
+    assert.equal(
+      readFileSync(resultPath(smallRequestId), "utf8").endsWith("small result"),
+      true,
+    );
+  } finally {
+    for (const handler of pi.events.get("session_shutdown") ?? [])
+      handler(undefined, context);
+    resetAgentMailbox(largeMailbox);
+    resetAgentMailbox(smallMailbox);
+  }
+});
+
 test("independent producer branches publish globally unique semantic refs", async () => {
   const label = `globalref-${randomUUID().slice(0, 8)}`;
   const reservationDirectory = join(
@@ -3745,6 +3859,79 @@ test("session agent identity reads the session-wide entry array", () => {
       label: "reviewer",
     },
   );
+});
+
+test("cache warming is overridden only for a Lead with unresolved direct agents", () => {
+  assert.equal(leadCacheWarmingAction("lead", true), "warm");
+  assert.equal(leadCacheWarmingAction("lead", false), undefined);
+  assert.equal(leadCacheWarmingAction("manager", true), undefined);
+  assert.equal(leadCacheWarmingAction("chief", true), undefined);
+});
+
+test("only a plain Lead caps inlined agent results", () => {
+  assert.equal(leadResultInlineLimitBytes("lead", 6144), 6144);
+  assert.equal(leadResultInlineLimitBytes("manager", 6144), undefined);
+  assert.equal(leadResultInlineLimitBytes("chief", 6144), undefined);
+});
+
+test("managed agents register no cache warming handler", () => {
+  const mailbox = setAgentEnvironment("cache-warming-agent");
+  const agent = fakePi();
+  try {
+    registerExtension!(agent.pi as never);
+    assert.equal(agent.events.get("cache_warming_decision"), undefined);
+  } finally {
+    agent.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(mailbox);
+  }
+});
+
+test("the Lead warms its prompt cache only while direct agents are unresolved", () => {
+  setLeadEnvironment();
+  const lead = fakePi();
+  const label = "cache-warming-child";
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  const requestId = randomUUID();
+  const child = {
+    ...managedState(label),
+    piSessionId: randomUUID(),
+  };
+  const decision = {
+    type: "cache_warming_decision" as const,
+    warmCost: 0.01,
+    missCost: 1,
+    continuationProbability: 0.15,
+    action: "stop" as const,
+  };
+  const entries: unknown[] = [];
+  const context = fakeContext(entries);
+  try {
+    registerExtension!(lead.pi as never);
+    const handlers = lead.events.get("cache_warming_decision");
+    assert.equal(handlers?.length, 1);
+    const decide = handlers![0];
+    assert.equal(decide(decision, context), undefined);
+
+    writeAgentState(mailbox, { ...child, activeRequestId: requestId });
+    assert.deepEqual(decide(decision, context), { action: "warm" });
+
+    writeAgentState(mailbox, {
+      ...child,
+      activeRequestId: undefined,
+      completedRequestId: requestId,
+    });
+    assert.deepEqual(decide(decision, context), { action: "warm" });
+
+    entries.push({
+      type: "custom_message",
+      customType: "pi-herdsman-agent-result",
+      details: resultEntryDetails(child, requestId),
+    });
+    assert.equal(decide(decision, context), undefined);
+  } finally {
+    resetAgentMailbox(mailbox);
+    lead.events.get("session_shutdown")?.[0]();
+  }
 });
 
 test("retired active sessions suppress threshold compaction until completion", async () => {

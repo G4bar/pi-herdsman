@@ -3351,7 +3351,92 @@ test("Completion result persistence is deterministic, bounded, and fail-closed",
     assert.equal(first.truncated, true);
     assert.ok(Buffer.byteLength(first.content) <= 50 * 1024);
     assert.ok(first.content.split("\n").length <= 2000);
-    assert.equal(first.content.includes(first.resultRef!), false);
+    assert.ok(
+      first.content.includes(
+        `Full result: ${first.resultRef!} at ${resultPath(options.requestId)}`,
+      ),
+    );
+  }
+
+  {
+    const options = {
+      keep: "head" as const,
+      sessionId: "capped-completion-session",
+      key: "123e4567-e89b-12d3-a456-426614174003",
+      requestId: "123e4567-e89b-12d3-a456-426614174003",
+      persist: "completion" as const,
+    };
+    const text = "capped line\n".repeat(3000);
+    const persistText = `Agent result source: {"agent":"reviewer"}\n\n${text}`;
+    const capped = truncateModelText(text, {
+      ...options,
+      persistText,
+      maxBytes: 2048,
+    });
+    assert.equal(capped.truncated, true);
+    assert.ok(Buffer.byteLength(capped.content) <= 2048);
+    assert.match(capped.content, /^capped line\n/);
+    assert.ok(
+      capped.content.includes(
+        `Full result: ${capped.resultRef!} at ${resultPath(options.requestId)}`,
+      ),
+    );
+    assert.equal(
+      readFileSync(resultPath(options.requestId), "utf8"),
+      persistText,
+    );
+    const small = truncateModelText("small result", {
+      ...options,
+      key: "123e4567-e89b-12d3-a456-426614174004",
+      requestId: "123e4567-e89b-12d3-a456-426614174004",
+      persistText: "small result",
+      maxBytes: 2048,
+    });
+    assert.equal(small.truncated, false);
+    assert.equal(small.content, "small result");
+    assert.equal(
+      readFileSync(resultPath("123e4567-e89b-12d3-a456-426614174004"), "utf8"),
+      "small result",
+    );
+  }
+
+  {
+    const options = {
+      keep: "head" as const,
+      sessionId: "multibyte-completion-session",
+      key: "123e4567-e89b-12d3-a456-426614174005",
+      requestId: "123e4567-e89b-12d3-a456-426614174005",
+      persist: "completion" as const,
+    };
+    const text = "é".repeat(8000);
+    const result = truncateModelText(text, {
+      ...options,
+      persistText: text,
+      maxBytes: 2048,
+    });
+    assert.equal(result.truncated, true);
+    assert.match(result.content, /^é+\n\[Output truncated: 1\/1 lines, /);
+    assert.equal(result.content.includes("\uFFFD"), false);
+    const head = result.content.slice(0, result.content.indexOf("\n["));
+    assert.ok(Buffer.byteLength(result.content) <= 2048);
+    assert.equal(Buffer.byteLength(head) % 2, 0);
+    assert.equal(readFileSync(resultPath(options.requestId), "utf8"), text);
+  }
+
+  {
+    // A failed save must not also shrink the inline copy: nothing to point at.
+    const text = `${("x".repeat(99) + "\n").repeat(100)}`;
+    const result = truncateModelText(text, {
+      keep: "head",
+      sessionId: "unsaved-completion-session",
+      key: "../outside",
+      persist: "completion",
+      requestId: "../outside",
+      maxBytes: 2048,
+    });
+    assert.equal(result.truncated, false);
+    assert.equal(result.persistenceError, "Result file could not be saved.");
+    assert.equal(result.content, `Result file could not be saved.\n\n${text}`);
   }
 
   {

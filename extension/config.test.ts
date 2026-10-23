@@ -83,6 +83,7 @@ test("missing config resolves to defaults without creating storage", () => {
   assert.equal(readConfig().contextRetirement, true);
   assert.equal(readConfig().defaultLeadExecution, "flexible");
   assert.equal(readConfig().autoActivateManager, false);
+  assert.equal(readConfig().resultInlineLimitBytes, 6144);
   assert.equal(realFs.existsSync(herdsmanDataRoot()), false);
 });
 
@@ -110,6 +111,7 @@ test("partial and complete valid configs overlay defaults", () => {
       defaultLeadExecution: "orchestrate",
       inlineAttachmentLimitBytes: MIN_BYTE_LIMIT,
       mailboxPayloadLimitBytes: MAX_BYTE_LIMIT,
+      resultInlineLimitBytes: 8192,
       autoActivateManager: true,
     }),
   );
@@ -120,6 +122,7 @@ test("partial and complete valid configs overlay defaults", () => {
     autoActivateManager: true,
     inlineAttachmentLimitBytes: MIN_BYTE_LIMIT,
     mailboxPayloadLimitBytes: MAX_BYTE_LIMIT,
+    resultInlineLimitBytes: 8192,
   });
 });
 
@@ -139,6 +142,18 @@ test("invalid values, malformed JSON, non-object roots, and unknown keys fail cl
     [
       `{"mailboxPayloadLimitBytes":${MIN_BYTE_LIMIT + 0.5}}`,
       "mailboxPayloadLimitBytes",
+    ],
+    [
+      `{"resultInlineLimitBytes":${MIN_BYTE_LIMIT - 1}}`,
+      "resultInlineLimitBytes",
+    ],
+    [
+      `{"resultInlineLimitBytes":${MAX_BYTE_LIMIT + 1}}`,
+      "resultInlineLimitBytes",
+    ],
+    [
+      `{"resultInlineLimitBytes":${MIN_BYTE_LIMIT + 0.5}}`,
+      "resultInlineLimitBytes",
     ],
     ['{"contextRetirement":"false"}', "contextRetirement"],
     ['{"autoActivateManager":"true"}', "autoActivateManager"],

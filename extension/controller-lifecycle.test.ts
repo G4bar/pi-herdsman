@@ -394,6 +394,147 @@ test("parent delegates two same-definition children with exact ownership", async
   }
 });
 
+function leadDelegationHarness(parentLabel: string) {
+  setLeadEnvironment();
+  const parent = managedState(parentLabel);
+  const mailbox = agentMailboxPath(WORKSPACE, parent.agentLabel);
+  resetAgentMailbox(mailbox);
+  writeAgentState(mailbox, parent);
+  registerNativeAgentSession(parent);
+  const lifecycle = delegatedLifecycleExecutor(parent);
+  const entries: any[] = [];
+  const queued: unknown[] = [];
+  // The fake branch needs one parent-linked path for buildSessionProjection.
+  const chain = () =>
+    entries.forEach((entry, index) => {
+      entry.id = `entry-${index + 1}`;
+      entry.parentId = index ? `entry-${index}` : undefined;
+    });
+  const pi = fakePi({
+    entries,
+    exec: lifecycle.exec,
+    // Real pi persists a steered message only after the next turn_start.
+    sendMessage: (message) => {
+      queued.push(message);
+    },
+  });
+  registerExtension!(pi.pi as never);
+  const context = fakeContext(entries);
+  const childMailboxes: string[] = [];
+  return {
+    pi,
+    entries,
+    queued,
+    async start() {
+      for (const handler of pi.events.get("session_start") ?? [])
+        await handler(undefined, context);
+    },
+    async emit(name: string) {
+      for (const handler of pi.events.get(name) ?? []) await handler({}, context);
+    },
+    async turn() {
+      chain();
+      for (const handler of pi.events.get("turn_start") ?? [])
+        await handler({}, context);
+      while (queued.length) {
+        entries.push({ type: "custom_message", ...(queued.shift() as object) });
+        chain();
+      }
+    },
+    async delegate(name: string) {
+      const result = await registeredAgentTool(pi, "delegate").execute(
+        name,
+        { definition: "agent", label: `guidance-${name}`, task: "delegated" },
+        undefined,
+        undefined,
+        context,
+      );
+      assert.equal(result.details.ok, true, JSON.stringify(result.details));
+      childMailboxes.push(
+        agentMailboxPath(WORKSPACE, result.details.agent as string),
+      );
+    },
+    guidance() {
+      return pi.sentMessageCalls.filter(
+        ({ message }) =>
+          (message as any).customType === "pi-herdsman-delegation-guidance",
+      );
+    },
+    cleanup() {
+      for (const handler of pi.events.get("session_shutdown") ?? []) handler();
+      resetAgentMailbox(mailbox);
+      for (const childMailbox of childMailboxes) resetAgentMailbox(childMailbox);
+      nativeSessions.delete(parent.piSessionId);
+    },
+  };
+}
+
+test("lead sends delegation guidance once per session until it leaves context", async () => {
+  const harness = leadDelegationHarness("guidance-once-parent");
+  try {
+    await harness.start();
+    await harness.turn();
+    await harness.delegate("first");
+    assert.equal(harness.guidance().length, 1);
+    // The steer is still queued here: the Lead must not send a second copy.
+    await harness.turn();
+    await harness.delegate("second");
+    assert.equal(
+      harness.guidance().length,
+      1,
+      "one guidance copy per Lead session",
+    );
+    await harness.turn();
+    harness.entries.length = 0; // simulated compaction retires the landed copy
+    await harness.turn();
+    await harness.delegate("third");
+    assert.equal(harness.guidance().length, 2, "retired guidance is sent again");
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test("lead re-sends delegation guidance after a dropped steer", async () => {
+  const harness = leadDelegationHarness("guidance-dropped-parent");
+  try {
+    await harness.start();
+    await harness.turn();
+    await harness.delegate("first");
+    assert.equal(harness.guidance().length, 1);
+    harness.queued.length = 0; // an aborted turn clears the steer before it lands
+    await harness.emit("agent_end");
+    await harness.turn();
+    await harness.delegate("second");
+    assert.equal(
+      harness.guidance().length,
+      2,
+      "guidance is re-armed after a dropped steer",
+    );
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test("delegation guidance resets every turn outside the plain Lead role", async () => {
+  const { shouldResetDelegationGuidance } = await import("./lead-runtime.ts");
+  for (const role of ["manager", "chief"] as const)
+    for (const visible of [false, true]) {
+      assert.equal(
+        shouldResetDelegationGuidance(role, false, visible),
+        true,
+        `${role} resets every turn with guidance visible=${visible}`,
+      );
+      assert.equal(shouldResetDelegationGuidance(role, true, visible), true);
+    }
+  assert.equal(
+    shouldResetDelegationGuidance("lead", false, false),
+    false,
+    "the Lead keeps the flag while its steer is still queued",
+  );
+  assert.equal(shouldResetDelegationGuidance("lead", true, true), false);
+  assert.equal(shouldResetDelegationGuidance("lead", true, false), true);
+});
+
 function writePlacementSetting(placement: "tab" | "subtree" | "split") {
   realFs.mkdirSync(join(PI_AGENT_ROOT, "pi-herdsman"), { recursive: true });
   realFs.writeFileSync(

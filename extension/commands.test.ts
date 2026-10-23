@@ -7185,6 +7185,8 @@ test("Chief activation rollback fails closed when its restrictive projection fai
     "read",
     "bash",
   ]);
+  // The restore is only a real rewrite while another extension's tool is active.
+  pi.pi.setActiveTools([...projected, "foreign_tool"]);
   const setActiveTools = pi.pi.setActiveTools;
   let activationAttempted = false;
   let projectionFailures = 2;
@@ -7951,6 +7953,154 @@ test("Chief profile drives the turn-start tools, prompt, and tool-call guard", a
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
   }
+});
+
+test("Lead delegate keeps the active tool list stable", async (t) => {
+  setLeadEnvironment();
+  const pi = fakeChiefPi({ activeTools: ["read", "bash"] });
+  const context = fakeContext() as any;
+  context.ui.notify = () => undefined;
+  registerExtension!(pi.pi as never);
+  t.after(async () => pi.events.get("session_shutdown")?.[0]());
+  await pi.events.get("session_start")![0](undefined, context);
+  assert.deepEqual(pi.pi.getActiveTools(), ["read", "bash", ...leadTools]);
+  const setActiveTools = pi.pi.setActiveTools.bind(pi.pi);
+  const writes: string[][] = [];
+  pi.pi.setActiveTools = (next: string[]) => {
+    writes.push([...next]);
+    setActiveTools(next);
+  };
+  const delegate = () =>
+    agentTool(pi, "delegate").execute(
+      "stable-lead-tools",
+      { definition: "agent", task: "keep the Lead tool list stable" },
+      undefined,
+      undefined,
+      context,
+    );
+  const cases: { name: string; mutate: (tools: string[]) => string[] }[] = [
+    {
+      name: "another extension deactivates a registered tool",
+      mutate: (tools) => tools.filter((name) => name !== "bash"),
+    },
+    {
+      name: "another extension reorders the list",
+      mutate: (tools) => [...tools].reverse(),
+    },
+  ];
+  for (const { name, mutate } of cases) {
+    pi.pi.setActiveTools(mutate(pi.pi.getActiveTools()));
+    const before = pi.pi.getActiveTools();
+    const launches = () =>
+      pi.calls.filter((args) => args[0] === "tab" && args[1] === "create")
+        .length;
+    const launchesBefore = launches();
+    writes.length = 0;
+    await delegate();
+    assert.ok(launches() > launchesBefore, `${name}: delegate reached Herdr`);
+    assert.deepEqual(
+      pi.pi.getActiveTools(),
+      before,
+      `${name}: ${JSON.stringify(writes)}`,
+    );
+    assert.deepEqual(writes, [], name);
+  }
+});
+
+test("Lead reconcile strips tools the execution profile does not allow", async (t) => {
+  setLeadEnvironment();
+  const cwd = mkdtempSync(join(tmpdir(), "herdsman-lead-allowlist-"));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  mkdirSync(join(cwd, ".pi", "agents"), { recursive: true });
+  writeFileSync(
+    join(cwd, ".pi", "agents", "orchestrator-lead.md"),
+    "---\nname: orchestrator-lead\ntools: [read, bash]\n---\norchestrate\n",
+  );
+  writeFileSync(
+    join(cwd, ".pi", "agents", "flexible-lead.md"),
+    "---\nname: flexible-lead\n---\nflexible\n",
+  );
+  const pi = fakeChiefPi({ activeTools: ["read", "bash"] });
+  const context = fakeContext(pi.entries) as any;
+  context.cwd = cwd;
+  context.ui.notify = () => undefined;
+  registerExtension!(pi.pi as never);
+  t.after(async () => pi.events.get("session_shutdown")?.[0]());
+  await pi.events.get("session_start")![0](undefined, context);
+  await pi.commandOptions.get("lead").handler("orchestrate", context);
+  const allowed = ["read", "bash", ...leadTools];
+  assert.deepEqual(pi.pi.getActiveTools(), allowed);
+  const setActiveTools = pi.pi.setActiveTools.bind(pi.pi);
+  const writes: string[][] = [];
+  pi.pi.setActiveTools = (next: string[]) => {
+    writes.push([...next]);
+    setActiveTools(next);
+  };
+  const delegate = () =>
+    agentTool(pi, "delegate").execute(
+      "allowlisted-lead-tools",
+      { definition: "agent", task: "strip the disallowed tool" },
+      undefined,
+      undefined,
+      context,
+    );
+
+  pi.pi.setActiveTools([...allowed, "foreign_tool"]);
+  writes.length = 0;
+  await delegate();
+  assert.deepEqual(writes, [allowed], "the allowlist strips the foreign tool");
+  assert.deepEqual(pi.pi.getActiveTools(), allowed);
+
+  await pi.commandOptions.get("lead").handler("flexible", context);
+  await pi.commandOptions.get("lead").handler("orchestrate", context);
+  pi.pi.setActiveTools([...pi.pi.getActiveTools(), "foreign_tool"]);
+  writes.length = 0;
+  await delegate();
+  assert.deepEqual(
+    pi.pi.getActiveTools(),
+    allowed,
+    "a mode switch back still enforces the allowlist",
+  );
+
+  pi.pi.setActiveTools([...allowed, "foreign_tool"]);
+  await pi.events.get("session_start")![0](undefined, context);
+  assert.deepEqual(
+    pi.pi.getActiveTools(),
+    allowed,
+    "a resumed session enforces the allowlist again",
+  );
+});
+
+test("Lead reconcile strips tools the execution profile excludes", async (t) => {
+  setLeadEnvironment();
+  const cwd = mkdtempSync(join(tmpdir(), "herdsman-lead-exclude-"));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  mkdirSync(join(cwd, ".pi", "agents"), { recursive: true });
+  writeFileSync(
+    join(cwd, ".pi", "agents", "flexible-lead.md"),
+    "---\nname: flexible-lead\nexcludeTools: [foreign*]\n---\nflexible\n",
+  );
+  const pi = fakeChiefPi({ activeTools: ["read", "bash"] });
+  const context = fakeContext(pi.entries) as any;
+  context.cwd = cwd;
+  context.ui.notify = () => undefined;
+  registerExtension!(pi.pi as never);
+  t.after(async () => pi.events.get("session_shutdown")?.[0]());
+  await pi.events.get("session_start")![0](undefined, context);
+  await pi.commandOptions.get("lead").handler("flexible", context);
+  const allowed = ["read", "bash", ...leadTools];
+  assert.deepEqual(pi.pi.getActiveTools(), allowed);
+  pi.pi.setActiveTools([...allowed, "foreign_tool"]);
+
+  await agentTool(pi, "delegate").execute(
+    "excluded-lead-tools",
+    { definition: "agent", task: "strip the excluded tool" },
+    undefined,
+    undefined,
+    context,
+  );
+
+  assert.deepEqual(pi.pi.getActiveTools(), allowed);
 });
 
 test("root assignment rejects a role generation changed during preflight", async () => {

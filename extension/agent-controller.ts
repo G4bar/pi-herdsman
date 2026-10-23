@@ -788,12 +788,33 @@ export function durableIdentityKey(state: ManagedAgentState): string {
   return `${state.workspaceId}\0${state.piSessionId}`;
 }
 
-function directChildStates(parent: ManagedAgentState) {
+function directChildStatesOf(workspaceId: string, ownerSessionId: string) {
   return listAgentStates().filter(
     ({ state }) =>
-      state.workspaceId === parent.workspaceId &&
-      state.ownerSessionId === parent.piSessionId,
+      state.workspaceId === workspaceId &&
+      state.ownerSessionId === ownerSessionId,
   );
+}
+
+function directChildStates(parent: ManagedAgentState) {
+  return directChildStatesOf(parent.workspaceId, parent.piSessionId);
+}
+
+function directChildResultIdentity(
+  state: ManagedAgentState,
+  requestId: string,
+) {
+  return {
+    runId: state.runId,
+    requestId,
+    ownerSessionId: state.ownerSessionId,
+    workspaceId: state.workspaceId,
+    agentLabel: state.agentLabel,
+    paneId: state.paneId,
+    cwd: state.cwd,
+    piSessionId: state.piSessionId,
+    piSessionFile: state.piSessionFile,
+  };
 }
 
 function pendingResultExists(
@@ -844,17 +865,8 @@ export function hasUndeliveredDirectChildWork(
   ) => Object.entries(expected).every(([key, value]) => details[key] === value);
   return directChildStates(parent).some(({ state }) => {
     if (state.resultError) return true;
-    const identity = (requestId: string) => ({
-      runId: state.runId,
-      requestId,
-      ownerSessionId: state.ownerSessionId,
-      workspaceId: state.workspaceId,
-      agentLabel: state.agentLabel,
-      paneId: state.paneId,
-      cwd: state.cwd,
-      piSessionId: state.piSessionId,
-      piSessionFile: state.piSessionFile,
-    });
+    const identity = (requestId: string) =>
+      directChildResultIdentity(state, requestId);
     if (
       excludedResult &&
       [state.activeRequestId, state.completedRequestId].some(
@@ -2548,6 +2560,8 @@ export type AgentControllerOptions = {
     content: string,
     details: Record<string, unknown>,
   ): void;
+  /** Inline byte cap for agent results; omitted means no extra cap. */
+  resultInlineLimitBytes?(): number | undefined;
   sendAskMessage(ctx: ExtensionContext, ask: AskRecord): void;
   sessionRetired(runtime: Runtime): boolean;
   appendError(ctx: ExtensionContext, kind: string, error: unknown): void;
@@ -4855,6 +4869,23 @@ export function createAgentController(
       return undefined;
     }
   };
+  const hasUnresolvedDirectAgents = (context: ExtensionContext): boolean => {
+    if (options.scope?.kind !== "root") return false;
+    const entries = context.sessionManager.getEntries();
+    return directChildStatesOf(
+      options.workspaceId(),
+      context.sessionManager.getSessionId(),
+    ).some(({ state }) => {
+      if (state.resultError || state.activeRequestId) return true;
+      return (
+        !!state.completedRequestId &&
+        !hasDeliveredResult(
+          entries,
+          directChildResultIdentity(state, state.completedRequestId),
+        )
+      );
+    });
+  };
   const nextResultIndex = (
     entries: readonly unknown[],
     label: string,
@@ -5251,6 +5282,7 @@ export function createAgentController(
             sessionId: runtime.piSessionId ?? runtime.runId,
             key: result.requestId,
             requestId: result.requestId,
+            maxBytes: options.resultInlineLimitBytes?.(),
             ...(result.status === "completed"
               ? {
                   persist: "completion" as const,
@@ -7587,6 +7619,7 @@ export function createAgentController(
     agentSnapshotView: snapshotView,
     listedAgentRecord: listRecord,
     hasPendingDirectChildWork,
+    hasUnresolvedDirectAgents,
     allDirectChildrenAskBlocked,
     hasUndeliveredDirectChildWork,
     listedAgents(

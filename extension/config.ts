@@ -20,6 +20,7 @@ import {
 } from "./core.ts";
 
 const DEFAULT_BYTE_LIMIT = 128 * 1024;
+const DEFAULT_RESULT_INLINE_LIMIT = 6 * 1024;
 export const MIN_BYTE_LIMIT = 1024;
 export const MAX_BYTE_LIMIT = 1024 * 1024;
 
@@ -30,6 +31,7 @@ export type HerdsmanConfig = {
   autoActivateManager: boolean;
   inlineAttachmentLimitBytes: number;
   mailboxPayloadLimitBytes: number;
+  resultInlineLimitBytes: number;
 };
 
 export const DEFAULT_CONFIG: HerdsmanConfig = {
@@ -39,6 +41,7 @@ export const DEFAULT_CONFIG: HerdsmanConfig = {
   autoActivateManager: false,
   inlineAttachmentLimitBytes: DEFAULT_BYTE_LIMIT,
   mailboxPayloadLimitBytes: DEFAULT_BYTE_LIMIT,
+  resultInlineLimitBytes: DEFAULT_RESULT_INLINE_LIMIT,
 };
 
 export function validByteLimit(value: unknown): value is number {
@@ -58,6 +61,7 @@ const CONFIG_KEYS = new Set<ConfigKey>([
   "autoActivateManager",
   "inlineAttachmentLimitBytes",
   "mailboxPayloadLimitBytes",
+  "resultInlineLimitBytes",
 ]);
 
 function parseRawConfig(content: string): Partial<HerdsmanConfig> {
@@ -99,6 +103,7 @@ function parseRawConfig(content: string): Partial<HerdsmanConfig> {
   for (const key of [
     "inlineAttachmentLimitBytes",
     "mailboxPayloadLimitBytes",
+    "resultInlineLimitBytes",
   ] as const)
     if (key in record) {
       if (!validByteLimit(record[key]))

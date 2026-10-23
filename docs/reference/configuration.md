@@ -30,7 +30,8 @@ schema is:
   "contextRetirement": true,
   "autoActivateManager": false,
   "inlineAttachmentLimitBytes": 131072,
-  "mailboxPayloadLimitBytes": 131072
+  "mailboxPayloadLimitBytes": 131072,
+  "resultInlineLimitBytes": 6144
 }
 ```
 
@@ -44,6 +45,7 @@ An absent file means these defaults:
 | `autoActivateManager`        |              false | boolean                                           |
 | `inlineAttachmentLimitBytes` | `131072` (128 KiB) | integer from 1024 (1 KiB) through 1048576 (1 MiB) |
 | `mailboxPayloadLimitBytes`   | `131072` (128 KiB) | integer from 1024 (1 KiB) through 1048576 (1 MiB) |
+| `resultInlineLimitBytes`     |     `6144` (6 KiB) | integer from 1024 (1 KiB) through 1048576 (1 MiB) |
 
 Malformed JSON, a non-object root, unknown fields, and invalid known values
 are errors. Reads do not create the directory or file. Herdsman's human
@@ -63,6 +65,11 @@ coordination records remain subject to this configured limit and their fixed
 8 KiB ceiling. Project assignments are persisted separately from their compact
 inbox notification, so that coordination ceiling does not reduce the evidence
 capacity of a Manager-to-Lead assignment.
+
+`resultInlineLimitBytes` caps how much of a completed agent result is inlined
+into an ordinary Lead session. The full text is always written to the result
+file, and a truncated message names the result ref and that file so the Lead can
+read the rest. Manager and Chief results keep their fixed 50 KiB model limit.
 
 When `contextRetirement` is enabled, automatic context pressure retires a
 managed-agent session. Herdsman suppresses preventive threshold compaction
