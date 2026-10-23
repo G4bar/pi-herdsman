@@ -1,14 +1,24 @@
 import assert from "node:assert/strict";
+import { join } from "node:path";
 import { test } from "node:test";
 import {
   fakeContext,
   fakePi,
   registerExtension,
   setLeadEnvironment,
+  testTmpRoot,
+  realFs,
+  WORKSPACE,
+  agentMailboxPath,
+  agentControllerExecutor,
+  managedState,
+  recoveryIdentity,
+  writeAgentState,
 } from "./support.ts";
 import {
   HERDSMAN_SNAPSHOT_LIMIT_BYTES,
   HERDSMAN_STATUS_KEY,
+  createAgentWorkReader,
   createHerdsmanStatusFeed,
   herdsmanAgentState,
   herdsmanAgentWork,
@@ -175,9 +185,9 @@ test("agent work rows and counters come from the Pi session entries", () => {
           usage: {
             input: 1,
             output: 2,
-            cacheRead: 3,
+            cacheRead: 50_000,
             cacheWrite: 4,
-            totalTokens: 10,
+            totalTokens: 60_007,
           },
         },
       }),
@@ -190,20 +200,94 @@ test("agent work rows and counters come from the Pi session entries", () => {
       provider: "anthropic",
       model: "claude",
       usage: {
-        input: 0,
-        output: 0,
-        cacheRead: 0,
+        input: 3,
+        output: 4,
+        cacheRead: 9_000,
         cacheWrite: 0,
-        totalTokens: 7,
+        totalTokens: 9_007,
+      },
+    }),
+  );
+  lines.push(
+    JSON.stringify({
+      type: "compaction",
+      id: "k1",
+      timestamp: 31,
+      summary: "compacted",
+      usage: {
+        input: 5,
+        output: 6,
+        cacheRead: 40_000,
+        cacheWrite: 0,
+        totalTokens: 50_011,
       },
     }),
   );
   const work = herdsmanAgentWork(parseSessionEntries(lines.join("\n")));
   assert.equal(work.toolCalls, 25);
-  assert.equal(work.tokens, 257);
+  // The house total is input plus output; re-read context is not a token spent.
+  assert.equal(work.tokens, 25 * 3 + 7 + 11);
   assert.equal(work.activity.length, 20);
   assert.equal(work.activity[0], "read src/file-5.ts second line");
   assert.equal(work.activity[19], "read src/file-24.ts second line");
+});
+
+test("the work reader re-reads only a changed transcript and never throws", () => {
+  const path = join(testTmpRoot, "work-reader.jsonl");
+  const line = (name: string) =>
+    JSON.stringify({
+      type: "message",
+      id: name,
+      timestamp: 1,
+      message: {
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: name, name, arguments: { path: name } },
+        ],
+        usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
+      },
+    });
+  realFs.writeFileSync(path, `${line("read")}\n`);
+  let reads = 0;
+  const reader = createAgentWorkReader({
+    stat: (target) => realFs.statSync(target, { throwIfNoEntry: false }),
+    read: (target) => {
+      reads += 1;
+      return realFs.readFileSync(target, "utf8");
+    },
+  });
+  const first = reader.read(path);
+  assert.deepEqual(first?.activity, ["read read"]);
+  assert.equal(first?.toolCalls, 1);
+  assert.equal(first?.tokens, 3);
+  assert.equal(reader.read(path)?.toolCalls, 1);
+  assert.equal(reads, 1);
+
+  realFs.writeFileSync(path, `${line("read")}\n${line("edit")}\n`);
+  assert.deepEqual(reader.read(path)?.activity, ["read read", "edit edit"]);
+  assert.equal(reads, 2);
+
+  reader.keep(["other.jsonl"]);
+  reader.read(path);
+  assert.equal(reads, 3);
+  assert.equal(reader.read(undefined), undefined);
+  assert.equal(reader.ready(path), true);
+  assert.equal(reader.ready(join(testTmpRoot, "missing.jsonl")), false);
+
+  const throwing = createAgentWorkReader({
+    stat: () => assert.fail("stat must be guarded"),
+    read: () => assert.fail("read must not run"),
+  });
+  assert.equal(throwing.read(path), undefined);
+  assert.equal(throwing.ready(path), false);
+
+  const denied = createAgentWorkReader({
+    stat: realFs.statSync,
+    read: () => {
+      throw new Error("EACCES");
+    },
+  });
+  assert.equal(denied.read(path), undefined);
 });
 
 test("agent snapshot carries work rows and counters", () => {
@@ -319,6 +403,42 @@ test("serializing drops tasks and then agents to stay inside the limit", () => {
     parsed.agents.map((agent) => agent.toolCalls),
     parsed.agents.map((_agent, index) => index),
   );
+});
+
+test("activity keeps its own budget instead of dropping for every agent", () => {
+  const agents = Array.from({ length: 30 }, (_, index) =>
+    herdsmanRpcAgent({
+      label: `impl_${index}`,
+      projection: "working",
+      activity: Array.from({ length: 20 }, () => "y".repeat(80)),
+    }),
+  );
+  agents.push(
+    herdsmanRpcAgent({
+      label: "impl_done",
+      projection: "settling",
+      result: {
+        status: "completed",
+        text: "z".repeat(8 * 1024),
+        completedAt: 1,
+      },
+    }),
+  );
+  const text = serializeHerdsmanRpcSnapshot({
+    v: 1,
+    capabilities: ["steer"],
+    agents,
+  });
+  assert.ok(Buffer.byteLength(text) <= HERDSMAN_SNAPSHOT_LIMIT_BYTES);
+  const parsed = JSON.parse(text) as HerdsmanRpcSnapshot;
+  const running = parsed.agents.filter((agent) => agent.activity?.length);
+  assert.equal(running.length, 30);
+  const activityBytes = running.reduce(
+    (total, agent) => total + Buffer.byteLength(JSON.stringify(agent.activity)),
+    0,
+  );
+  assert.ok(activityBytes <= 16 * 1024, `activity is ${activityBytes} bytes`);
+  assert.equal(parsed.agents.at(-1)!.answer?.length, 8 * 1024);
 });
 
 test("the status feed publishes once per throttle window and coalesces", async () => {
@@ -497,6 +617,55 @@ test("RPC mode publishes the Herdsman snapshot and TUI mode stays silent", async
       "continue",
     ]);
     assert.deepEqual(snapshot.agents, []);
+  } finally {
+    for (const handler of fixture.events.get("session_shutdown") ?? [])
+      await handler(undefined, ctx);
+  }
+});
+
+test("RPC mode publishes work rows from a child transcript", async () => {
+  setLeadEnvironment();
+  const entries: any[] = [];
+  const transcript = join(testTmpRoot, "impl-one-session.jsonl");
+  realFs.writeFileSync(
+    transcript,
+    `${JSON.stringify({
+      type: "message",
+      id: "m1",
+      timestamp: 1,
+      message: {
+        role: "assistant",
+        content: [
+          { type: "text", text: "reading" },
+          {
+            type: "toolCall",
+            id: "c1",
+            name: "read",
+            arguments: { path: "src/app.ts" },
+          },
+        ],
+        usage: { input: 120, output: 30, cacheRead: 90_000, cacheWrite: 0 },
+      },
+    })}\n`,
+  );
+  const child = {
+    ...managedState("impl_one", undefined, recoveryIdentity("impl_one")),
+    piSessionFile: transcript,
+  };
+  writeAgentState(agentMailboxPath(WORKSPACE, child.agentLabel), child);
+  const fixture = fakePi({ entries, exec: agentControllerExecutor(child) });
+  const { ctx, statuses } = rpcContext(entries);
+  registerExtension!(fixture.pi as never);
+  try {
+    for (const handler of fixture.events.get("session_start") ?? [])
+      await handler(undefined, ctx);
+    await settle(() => assert.equal(statuses.length, 1));
+    const snapshot = JSON.parse(statuses[0]!.text!) as HerdsmanRpcSnapshot;
+    const agent = snapshot.agents.find(({ label }) => label === "impl_one");
+    assert.ok(agent, `agents: ${JSON.stringify(snapshot.agents)}`);
+    assert.deepEqual(agent.activity, ["read src/app.ts"]);
+    assert.equal(agent.toolCalls, 1);
+    assert.equal(agent.tokens, 150);
   } finally {
     for (const handler of fixture.events.get("session_shutdown") ?? [])
       await handler(undefined, ctx);

@@ -8,12 +8,12 @@
  *
  * `activity`, `toolCalls` and `tokens` are not kept in mailbox state: they come
  * from each agent's own Pi session file, which Pi already persists, through
- * `herdsmanAgentWork`. The caller reads that file; this module only projects
- * the entries it parsed.
+ * `createAgentWorkReader`.
  */
-import type {
-  ExtensionCommandContext,
-  SessionEntry,
+import {
+  parseSessionEntries,
+  type ExtensionCommandContext,
+  type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 
 export const HERDSMAN_STATUS_KEY = "herdsman";
@@ -23,6 +23,7 @@ export const HERDSMAN_FEED_THROTTLE_MS = 1_000;
 export const HERDSMAN_COMMAND_NAME = "hm";
 
 const ACTIVITY_ROWS = 20;
+const ACTIVITY_BUDGET_BYTES = 16 * 1024;
 const TASK_LIMIT_CHARS = 500;
 const TEXT_LIMIT_BYTES = 8 * 1024;
 const AGENT_LIMIT = 100;
@@ -168,24 +169,35 @@ function toolCallRow(name: string, args: unknown): string {
   return text ? `${name} ${text}` : name;
 }
 
-/**
- * Work rows and counters from an agent's own Pi session entries: its tool calls
- * and the token usage Pi persisted alongside them.
- */
-export function herdsmanAgentWork(entries: readonly SessionEntry[]): {
+export type HerdsmanAgentWork = {
   activity: string[];
   toolCalls: number;
   tokens: number;
-} {
+};
+
+/**
+ * Work rows and counters from an agent's own Pi session entries: its tool calls
+ * and the token usage Pi persisted alongside them. Tokens are the house total,
+ * input plus output, cached context included once per turn writes it.
+ */
+export function herdsmanAgentWork(
+  entries: readonly SessionEntry[],
+): HerdsmanAgentWork {
   const activity: string[] = [];
   let toolCalls = 0;
   let tokens = 0;
-  const addTokens = (usage: { totalTokens?: number } | undefined): void => {
-    const total = usage?.totalTokens;
-    if (typeof total === "number" && Number.isFinite(total)) tokens += total;
+  const addTokens = (
+    usage: { input?: number; output?: number } | undefined,
+  ) => {
+    for (const value of [usage?.input, usage?.output])
+      if (typeof value === "number" && Number.isFinite(value)) tokens += value;
   };
   for (const entry of entries) {
-    if (entry.type === "usage") {
+    if (
+      entry.type === "usage" ||
+      entry.type === "compaction" ||
+      entry.type === "branch_summary"
+    ) {
       addTokens(entry.usage);
       continue;
     }
@@ -203,6 +215,59 @@ export function herdsmanAgentWork(entries: readonly SessionEntry[]): {
   return { activity: activityRows(activity), toolCalls, tokens };
 }
 
+/**
+ * Work rows and counters for one agent file, re-read only when it changed.
+ * Nothing here throws: one unreadable transcript must not drop a snapshot.
+ */
+export type HerdsmanAgentWorkReader = {
+  read(path: string | undefined): HerdsmanAgentWork | undefined;
+  ready(path: string): boolean;
+  keep(paths: Iterable<string | undefined>): void;
+};
+
+export function createAgentWorkReader(files: {
+  stat(
+    path: string,
+  ): { mtimeMs: number; size: number; isFile(): boolean } | undefined;
+  read(path: string): string;
+}): HerdsmanAgentWorkReader {
+  const cache = new Map<string, { stamp: string; work: HerdsmanAgentWork }>();
+  const fileOf = (path: string | undefined) => {
+    if (!path) return undefined;
+    try {
+      const file = files.stat(path);
+      return file?.isFile() ? file : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  return {
+    read(path) {
+      const file = fileOf(path);
+      if (!path || !file) return undefined;
+      const stamp = `${file.mtimeMs}:${file.size}`;
+      const cached = cache.get(path);
+      if (cached?.stamp === stamp) return cached.work;
+      let work: HerdsmanAgentWork;
+      try {
+        // shortcut: one whole-file read per changed transcript, so a very long
+        // agent session costs more per publish; upgrade to tail parsing past a
+        // few MB.
+        work = herdsmanAgentWork(parseSessionEntries(files.read(path)));
+      } catch {
+        return undefined;
+      }
+      cache.set(path, { stamp, work });
+      return work;
+    },
+    ready: (path) => (fileOf(path)?.size ?? 0) > 0,
+    keep(paths) {
+      const keep = new Set(paths);
+      for (const path of cache.keys()) if (!keep.has(path)) cache.delete(path);
+    },
+  };
+}
+
 type AgentTrim = (agent: HerdsmanRpcAgent) => HerdsmanRpcAgent;
 
 const withoutActivity: AgentTrim = ({ activity: _activity, ...agent }) => agent;
@@ -213,8 +278,35 @@ const withoutText: AgentTrim = ({ answer: _answer, question, ...agent }) => ({
 const withoutTask: AgentTrim = ({ task: _task, ...agent }) => agent;
 
 /**
- * Serializes within the size budget by trimming activity, then answer and
- * question text, then tasks, then the tail of the agent list.
+ * Activity gets its own byte budget, shared across agents and keeping the
+ * newest rows, so many running agents lose single rows instead of losing all
+ * activity and the snapshot still has room for answers.
+ */
+function boundActivity(
+  agents: readonly HerdsmanRpcAgent[],
+  budget = ACTIVITY_BUDGET_BYTES,
+): HerdsmanRpcAgent[] {
+  const running = agents.filter((agent) => agent.activity?.length).length;
+  if (!running) return [...agents];
+  const share = Math.floor(budget / running);
+  return agents.map((agent) => {
+    if (!agent.activity?.length) return agent;
+    const kept: string[] = [];
+    let used = 0;
+    for (let index = agent.activity.length - 1; index >= 0; index -= 1) {
+      const row = agent.activity[index]!;
+      const cost = Buffer.byteLength(row, "utf8") + 3;
+      if (used + cost > share) break;
+      used += cost;
+      kept.unshift(row);
+    }
+    return kept.length ? { ...agent, activity: kept } : withoutActivity(agent);
+  });
+}
+
+/**
+ * Serializes within the size budget, bounding activity first, then dropping
+ * activity, answer and question text, tasks, and the tail of the agent list.
  */
 export function serializeHerdsmanRpcSnapshot(
   snapshot: HerdsmanRpcSnapshot,
@@ -228,7 +320,8 @@ export function serializeHerdsmanRpcSnapshot(
     JSON.stringify({ ...bounded, agents });
   const fits = (text: string): boolean =>
     Buffer.byteLength(text, "utf8") <= limitBytes;
-  let agents = bounded.agents;
+  let agents = boundActivity(bounded.agents);
+  if (fits(render(agents))) return render(agents);
   for (const trim of [withoutActivity, withoutText, withoutTask]) {
     agents = agents.map(trim);
     const text = render(agents);
